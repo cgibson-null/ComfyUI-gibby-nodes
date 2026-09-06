@@ -20,7 +20,7 @@ import comfy.sample
 import comfy.model_management
 import latent_preview
 import comfy.model_base
-from nodes import VAEDecode
+from nodes import VAEDecode, CLIPTextEncode, ConditioningZeroOut
 from comfy_api.latest import io
 
 try:
@@ -34,7 +34,297 @@ except ImportError:
     Flux2Scheduler = None
     get_schedule = None
 
+import json
+import comfy.utils as _comfy_utils
+from nodes import VAEEncode, VAEDecode, SetLatentNoiseMask
 from ..context import _CONTEXT_TYPE, GibbyContext
+from ..crop_inpaint_options import _INPAINT_OPTIONS_TYPE
+
+
+def _parse_inpaint_options(options_str):
+    if not options_str:
+        return None
+    try:
+        opts = json.loads(options_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    for o in opts:
+        if o.get("type") == "inpaint":
+            return o
+    return None
+
+
+def _get_mask_bbox(mask):
+    """Get bounding box of non-zero mask area. Returns (x, y, w, h) or None."""
+    m = mask.squeeze()
+    if m.dim() > 2:
+        m = m[0, 0]
+    rows = (m > 0.001).any(dim=1)
+    cols = (m > 0.001).any(dim=0)
+    if not rows.any() or not cols.any():
+        return None
+    top = rows.nonzero().squeeze(-1)[0].item()
+    bottom = rows.nonzero().squeeze(-1)[-1].item()
+    left = cols.nonzero().squeeze(-1)[0].item()
+    right = cols.nonzero().squeeze(-1)[-1].item()
+    return (left, top, right - left + 1, bottom - top + 1)
+
+
+def _resize_to_target(img, mask, megapixels, scale_factor, multiple, method):
+    """Resize image and mask to target size. Returns (img, mask, new_w, new_h)."""
+    h, w = img.shape[1], img.shape[2]
+
+    if scale_factor != 1.0:
+        h = int(h * scale_factor)
+        w = int(w * scale_factor)
+
+    if megapixels > 0:
+        target_px = megapixels * 1_000_000
+        current_px = h * w
+        if current_px > 0:
+            scale = (target_px / current_px) ** 0.5
+            h = int(h * scale)
+            w = int(w * scale)
+
+    if multiple > 1:
+        h = max(multiple, (h // multiple) * multiple)
+        w = max(multiple, (w // multiple) * multiple)
+
+    if h == img.shape[1] and w == img.shape[2]:
+        return img, mask, w, h
+
+    import torch.nn.functional as F
+    mode = {"bilinear": "bilinear", "area": "area", "nearest": "nearest", "lanczos": "bilinear"}.get(method, "bilinear")
+    # F.interpolate expects (N, C, H, W) — permute channels-last to channels-first
+    img = F.interpolate(img.permute(0, 3, 1, 2), size=(h, w), mode=mode, align_corners=False).permute(0, 2, 3, 1)
+    if mask.dim() == 3:
+        mask = F.interpolate(mask.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=False).squeeze(1)
+    else:
+        mask = F.interpolate(mask, size=(h, w), mode="bilinear", align_corners=False)
+    return img, mask, w, h
+
+
+def _scale_mask(mask, scale):
+    """Rescale mask: scale<1 shrinks white area, scale>1 expands. scale=1 is no-op."""
+    if scale == 1.0:
+        return mask
+    import torch.nn.functional as F
+    # Resize mask to scale size, then back — with threshold to keep hard edges
+    b, h, w = mask.shape
+    m4 = mask.unsqueeze(1).float()
+    small_h = max(2, int(h * scale))
+    small_w = max(2, int(w * scale))
+    m4 = F.interpolate(m4, size=(small_h, small_w), mode="bilinear", align_corners=False)
+    m4 = F.interpolate(m4, size=(h, w), mode="bilinear", align_corners=False)
+    return m4.squeeze(1).to(mask.dtype)
+
+
+def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
+                  sampler_obj, sigmas_tensor, cfg_value, positive, negative, decode):
+    """Crop image by mask bbox, resize, encode, sample, composite back."""
+    image = ctx["image"]
+    mask = ctx["mask"]
+    vae = ctx.get("vae")
+
+    # Resize mask to image size if mismatch
+    if mask.shape[1] != image.shape[1] or mask.shape[2] != image.shape[2]:
+        import torch.nn.functional as F
+        if mask.dim() == 3:
+            mask = F.interpolate(mask.unsqueeze(1), size=(image.shape[1], image.shape[2]), mode="bilinear", align_corners=False).squeeze(1)
+        else:
+            mask = F.interpolate(mask, size=(image.shape[1], image.shape[2]), mode="bilinear", align_corners=False)
+
+    # Get mask regions (single or split)
+    mask_mode = opts.get("mask_mode", "single")
+    crop_factor = opts.get("crop_factor", 3.0)
+    img_h, img_w = image.shape[1], image.shape[2]
+
+    regions = []
+    if mask_mode == "split":
+        # Find disconnected regions using contour detection
+        import cv2
+        import numpy as np
+        mask_2d = (mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) if mask.dim() == 3 else (mask.cpu().numpy() * 255).astype(np.uint8)
+        contours, hierarchy = cv2.findContours(mask_2d, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is not None:
+            for j, contour in enumerate(contours):
+                if hierarchy[0][j][3] != -1:
+                    continue
+                x, y, w, h = cv2.boundingRect(contour)
+                if w < 4 or h < 4:
+                    continue
+                # Expand by crop_factor
+                cw = int(w * crop_factor)
+                ch = int(h * crop_factor)
+                cx = x + w // 2
+                cy = y + h // 2
+                x0 = max(0, cx - cw // 2)
+                y0 = max(0, cy - ch // 2)
+                x1 = min(img_w, x0 + cw)
+                y1 = min(img_h, y0 + ch)
+                regions.append((x0, y0, x1, y1))
+        if not regions:
+            return io.NodeOutput(ctx, ctx.get("latent"), image, None, vae, ctx.get("vae_audio"))
+    else:
+        # Single region: use full mask bbox
+        bbox = _get_mask_bbox(mask)
+        if bbox is None:
+            return io.NodeOutput(ctx, ctx.get("latent"), image, None, vae, ctx.get("vae_audio"))
+        mx, my, mw, mh = bbox
+        cw = int(mw * crop_factor)
+        ch = int(mh * crop_factor)
+        cx = mx + mw // 2
+        cy = my + mh // 2
+        x0 = max(0, cx - cw // 2)
+        y0 = max(0, cy - ch // 2)
+        x1 = min(img_w, x0 + cw)
+        y1 = min(img_h, y0 + ch)
+        regions.append((x0, y0, x1, y1))
+
+    # Process each region
+    megapixels = opts.get("megapixels", 0.0)
+    scale_factor = opts.get("scale_factor", 1.0)
+    multiple = opts.get("multiple", 8)
+    method = opts.get("upscale_method", "bilinear")
+    mask_scale_start = opts.get("mask_scale_start", 1.0)
+    mask_scale_end = opts.get("mask_scale_end", 1.0)
+    inpaint_mode = opts.get("inpaint_mode", "masked_only")
+
+    result_image = image.clone()
+
+    for idx, (x0, y0, x1, y1) in enumerate(regions):
+        cw = x1 - x0
+        ch = y1 - y0
+
+        # Crop image and mask (mask is 3D: B,H,W)
+        crop_img = result_image[:, y0:y1, x0:x1, :]
+        crop_mask = mask[:, y0:y1, x0:x1]
+
+        # Resize
+        crop_img, crop_mask, new_w, new_h = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, method)
+
+        # Encode (ensure float32 for VAE)
+        crop_img = crop_img.float()
+        crop_latent, = VAEEncode().encode(vae, crop_img)
+
+        # Prepare noise
+        latent_image = crop_latent["samples"]
+        latent_image = comfy.sample.fix_empty_latent_channels(
+            model_obj, latent_image,
+            crop_latent.get("downscale_ratio_spacial", None),
+            crop_latent.get("downscale_ratio_temporal", None)
+        )
+        noise = comfy.sample.prepare_noise(latent_image, seed)
+
+        # Set noise mask
+        noise_mask = None
+        if inpaint_mode == "masked_only":
+            if abs(mask_scale_start - mask_scale_end) > 0.001:
+                import torch.nn.functional as F
+                b, h, w = crop_mask.shape
+                mask_2d = crop_mask.squeeze(0) if crop_mask.dim() == 3 else crop_mask
+                ys, xs = torch.where(mask_2d > 0.5)
+                if len(ys) > 0:
+                    cy = ys.float().mean().item()
+                    cx = xs.float().mean().item()
+                    max_r = torch.sqrt((ys.float() - cy) ** 2 + (xs.float() - cx) ** 2).max().item()
+                else:
+                    cy, cx, max_r = h / 2, w / 2, min(h, w) / 2
+                yy, xx = torch.meshgrid(
+                    torch.arange(h, device=crop_mask.device, dtype=torch.float),
+                    torch.arange(w, device=crop_mask.device, dtype=torch.float),
+                    indexing='ij'
+                )
+                dist = torch.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+                r_start = max_r * min(mask_scale_start, mask_scale_end)
+                r_end = max_r * max(mask_scale_start, mask_scale_end)
+                if r_end > r_start:
+                    gradient = ((r_end - dist) / (r_end - r_start)).clamp(0, 1)
+                else:
+                    gradient = (dist <= r_start).float()
+                grad_mask = gradient.float()
+                if mask_scale_start < 1.0:
+                    grad_mask = grad_mask * crop_mask
+                masked = SetLatentNoiseMask().set_mask(crop_latent, grad_mask)
+                if isinstance(masked, tuple):
+                    masked = masked[0]
+                noise_mask = masked.get("noise_mask")
+                from comfy_extras.nodes_differential_diffusion import DifferentialDiffusion
+                model_obj = DifferentialDiffusion.execute(model_obj, strength=1.0)[0]
+            elif mask_scale_start != 1.0:
+                import torch.nn.functional as F
+                b, h, w = crop_mask.shape
+                mask_2d = crop_mask.squeeze(0) if crop_mask.dim() == 3 else crop_mask
+                ys, xs = torch.where(mask_2d > 0.5)
+                if len(ys) > 0:
+                    cy = ys.float().mean().item()
+                    cx = xs.float().mean().item()
+                    max_r = torch.sqrt((ys.float() - cy) ** 2 + (xs.float() - cx) ** 2).max().item()
+                else:
+                    cy, cx, max_r = h / 2, w / 2, min(h, w) / 2
+                yy, xx = torch.meshgrid(
+                    torch.arange(h, device=crop_mask.device, dtype=torch.float),
+                    torch.arange(w, device=crop_mask.device, dtype=torch.float),
+                    indexing='ij'
+                )
+                dist = torch.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+                r_target = max_r * mask_scale_start
+                scaled_mask = (dist <= r_target).float()
+                if mask_scale_start < 1.0:
+                    scaled_mask = scaled_mask * crop_mask
+                masked = SetLatentNoiseMask().set_mask(crop_latent, scaled_mask)
+                if isinstance(masked, tuple):
+                    masked = masked[0]
+                noise_mask = masked.get("noise_mask")
+                from comfy_extras.nodes_differential_diffusion import DifferentialDiffusion
+                model_obj = DifferentialDiffusion.execute(model_obj, strength=1.0)[0]
+            else:
+                masked = SetLatentNoiseMask().set_mask(crop_latent, crop_mask)
+                if isinstance(masked, tuple):
+                    masked = masked[0]
+                noise_mask = masked.get("noise_mask")
+
+        # Sample
+        callback = latent_preview.prepare_callback(model_obj, steps_value)
+        samples = comfy.sample.sample_custom(
+            model_obj, noise, cfg_value, sampler_obj, sigmas_tensor,
+            positive, negative, latent_image,
+            noise_mask=noise_mask, callback=callback,
+            disable_pbar=not _comfy_utils.PROGRESS_BAR_ENABLED, seed=seed
+        )
+
+        # Decode
+        if decode and vae is not None:
+            refined_crop, = VAEDecode().decode(vae, {"samples": samples})
+        else:
+            refined_crop = None
+
+        # Composite back
+        import torch.nn.functional as F
+        if refined_crop is not None:
+            if refined_crop.dim() == 3:
+                refined_crop = refined_crop.unsqueeze(0)
+            paste_img = F.interpolate(
+                refined_crop.permute(0, 3, 1, 2), size=(ch, cw), mode="bilinear", align_corners=False
+            ).permute(0, 2, 3, 1)
+            if crop_mask.dim() == 3:
+                paste_mask = F.interpolate(crop_mask.unsqueeze(1), size=(ch, cw), mode="bilinear", align_corners=False).squeeze(1)
+            else:
+                paste_mask = F.interpolate(crop_mask, size=(ch, cw), mode="bilinear", align_corners=False)
+            pm = paste_mask.float().unsqueeze(1)
+            pm = F.avg_pool2d(pm, kernel_size=5, stride=1, padding=2)
+            pm = pm.clamp(0, 1).squeeze(1).unsqueeze(-1)
+            result_image[:, y0:y1, x0:x1, :3] = (
+                paste_img[:, :, :, :3] * pm +
+                result_image[:, y0:y1, x0:x1, :3] * (1 - pm)
+            )
+
+    # Update context
+    ctx["image"] = result_image
+    ctx.pop("latent", None)
+    ctx.pop("mask", None)
+
+    return io.NodeOutput(ctx, None, result_image, None, vae, ctx.get("vae_audio"))
 
 
 def _calculate_sigmas(model, scheduler_name, steps, sampler_name="euler", denoise=1.0):
@@ -81,6 +371,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                 io.Mask.Input("mask", optional=True),
                 io.Sampler.Input("sampler", optional=True),
                 io.Sigmas.Input("sigmas", optional=True),
+                _INPAINT_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect Crop-Inpaint options node"),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate="fixed"),
                 io.Int.Input("steps", default=0, min=0, max=10000),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
@@ -101,9 +392,10 @@ class GibbyKSamplerContext(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, context, model=None, latent=None, image=None, mask=None, sampler=None, sigmas=None,
-                seed=0, steps=0, denoise=1.0, start_step=0.0, end_step=10000.0,
-                add_noise=True, leftover_noise=False, decode=True) -> io.NodeOutput:
+    def execute(cls, context, model=None, latent=None, image=None, mask=None, options=None,
+                sampler=None, sigmas=None, seed=0, steps=0, denoise=1.0,
+                start_step=0.0, end_step=10000.0, add_noise=True, leftover_noise=False,
+                decode=True) -> io.NodeOutput:
         # Start with context dict and apply overrides
         ctx = dict(context) if isinstance(context, dict) else {}
 
@@ -120,8 +412,43 @@ class GibbyKSamplerContext(io.ComfyNode):
         if mask is not None:
             ctx["mask"] = mask
 
+        # Crop-inpaint: check early to skip full image encode in evaluate()
+        inpaint_opts = _parse_inpaint_options(options)
+        if inpaint_opts is not None and ctx.get("image") is not None and ctx.get("mask") is not None:
+            # Only encode conditioning, skip image→latent
+            if ctx.get("positive") is None and ctx.get("clip") is not None:
+                ctx["positive"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("positive_prompt", ""))
+            if ctx.get("negative") is None:
+                if ctx.get("cfg") == 1 and ctx.get("positive") is not None:
+                    ctx["negative"], = ConditioningZeroOut().zero_out(ctx["positive"])
+                elif ctx.get("clip") is not None:
+                    ctx["negative"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("negative_prompt", ""))
+            model_obj = ctx.get("model")
+            has_image = True
+            denoise_value = denoise if has_image else 1.0
+            base_steps = ctx.get("steps") or 0
+            if steps > 0:
+                steps_value = steps
+            elif has_image and ctx.get("step_refiner", 0) > 0:
+                steps_value = ctx["step_refiner"]
+            else:
+                steps_value = base_steps if base_steps > 0 else 20
+            cfg_value = ctx.get("cfg", 8.0)
+            sampler_name = ctx.get("sampler", "euler")
+            if sampler_name not in comfy.samplers.KSampler.SAMPLERS:
+                sampler_name = comfy.samplers.KSampler.SAMPLERS[0]
+            sampler_obj = comfy.samplers.sampler_object(sampler_name)
+            scheduler_name = ctx.get("scheduler", "normal")
+            sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name, denoise_value)
+            return _crop_inpaint(ctx, inpaint_opts, model_obj, seed, steps_value, denoise_value,
+                                 sampler_obj, sigmas_tensor, cfg_value, ctx.get("positive"), ctx.get("negative"), decode)
+
         # Fill in derived values on demand (latent from image, conditioning, width/height).
         GibbyContext.evaluate(ctx)
+
+        # Apply mask only if it came from the input (not context) and latent exists.
+        if mask is not None and ctx.get("latent") is not None and "noise_mask" not in ctx["latent"]:
+            ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], mask)
 
         # Resolve sampling parameters from context with widget overrides
         model_obj = ctx.get("model")
@@ -227,6 +554,12 @@ class GibbyKSamplerContext(io.ComfyNode):
         # Conditioning was filled in by evaluate() above if it was missing.
         positive = ctx.get("positive")
         negative = ctx.get("negative")
+
+        # Crop-inpaint: if options specify inpaint and we have image+mask, crop and detail
+        inpaint_opts = _parse_inpaint_options(options)
+        if inpaint_opts is not None and ctx.get("image") is not None and ctx.get("mask") is not None:
+            return _crop_inpaint(ctx, inpaint_opts, model_obj, seed, steps_value, denoise_value,
+                                 sampler_obj, sigmas_tensor, cfg_value, positive, negative, decode)
 
         # Prepare noise
         latent_image = ctx["latent"]["samples"]

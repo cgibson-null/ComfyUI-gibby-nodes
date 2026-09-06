@@ -37,6 +37,7 @@ from .reference_latent_context import GibbyReferenceLatentContext
 from .pipe_any import PipeAny
 from .crop_image import GibbyCropImage
 from .pause_execution import GibbyPauseExecution
+from .crop_inpaint_options import GibbyCropInpaintOptions
 
 # WEB_DIRECTORY points at the plugin root so ComfyUI discovers every node's
 # JS file (it globs recursively) and serves them under /extensions/<this>.
@@ -92,7 +93,7 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyCropImage, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext]
+        return [GibbyAnySwitch, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyCropImage, GibbyCropInpaintOptions, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

@@ -892,6 +892,8 @@ class GibbyImageSaverContext(io.ComfyNode):
         height = int(ctx.get("height") or 512)
         positive = str(ctx.get("positive_prompt") or '')
         negative = str(ctx.get("negative_prompt") or '')
+        if cfg <= 1.0:
+            negative = ''
 
         if image is not None:
             ctx["image"] = image
