@@ -35,6 +35,8 @@ from .image_saver import GibbyImageSaverContext
 from .h3_pipe import H3PipeCreate, H3PipeApply
 from .reference_latent_context import GibbyReferenceLatentContext
 from .pipe_any import PipeAny
+from .crop_image import GibbyCropImage
+from .pause_execution import GibbyPauseExecution
 
 # WEB_DIRECTORY points at the plugin root so ComfyUI discovers every node's
 # JS file (it globs recursively) and serves them under /extensions/<this>.
@@ -73,8 +75,11 @@ try:
         "fast_groups.js",
         "group_header_toggles.js",
         "context/context.js",
+        "context/context_loader.js",
         "resolution_latent/resolution_latent.js",
         "ksampler_context/ksampler_context.js",
+        "node_runtime.js",
+        "pause_execution/pause_execution.js",
     ):
         PromptServer.instance.routes.get(
             f"/extensions/{_FOLDER_NAME}/{_rel}"
@@ -87,7 +92,7 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyContext, GibbyContextLoader, GibbyContextOverride, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext]
+        return [GibbyAnySwitch, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyCropImage, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

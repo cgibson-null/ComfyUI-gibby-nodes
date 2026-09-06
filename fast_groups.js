@@ -28,6 +28,7 @@ const MODE_BYPASS = 4;  // bypassed (Fast Groups Bypasser "off")
 
 const MUTER_TYPE = "Gibby_FastGroupsMuter";
 const BYPASSER_TYPE = "Gibby_FastGroupsBypasser";
+const TOGGLE_TYPE = "Gibby_FastGroupsToggle";
 const CATEGORY = "gibby";
 
 const ROW_HEIGHT = 26;          // height of a single toggle row
@@ -1117,10 +1118,297 @@ class GibbyFastGroupsBypasser extends GibbyBaseFastGroups {
     }
 }
 
+// Combined Toggle node: each group has on/off AND bypass/mute toggles.
+// The bypass/mute toggle controls which disabled mode to use for that group.
+class GibbyFastGroupsToggle extends GibbyBaseFastGroups {
+    constructor() {
+        super("Fast Groups Toggle");
+        this.modeOn = MODE_ALWAYS;
+        this.modeOff = MODE_MUTE;      // default off mode
+        this.helpActions = "toggle groups between active, muted, and bypassed";
+        // Per-group bypass/mute settings: group id -> true (bypass) or false (mute)
+        this._groupModes = new Map();
+    }
+
+    onConfigure(data) {
+        super.onConfigure(data);
+        this._restoreGroupModes();
+    }
+
+    _getGroupMode(group) {
+        return this._groupModes.get(group.id) !== false;
+    }
+
+    _setGroupMode(group, bypass) {
+        this._groupModes.set(group.id, bypass);
+        this._persistGroupModes();
+    }
+
+    _persistGroupModes() {
+        // Serialize the Map to a plain object for storage in properties
+        const obj = {};
+        for (const [id, bypass] of this._groupModes) {
+            obj[id] = bypass;
+        }
+        this.properties.groupModes = obj;
+    }
+
+    _restoreGroupModes() {
+        if (!this.properties.groupModes) return;
+        this._groupModes = new Map();
+        for (const [id, bypass] of Object.entries(this.properties.groupModes)) {
+            this._groupModes.set(Number(id), bypass);
+        }
+    }
+
+    // Override row creation to add the bypass/mute toggle
+    _createRow(group) {
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.alignItems = "center";
+        row.style.gap = "4px";
+        row.style.width = "100%";
+        row.style.boxSizing = "border-box";
+        row.style.height = `${ROW_HEIGHT}px`;
+
+        // Optional "jump to group" arrow.
+        if (this.properties.showNav !== false) {
+            const nav = document.createElement("div");
+            nav.textContent = "\u25b6";
+            nav.title = "Jump to this group";
+            nav.style.cursor = "pointer";
+            nav.style.color = "#89A";
+            nav.style.fontSize = "11px";
+            nav.style.flex = "0 0 auto";
+            nav.style.padding = "0 2px";
+            nav.style.userSelect = "none";
+            nav.addEventListener("click", (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                navigateToGroup(group);
+            });
+            row.appendChild(nav);
+        }
+
+        // The ON/OFF toggle.
+        const toggle = document.createElement("div");
+        toggle.title = "Toggle this group on/off";
+        toggle.style.cursor = "pointer";
+        toggle.style.flex = "0 0 auto";
+        toggle.style.width = "50px";
+        toggle.style.height = "18px";
+        toggle.style.borderRadius = "9px";
+        toggle.style.boxSizing = "border-box";
+        toggle.style.userSelect = "none";
+        toggle.addEventListener("click", (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            this._doModeChange(group, undefined);
+        });
+        row.appendChild(toggle);
+
+        // The group title.
+        const labelEl = document.createElement("div");
+        labelEl.style.flex = "1 1 auto";
+        labelEl.style.minWidth = "0";
+        labelEl.style.fontSize = "11px";
+        labelEl.style.color = "#ddd";
+        labelEl.style.whiteSpace = "nowrap";
+        labelEl.style.overflow = "hidden";
+        labelEl.style.textOverflow = "ellipsis";
+        row.appendChild(labelEl);
+
+        // The BYPASS/MUTE toggle (right-aligned).
+        const bypassToggle = document.createElement("div");
+        bypassToggle.title = "Toggle bypass/mute for this group";
+        bypassToggle.style.cursor = "pointer";
+        bypassToggle.style.flex = "0 0 auto";
+        bypassToggle.style.width = "50px";
+        bypassToggle.style.height = "18px";
+        bypassToggle.style.borderRadius = "9px";
+        bypassToggle.style.boxSizing = "border-box";
+        bypassToggle.style.userSelect = "none";
+        bypassToggle.addEventListener("click", (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            const bypass = !this._getGroupMode(group);
+            this._setGroupMode(group, bypass);
+            const rowObj = getDomState(this).rows.get(group);
+            if (rowObj) {
+                rowObj.bypassState = bypass;
+                this._updateRowVisual(rowObj, rowObj.enabledState, bypass);
+            }
+            // If group is off, apply the new mode immediately
+            if (!isGroupEnabled(group)) {
+                this._applyMode(group, false);
+            }
+        });
+        row.appendChild(bypassToggle);
+
+        const rowObj = { element: row, toggleEl: toggle, bypassToggleEl: bypassToggle, labelEl, enabledState: false, bypassState: true };
+        this._updateRowVisual(rowObj, false, true);
+        getDomState(this).container.appendChild(row);
+        return rowObj;
+    }
+
+    _updateRowVisual(row, enabled, bypass) {
+        // Update on/off toggle
+        const t = row.toggleEl;
+        t.style.display = "flex";
+        t.style.alignItems = "center";
+        t.style.justifyContent = "center";
+        t.style.fontSize = "10px";
+        t.style.fontWeight = "bold";
+        t.style.letterSpacing = "0.5px";
+        if (enabled) {
+            t.style.background = "#3a7d44";
+            t.style.color = "#cfe8d2";
+            t.textContent = "ON";
+        } else {
+            t.style.background = "#3a3a3a";
+            t.style.color = "#999";
+            t.textContent = "OFF";
+        }
+
+        // Update bypass/mute toggle
+        const b = row.bypassToggleEl;
+        b.style.display = "flex";
+        b.style.alignItems = "center";
+        b.style.justifyContent = "center";
+        b.style.fontSize = "9px";
+        b.style.fontWeight = "bold";
+        b.style.letterSpacing = "0.5px";
+        if (bypass) {
+            b.style.background = "#4a6fa5";
+            b.style.color = "#d4e4f7";
+            b.textContent = "BYPASS";
+        } else {
+            b.style.background = "#5a4a6a";
+            b.style.color = "#e8d4f7";
+            b.textContent = "MUTE";
+        }
+    }
+
+    // Override refresh to track bypass/mute state
+    _refreshFastGroups() {
+        const state = getDomState(this);
+        if (!state.container) return;
+        
+        const props = this.properties;
+        const configKey = `nav:${props.showNav !== false}`;
+        if (configKey !== this._lastConfigKey) {
+            for (const row of state.rows.values()) row.element.remove();
+            state.rows.clear();
+            if (state.placeholder) {
+                state.placeholder.remove();
+                state.placeholder = null;
+            }
+            this._lastConfigKey = configKey;
+            this._lastSignature = null;
+        }
+
+        const { sortMode, customAlphabet } = this._resolveSort();
+        let groups = collectAllGroups();
+        groups = filterGroups(groups, props);
+        groups = sortGroups(groups, sortMode, customAlphabet);
+
+        const signature = groups
+            .map((g) => `${g.id}|${g.title || ""}|${isGroupEnabled(g) ? 1 : 0}`)
+            .join(";");
+        
+        const rowsNeedRebuild = Array.from(state.rows.values()).some(
+            (row) => !row.element.isConnected
+        );
+        
+        if (signature === this._lastSignature && !rowsNeedRebuild) return;
+        this._lastSignature = signature;
+
+        for (const [group, row] of Array.from(state.rows.entries())) {
+            if (!groups.includes(group)) {
+                row.element.remove();
+                state.rows.delete(group);
+            }
+        }
+
+        for (const group of groups) {
+            let row = state.rows.get(group);
+            if (!row) {
+                row = this._createRow(group);
+                state.rows.set(group, row);
+            }
+            const enabled = isGroupEnabled(group);
+            const bypass = this._getGroupMode(group);
+            row.labelEl.textContent = group.title || "";
+            row.enabledState = enabled;
+            row.bypassState = bypass;
+            this._updateRowVisual(row, enabled, bypass);
+            state.container.appendChild(row.element);
+        }
+
+        this._updatePlaceholder(groups.length);
+        this._visibleGroups = groups;
+        this.setSize(this.computeSize());
+        if (this.graph) this.graph.setDirtyCanvas(true, false);
+    }
+
+    // Override apply mode to use per-group bypass/mute setting
+    _applyMode(group, enabled) {
+        let mode = this.modeOn;
+        if (!enabled) {
+            mode = this._getGroupMode(group) ? MODE_BYPASS : MODE_MUTE;
+        }
+        for (const n of getNodesInGroup(group)) {
+            setNodeMode(n, mode);
+        }
+        if (this.graph) this.graph.setDirtyCanvas(true, true);
+    }
+
+    // Override toolbar to use "Disable all" label
+    _buildToolbar() {
+        const toolbar = document.createElement("div");
+        toolbar.style.display = "flex";
+        toolbar.style.gap = "4px";
+        toolbar.style.padding = "2px 0 5px 0";
+        toolbar.style.borderBottom = "1px solid #3a3a3a";
+        toolbar.style.marginBottom = "2px";
+
+        const buttons = [
+            { label: "Toggle all", action: () => this._actionToggleAll() },
+            { label: "Enable all", action: () => this._actionAll(true) },
+            { label: "Disable all", action: () => this._actionAll(false) },
+        ];
+
+        for (const btn of buttons) {
+            const b = document.createElement("button");
+            b.textContent = btn.label;
+            b.style.cssText =
+                "flex:1; padding:3px 4px; font-size:11px; cursor:pointer; " +
+                "background:#2a2a2a; color:#ccc; border:1px solid #444; " +
+                "border-radius:3px; font-family:inherit; line-height:1.2;";
+            b.addEventListener("mouseenter", () => { b.style.background = "#3a3a3a"; });
+            b.addEventListener("mouseleave", () => { b.style.background = "#2a2a2a"; });
+            b.addEventListener("mousedown", (e) => e.stopPropagation());
+            b.addEventListener("click", (e) => {
+                e.stopPropagation();
+                try { btn.action(); } catch (err) {
+                    console.error("[Gibby FastGroups] button action failed:", err);
+                }
+            });
+            toolbar.appendChild(b);
+        }
+        return toolbar;
+    }
+
+    _placeholderText() {
+        return "No matching groups - adjust the node's Properties filter";
+    }
+}
+
     return {
         Base,
         GibbyFastGroupsMuter,
         GibbyFastGroupsBypasser,
+        GibbyFastGroupsToggle,
     };
 }
 
@@ -1142,6 +1430,7 @@ app.registerExtension({
                     Base,
                     GibbyFastGroupsMuter: Muter,
                     GibbyFastGroupsBypasser: Bypasser,
+                    GibbyFastGroupsToggle: Toggle,
                 } = built;
 
                 // title_mode is cosmetic; the constant lives on the LiteGraph
@@ -1187,6 +1476,16 @@ app.registerExtension({
                     })
                 );
                 Bypasser.category = CATEGORY;
+
+                registerNodeType(
+                    TOGGLE_TYPE,
+                    Object.assign(Toggle, {
+                        title: "Fast Groups Toggle",
+                        ...titleMode,
+                        collapsable: true,
+                    })
+                );
+                Toggle.category = CATEGORY;
                 return true;
             } catch (e) {
                 console.error("[Gibby FastGroups] registration failed:", e);
@@ -1208,7 +1507,7 @@ app.registerExtension({
                 if (!ok) {
                     console.error(
                         "[Gibby FastGroups] LGraphNode / registerNodeType never became available; " +
-                        "Fast Groups Muter / Bypasser were not registered"
+                        "Fast Groups Muter / Bypasser / Toggle were not registered"
                     );
                 } else if (attempts > 1) {
                     try {

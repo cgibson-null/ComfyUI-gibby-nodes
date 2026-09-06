@@ -142,6 +142,24 @@ class GibbyKSamplerContext(io.ComfyNode):
         else:
             steps_value = ctx.get("steps")
 
+        # Cache check: if this context already has a sampled result with matching
+        # parameters, return it instead of re-sampling. This handles the case where
+        # the latent output wasn't connected during the first run (result discarded
+        # by the engine) but is connected now.
+        cached = ctx.get("_kctx_sampled")
+        if cached is not None:
+            if (cached.get("seed") == seed and cached.get("steps") == steps_value
+                    and cached.get("denoise") == denoise_value
+                    and cached.get("add_noise") == add_noise
+                    and cached.get("leftover_noise") == leftover_noise
+                    and cached.get("decode") == decode
+                    and cached.get("start_step") == start_step
+                    and cached.get("end_step") == end_step):
+                out_latent = cached["out_latent"]
+                decoded_image = ctx.get("image")
+                decoded_audio = ctx.get("audio")
+                return io.NodeOutput(ctx, out_latent, decoded_image, decoded_audio, ctx.get("vae"), ctx.get("vae_audio") or ctx.get("audio_vae"))
+
         cfg_value = ctx.get("cfg")
         
         # Handle start_step/end_step:
@@ -298,5 +316,18 @@ class GibbyKSamplerContext(io.ComfyNode):
             ctx.pop("image", None)
             ctx.pop("audio", None)
             ctx["latent"] = out_latent
+
+        # Store sampled result in context for cache reuse
+        ctx["_kctx_sampled"] = {
+            "out_latent": out_latent,
+            "seed": seed,
+            "steps": steps_value,
+            "denoise": denoise_value,
+            "add_noise": add_noise,
+            "leftover_noise": leftover_noise,
+            "decode": decode,
+            "start_step": start_step,
+            "end_step": end_step,
+        }
 
         return io.NodeOutput(ctx, out_latent, decoded_image, decoded_audio, ctx.get("vae"), ctx.get("vae_audio") or ctx.get("audio_vae"))
