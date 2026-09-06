@@ -234,14 +234,17 @@ class GibbyContext(io.ComfyNode):
         if ctx.get("latent") is None:
             # Image takes priority - encode it fresh with mask if available.
             if ctx.get("image") is not None and ctx.get("vae") is not None:
-                ctx["latent"], = VAEEncode().encode(ctx["vae"], ctx["image"])
-                if ctx.get("mask") is not None:
-                    ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], ctx["mask"])
-                
-                # If audio also available, combine into AV latent
-                if ctx.get("vae_audio") is not None and ctx.get("audio") is not None:
-                    audio_latent, = VAEEncodeAudio().encode(ctx["vae_audio"], ctx["audio"])
-                    ctx["latent"], = LTXVConcatAVLatent().execute(ctx["latent"], audio_latent)
+                try:
+                    ctx["latent"], = VAEEncode().encode(ctx["vae"], ctx["image"])
+                    if ctx.get("mask") is not None:
+                        ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], ctx["mask"])
+                    
+                    # If audio also available, combine into AV latent
+                    if ctx.get("vae_audio") is not None and ctx.get("audio") is not None:
+                        audio_latent, = VAEEncodeAudio().encode(ctx["vae_audio"], ctx["audio"])
+                        ctx["latent"], = LTXVConcatAVLatent().execute(ctx["latent"], audio_latent)
+                except Exception:
+                    ctx["latent"] = None
 
             # If no image but audio + vae_audio available, encode audio-only latent
             elif ctx.get("vae_audio") is not None and ctx.get("audio") is not None:

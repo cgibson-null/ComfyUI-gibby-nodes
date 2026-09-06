@@ -893,7 +893,9 @@ class GibbyImageSaverContext(io.ComfyNode):
         positive = str(ctx.get("positive_prompt") or '')
         negative = str(ctx.get("negative_prompt") or '')
 
-        images = image if image is not None else ctx.get("image")
+        if image is not None:
+            ctx["image"] = image
+        images = ctx.get("image")
         if images is None:
             print("Gibby Image Saver: no images found in context or input, nothing to save.")
             return io.NodeOutput(ctx, '', '')

@@ -116,10 +116,10 @@ class GibbyReferenceLatentContext(io.ComfyNode):
 
         # Update positive conditioning
         if positive is not None and ref_latents:
-            context["positive"] = node_helpers.conditioning_set_values(positive, {"reference_latents": ref_latents}, append=True)
+            context["positive"] = node_helpers.conditioning_set_values(positive, {"reference_latents": ref_latents})
 
         # Update negative conditioning if cfg != 1
         if negative is not None and cfg != 1.0 and ref_latents:
-            context["negative"] = node_helpers.conditioning_set_values(negative, {"reference_latents": ref_latents}, append=True)
+            context["negative"] = node_helpers.conditioning_set_values(negative, {"reference_latents": ref_latents})
 
         return io.NodeOutput(context)
