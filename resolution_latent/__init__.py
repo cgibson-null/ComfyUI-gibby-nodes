@@ -180,6 +180,10 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 megapixels=1.0, swap_dimensions=False, scale_factor=1.0,
                 multiple=8, batch_size=1, flux2_latent=False, upscale_method="lanczos",
                 keep_proportion="stretch", pad_color="0, 0, 0", crop_position="center", vae=None) -> io.NodeOutput:
+        # If no input image but context has one, use context's image
+        if image is None and isinstance(context, dict):
+            image = context.get("image")
+        
         has_media = image is not None or mask is not None
         # Source W/H; same shape indices for [B,H,W,C] images and [B,H,W] masks.
         SW = SH = 0
@@ -198,14 +202,13 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         base = 16 if is_flux2 else 8
         step = multiple * base // math.gcd(multiple, base)
 
-        if mode == "custom" or (mode == "keep_ar" and not has_media):
-            # keep_ar without media falls back to the (hidden) width/height fields.
+        if mode == "custom":
             w, h = float(width), float(height)
         else:
-            # Resolution Selector math at the selected ratio; keep_ar keeps the media's exact ratio.
-            if mode == "keep_ar":
+            # Resolution Selector math at the selected ratio; keep_ar uses media's ratio or falls back to aspect_ratio.
+            if mode == "keep_ar" and has_media:
                 rw, rh = float(SW), float(SH)
-            elif mode == "aspect_ratio":
+            elif mode == "aspect_ratio" or (mode == "keep_ar" and not has_media):
                 rw, rh = ASPECT_RATIOS[aspect_ratio]
             else:
                 rw, rh = float(x), float(y)

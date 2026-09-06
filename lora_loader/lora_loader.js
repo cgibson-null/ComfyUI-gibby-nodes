@@ -28,7 +28,7 @@ function fetchLoraOptions() {
     return fetch("/object_info/LoraLoader")
         .then((r) => r.json())
         .then((data) => {
-            const names = data?.LoraLoader?.input?.required?.lora_name?.[0] || [];
+            const names = (data?.LoraLoader?.input?.required?.lora_name?.[0] || []).slice().sort();
             return ["None", ...names];
         })
         .catch(() => ["None"]);
@@ -467,13 +467,12 @@ function createSearchableLoraSelect(loraOptions, initialLora, onCommit, getGloba
             }
         },
         // Update the options list (called when ComfyUI refreshes model lists).
-        // Preserves current selection if it's still valid.
+        // Always preserves current selection, even if not in the new list.
         updateOptions: (newOptions) => {
             loraOptions = newOptions;
-            // If current value is no longer in the list, reset to "None"
-            if (!loraOptions.includes(currentValue)) {
-                currentValue = "None";
-                input.value = currentValue;
+            // Mark as missing if not in the list (will highlight red)
+            if (currentValue !== "None" && !loraOptions.includes(currentValue)) {
+                hasMissingLora = true;
             }
         },
         destroy: () => {

@@ -27,10 +27,6 @@ from comfy_api.latest import io
 from ..lora_loader import _apply_lora
 from . import _CONTEXT_TYPE, _lora_stack, GibbyContext
 
-_CLIP_TYPE_OPTIONS = CLIPLoader.INPUT_TYPES()["required"]["type"][0]
-_VAE_OPTIONS = VAELoader.vae_list(VAELoader)
-
-
 def _clip_name_inputs(count):
     clip_options = ["None"] + folder_paths.get_filename_list("text_encoders")
     return [io.Combo.Input(f"clip_name{i}", options=clip_options, default="None") for i in range(1, count + 1)]
@@ -66,10 +62,10 @@ class GibbyContextLoader(io.ComfyNode):
                                     io.DynamicCombo.Option("4", _clip_name_inputs(4)),
                                 ],
                             ),
-                            io.Combo.Input("type", options=_CLIP_TYPE_OPTIONS, default="stable_diffusion"),
+                            io.Combo.Input("type", options=CLIPLoader.INPUT_TYPES()["required"]["type"][0], default="stable_diffusion"),
                             io.Combo.Input("device", options=["default", "cpu"], default="default", advanced=True),
-                            io.Combo.Input("vae_name", options=["None"] + _VAE_OPTIONS, default="None"),
-                            io.Combo.Input("vae_audio_name", options=["None"] + _VAE_OPTIONS, optional=True, default="None"),
+                            io.Combo.Input("vae_name", options=["None"] + VAELoader.vae_list(VAELoader), default="None"),
+                            io.Combo.Input("vae_audio_name", options=["None"] + VAELoader.vae_list(VAELoader), optional=True, default="None"),
                         ]),
                         io.DynamicCombo.Option("checkpoint", [
                             io.Combo.Input("ckpt_name", options=["None"] + folder_paths.get_filename_list("checkpoints"), default="None"),

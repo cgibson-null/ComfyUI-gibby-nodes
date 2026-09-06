@@ -157,15 +157,11 @@ function syncDomInputs(node) {
     // No-op: width/height and x/y are now standard widgets.
 }
 
-// Show/hide rows per mode: keep AR (only offered with media linked) hides all
-// size widgets but megapixels; custom shows the width x height fields (also
-// when media is linked - they become the resize box); the AR modes show their
-// ratio + megapixels. The resize controls only matter with an image or mask
-// linked.
+// Show/hide rows per mode: keep AR hides all size widgets but megapixels;
+// custom shows the width x height fields (also when media is linked - they
+// become the resize box); the AR modes show their ratio + megapixels.
 function refreshModeVisibility(node) {
     const hasMedia = !!node.inputs?.find((i) => (i.name === "image" || i.name === "mask") && i.link);
-    // Keep AR only exists with media linked - fall back to custom when it goes away.
-    if (getWidgetValue(node, "mode") === "keep_ar" && !hasMedia) setWidgetValue(node, "mode", "custom");
     const mode = getWidgetValue(node, "mode") || "custom";
 
     // Standard Vue-rendered rows (hidden via options.hidden).
@@ -185,12 +181,7 @@ function refreshModeVisibility(node) {
     const els = node._gibbyResElements;
     if (!els) return;
 
-    // The Keep AR button only appears with an image or mask linked.
-    const keepArBtn = [...els.modeSwitch.children].find((b) => b._gibbyValue === "keep_ar");
-    if (keepArBtn) keepArBtn.style.display = hasMedia ? "" : "none";
-
     // Repaint the switcher highlight.
-    console.log('[GibbyRes] refreshModeVisibility: nodeId:', node.id, 'modeSwitch inDom:', els.modeSwitch.parentNode !== null);
     if (els.modeSwitch._gibbyPaint) els.modeSwitch._gibbyPaint();
 
     // Force a redraw so the layout system re-measures after rows show/hide.

@@ -190,6 +190,14 @@ class GibbyKSamplerContext(io.ComfyNode):
                 
                 seq_len = (width * height / (16 * 16))
                 sigmas_tensor = get_schedule(steps_value, round(seq_len)).to(comfy.model_management.get_torch_device())
+                
+                # If no start/end step provided and denoise < 1, use low_sigmas
+                has_start_end = start_step != 0.0 or end_step < 10000.0
+                if not has_start_end and denoise_value < 1.0:
+                    steps = max(sigmas_tensor.shape[-1] - 1, 0)
+                    total_steps = round(steps * denoise_value)
+                    sigmas_tensor = sigmas_tensor[-(total_steps + 1):]
+                
                 use_start_end_steps = True
             else:
                 # Regular scheduler

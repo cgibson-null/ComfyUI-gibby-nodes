@@ -137,7 +137,7 @@ def _http_get_json(url: str):
 
 # --- Model info cache (hashes + Civitai data; JSON instead of .sha256/.civitai.info files)
 
-_PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PLUGIN_ROOT = os.path.dirname(os.path.abspath(__file__))
 _MODEL_INFO_CACHE_PATH = os.path.join(_PLUGIN_ROOT, "model_info_cache.json")
 
 
