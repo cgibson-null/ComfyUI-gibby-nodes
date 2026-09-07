@@ -23,6 +23,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
                 io.Boolean.Input("mask_mode", default=True, label_on="single", label_off="split", tooltip="single: treat mask as one region. split: split disconnected mask areas into separate crops."),
                 io.Float.Input("mask_scale_start", default=1.0, min=0.0, max=3.0, step=0.05, tooltip="Mask size multiplier on first step. <1=smaller, >1=larger than actual mask."),
                 io.Float.Input("mask_scale_end", default=1.0, min=0.0, max=3.0, step=0.05, tooltip="Mask size multiplier on last step."),
+                io.String.Input("mask_indices", default="", tooltip="When mask_mode=split: which mask indices to process. Extracts integers from string, ignores indices >= mask count. Empty=all."),
             ],
             outputs=[
                 _INPAINT_OPTIONS_TYPE.Output("options"),
@@ -32,7 +33,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
     @classmethod
     def execute(cls, crop_factor=3.0, megapixels=0.0, scale_factor=1.0, multiple=8,
                 upscale_method="lanczos", inpaint_mode=True, mask_mode=True,
-                mask_scale_start=1.0, mask_scale_end=1.0):
+                mask_scale_start=1.0, mask_scale_end=1.0, mask_indices=""):
         option = {
             "type": "inpaint",
             "crop_factor": crop_factor,
@@ -44,6 +45,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
             "mask_mode": "single" if mask_mode else "split",
             "mask_scale_start": mask_scale_start,
             "mask_scale_end": mask_scale_end,
+            "mask_indices": mask_indices,
         }
         return io.NodeOutput(json.dumps([option]))
 

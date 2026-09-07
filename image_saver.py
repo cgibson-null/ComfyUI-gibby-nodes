@@ -27,11 +27,18 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
-import piexif
-import piexif.helper
 import requests
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+
+# piexif only writes EXIF metadata into JPEG/WEBP; without it images still
+# save, just without that metadata.
+try:
+    import piexif
+    import piexif.helper
+except ImportError:
+    piexif = None
+    print("Gibby Image Saver: piexif is missing - JPEG/WEBP will be saved without EXIF metadata (pip install piexif)")
 
 import folder_paths
 from comfy.sd1_clip import escape_important, unescape_important, token_weights
@@ -705,6 +712,8 @@ def _save_image(image: Image.Image, filepath: str, extension: str, quality_jpeg_
         image.save(filepath, pnginfo=metadata, optimize=optimize_png)
     else: # webp & jpeg
         image.save(filepath, optimize=True, quality=quality_jpeg_or_webp, lossless=lossless_webp)
+        if piexif is None:
+            return
 
         # Native example adding workflow to exif:
         # https://github.com/comfyanonymous/ComfyUI/blob/095610717000bffd477a7e72988d1fb2299afacb/comfy_extras/nodes_images.py#L113
@@ -928,7 +937,7 @@ class GibbyImageSaverContext(io.ComfyNode):
             print("Gibby Image Saver: save_image is False, skipping save.")
             return io.NodeOutput(ctx, metadata.final_hashes, metadata.a111_params, ui=None)
         
-        # When no context, create minimal metadata; otherwise use full context metadata
+        # When no context, save with generic name and no metadata
         if not has_context:
             minimal_metadata = Metadata(
                 modelname="",
@@ -936,19 +945,19 @@ class GibbyImageSaverContext(io.ComfyNode):
                 negative="",
                 width=width,
                 height=height,
-                seed=seed_value,
-                steps=steps,
-                cfg=cfg,
-                sampler_name=sampler_name,
-                scheduler_name=scheduler_name,
-                denoise=denoise,
+                seed=0,
+                steps=0,
+                cfg=1.0,
+                sampler_name="",
+                scheduler_name="",
+                denoise=1.0,
                 custom="",
                 additional_hashes="",
                 ckpt_path="",
                 a111_params="",
                 final_hashes=""
             )
-            filenames = _save_images(images, filename, extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, cls.hidden.prompt, cls.hidden.extra_pnginfo, save_workflow_as_json, embed_workflow, counter, time_format, minimal_metadata)
+            filenames = _save_images(images, "image", extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, None, None, False, False, counter, time_format, minimal_metadata)
         else:
             filenames = _save_images(images, filename, extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, cls.hidden.prompt, cls.hidden.extra_pnginfo, save_workflow_as_json, embed_workflow, counter, time_format, metadata)
 

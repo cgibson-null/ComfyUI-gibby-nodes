@@ -24,6 +24,12 @@ import comfy.sd
 from nodes import UNETLoader, VAELoader, CLIPLoader, CheckpointLoaderSimple
 from comfy_api.latest import io
 
+try:
+    from comfy_extras.nodes_model_advanced import ModelAttentionBackend
+except ImportError:
+    ModelAttentionBackend = None
+    print("Gibby Context Loader: ModelAttentionBackend is missing - ck_attn is disabled (update ComfyUI)")
+
 from ..lora_loader import _apply_lora
 from . import _CONTEXT_TYPE, _lora_stack, GibbyContext
 
@@ -88,6 +94,7 @@ class GibbyContextLoader(io.ComfyNode):
                 io.Int.Input("height", default=0, advanced=True),
                 io.String.Input("positive_prompt", multiline=True, default="", advanced=True),
                 io.String.Input("negative_prompt", multiline=True, default="", advanced=True),
+                io.Boolean.Input("ck_attn", default=True, tooltip="Comfy Kitchen int8 attention; falls back to pytorch attention if unavailable."),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output(display_name="context"),
@@ -104,7 +111,7 @@ class GibbyContextLoader(io.ComfyNode):
     @classmethod
     def execute(cls, mode=None, latent=None, image=None, mask=None,
                 audio=None, mask_audio=None, lora_stack=None, steps=20, step_refiner=0,
-                cfg=1.0, sampler="euler", scheduler="normal", width=0, height=0, positive_prompt="", negative_prompt="") -> io.NodeOutput:
+                cfg=1.0, sampler="euler", scheduler="normal", width=0, height=0, positive_prompt="", negative_prompt="", ck_attn=True) -> io.NodeOutput:
         if mode is None:
             raise ValueError("Context Loader requires a 'mode' input.")
 
@@ -184,6 +191,9 @@ class GibbyContextLoader(io.ComfyNode):
                     continue
                 name, sm, sc = item[0], item[1], item[2]
                 ctx["model"], ctx["clip"] = _apply_lora(ctx["model"], ctx["clip"], name, sm, sc)
+
+        if ctx["model"] is not None and ck_attn and ModelAttentionBackend is not None:
+            ctx["model"], = ModelAttentionBackend().patch(ctx["model"], "comfy kitchen attention")
 
         # Always fill in derived values (conditioning from prompts, latent from image/width-height).
         GibbyContext.evaluate(ctx)

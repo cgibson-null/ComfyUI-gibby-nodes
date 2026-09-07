@@ -145,6 +145,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
         import cv2
         import numpy as np
         mask_2d = (mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) if mask.dim() == 3 else (mask.cpu().numpy() * 255).astype(np.uint8)
+        mask_2d_float = mask.squeeze(0) if mask.dim() == 3 else mask
         contours, hierarchy = cv2.findContours(mask_2d, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if hierarchy is not None:
             for j, contour in enumerate(contours):
@@ -162,7 +163,22 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
                 y0 = max(0, cy - ch // 2)
                 x1 = min(img_w, x0 + cw)
                 y1 = min(img_h, y0 + ch)
-                regions.append((x0, y0, x1, y1))
+                # Isolate this segment so other segments inside the crop
+                # window are not inpainted together with it
+                seg = np.zeros((img_h, img_w), dtype=np.uint8)
+                cv2.drawContours(seg, [contour], -1, 1, -1)
+                seg_mask = mask_2d_float * torch.from_numpy(seg > 0).to(mask.device)
+                regions.append((x0, y0, x1, y1, seg_mask))
+        # Filter by mask_indices if provided
+        mask_indices_str = opts.get("mask_indices", "")
+        if mask_indices_str:
+            import re as _re
+            indices = [int(s) for s in _re.findall(r'\d+', mask_indices_str)]
+            valid = [i for i in indices if i < len(regions)]
+            if valid:
+                regions = [regions[i] for i in valid]
+            else:
+                regions = []
         if not regions:
             return io.NodeOutput(ctx, ctx.get("latent"), image, None, vae, ctx.get("vae_audio"))
     else:
@@ -179,7 +195,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
         y0 = max(0, cy - ch // 2)
         x1 = min(img_w, x0 + cw)
         y1 = min(img_h, y0 + ch)
-        regions.append((x0, y0, x1, y1))
+        regions.append((x0, y0, x1, y1, None))
 
     # Process each region
     megapixels = opts.get("megapixels", 0.0)
@@ -192,13 +208,17 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
 
     result_image = image.clone()
 
-    for idx, (x0, y0, x1, y1) in enumerate(regions):
+    for idx, (x0, y0, x1, y1, seg_mask) in enumerate(regions):
         cw = x1 - x0
         ch = y1 - y0
 
-        # Crop image and mask (mask is 3D: B,H,W)
+        # Crop image and mask (mask is 3D: B,H,W); in split mode only this
+        # segment's pixels are kept
         crop_img = result_image[:, y0:y1, x0:x1, :]
-        crop_mask = mask[:, y0:y1, x0:x1]
+        if seg_mask is not None:
+            crop_mask = seg_mask[y0:y1, x0:x1].unsqueeze(0)
+        else:
+            crop_mask = mask[:, y0:y1, x0:x1]
 
         # Resize
         crop_img, crop_mask, new_w, new_h = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, method)
