@@ -19,7 +19,7 @@ import torch
 import comfy.samplers
 import comfy.model_management
 import comfy.model_base
-from nodes import CLIPTextEncode, ConditioningZeroOut, VAEEncode, SetLatentNoiseMask
+from nodes import CLIPTextEncode, ConditioningZeroOut, VAEEncode, VAEEncodeTiled, SetLatentNoiseMask
 from comfy_extras.nodes_audio import VAEEncodeAudio
 from comfy_extras.nodes_lt import LTXVConcatAVLatent
 from comfy_api.latest import io
@@ -217,7 +217,7 @@ class GibbyContext(io.ComfyNode):
         )
 
     @staticmethod
-    def evaluate(ctx):
+    def evaluate(ctx, tiled=False, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8):
         """Fill missing context values on demand from available inputs."""
         # Positive conditioning: encode positive_prompt if clip exists (even empty string).
         if ctx.get("positive") is None and ctx.get("clip") is not None:
@@ -235,7 +235,10 @@ class GibbyContext(io.ComfyNode):
             # Image takes priority - encode it fresh with mask if available.
             if ctx.get("image") is not None and ctx.get("vae") is not None:
                 try:
-                    ctx["latent"], = VAEEncode().encode(ctx["vae"], ctx["image"])
+                    if tiled:
+                        ctx["latent"], = VAEEncodeTiled().encode(ctx["vae"], ctx["image"], tile_size, overlap, temporal_size, temporal_overlap)
+                    else:
+                        ctx["latent"], = VAEEncode().encode(ctx["vae"], ctx["image"])
                     if ctx.get("mask") is not None:
                         ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], ctx["mask"])
                     

@@ -121,22 +121,10 @@ function buildModeSwitch(node) {
         const modeVal = getWidgetValue(n, "mode");
         const curLabel = labelOf(modeVal);
         
-        // Find the mode switch element in the DOM
-        let currentEl = null;
-        const nodeEl = document.querySelector(`[data-id="${n.id}"]`);
-        if (nodeEl) {
-            currentEl = nodeEl.querySelector(".gibby-mode-switch");
-        } else {
-            // Try finding by node-type attribute instead
-            const nodeTypeEl = document.querySelector(`[node-type="Gibby_EmptyLatent_Resolution"]`);
-            if (nodeTypeEl) {
-                currentEl = nodeTypeEl.querySelector(".gibby-mode-switch");
-            }
-        }
-        
-        if (!currentEl) return;
-        
-        for (const b of currentEl.children) {
+        // Paint this node's own buttons directly - el is this node's switcher.
+        // (Re-querying the DOM by node-type returns the first matching node,
+        // which mis-highlights sibling nodes.)
+        for (const b of el.children) {
             const on = b.textContent === curLabel;
             b.classList.toggle("gibby-mode-active", on);
             // Set colors directly to ensure proper display
@@ -157,11 +145,11 @@ function syncDomInputs(node) {
     // No-op: width/height and x/y are now standard widgets.
 }
 
-// Show/hide rows per mode: keep AR hides all size widgets but megapixels;
-// custom shows the width x height fields (also when media is linked - they
-// become the resize box); the AR modes show their ratio + megapixels.
+// Show/hide rows per mode: keep AR shows only megapixels; custom shows the
+// width x height fields; the AR modes show their ratio + megapixels. Resize
+// widgets (upscale_method/keep_proportion/pad_color/crop_position) and
+// batch_size/flux2_latent stay visible regardless of a linked media input.
 function refreshModeVisibility(node) {
-    const hasMedia = !!node.inputs?.find((i) => (i.name === "image" || i.name === "mask") && i.link);
     const mode = getWidgetValue(node, "mode") || "custom";
 
     // Standard Vue-rendered rows (hidden via options.hidden).
@@ -171,12 +159,6 @@ function refreshModeVisibility(node) {
     setWidgetHidden(findWidget(node, "x"), mode !== "custom_aspect_ratio");
     setWidgetHidden(findWidget(node, "y"), mode !== "custom_aspect_ratio");
     setWidgetHidden(findWidget(node, "megapixels"), !["keep_ar", "aspect_ratio", "custom_aspect_ratio"].includes(mode));
-    for (const name of ["upscale_method", "keep_proportion", "pad_color", "crop_position"]) {
-        setWidgetHidden(findWidget(node, name), !hasMedia);
-    }
-    for (const name of ["batch_size", "flux2_latent"]) {
-        setWidgetHidden(findWidget(node, name), hasMedia);
-    }
 
     const els = node._gibbyResElements;
     if (!els) return;

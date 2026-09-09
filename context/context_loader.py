@@ -193,7 +193,7 @@ class GibbyContextLoader(io.ComfyNode):
                 ctx["model"], ctx["clip"] = _apply_lora(ctx["model"], ctx["clip"], name, sm, sc)
 
         if ctx["model"] is not None and ck_attn and ModelAttentionBackend is not None:
-            ctx["model"], = ModelAttentionBackend().patch(ctx["model"], "comfy kitchen attention")
+            ctx["model"], = ModelAttentionBackend.execute(ctx["model"], "comfy kitchen attention")
 
         # Always fill in derived values (conditioning from prompts, latent from image/width-height).
         GibbyContext.evaluate(ctx)

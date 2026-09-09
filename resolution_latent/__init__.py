@@ -5,11 +5,16 @@ Creates an empty latent from a resolution spec instead of raw width/height.
 
 Four modes (switched by the horizontal mode toggle in resolution_latent.js):
 - keep_ar: resizes the linked media to the megapixels target at its own aspect
-  ratio (native Scale Image to Total Pixels math); only offered when an image or
-  mask is linked; all size widgets stay hidden except megapixels;
+  ratio (native Scale Image to Total Pixels math);
 - custom: explicit width x height;
 - aspect_ratio: core Resolution Selector presets + megapixels;
 - custom_aspect_ratio: manual x : y floats + megapixels.
+
+Megapixels 0 in the ratio modes: no target pixel count - the media's own size
+is used (rescaled by scale_factor) instead, or 1 MP when no media is linked.
+
+All widgets are always visible; the mode only selects which math drives the
+target size.
 
 Shared across all modes: swap_dimensions, scale_factor (resolution multiplier),
 multiple (round down to this multiple, advanced) and batch_size. The latent type
@@ -20,6 +25,12 @@ With an image or mask connected: the mode's target size becomes a box that the
 media is fitted into using keep_proportion (Resize Image v2 semantics - stretch,
 resize, pad with pad_color/crop_position, crop, total_pixels), and the resized
 media plus a matching latent are output.
+
+Optional upscale_model (Load Upscale Model): when connected and an image is
+linked, the image is first upscaled with it (Upscale Image (using Model))
+before the resize. The size spec follows the original image's size, so the
+upscaled result is fitted back into the target box (scale factor, not the
+model's factor, sets the final size).
 """
 
 import math
@@ -28,8 +39,8 @@ import torch
 import comfy.model_management
 import comfy.model_base
 import comfy.utils
-from nodes import VAEEncode, SetLatentNoiseMask
 from comfy_api.latest import io
+from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 
 from ..context import _CONTEXT_TYPE
 
@@ -124,7 +135,8 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 "Creates an empty latent from a resolution spec instead of raw width/height. "
                 "Modes: keep AR (megapixels at the media's aspect ratio, like Scale Image to Total Pixels), "
                 "custom (width x height), aspect ratio (preset + megapixels) or custom aspect ratio "
-                "(manual w:h + megapixels). "
+                "(manual w:h + megapixels). Megapixels 0 rescales the media's own size instead, or "
+                "defaults to 1 MP with no media linked. "
                 "Shared: swap dimensions, scale factor, multiple and batch size; latent type toggle for "
                 "standard 8x vs Flux2 16x latents. With an image or mask connected it is fitted into the "
                 "target box per keep_proportion (stretch/resize/pad/crop/total_pixels) and output resized."
@@ -145,7 +157,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 # custom aspect ratio mode: manual w : h floats.
                 io.Float.Input("x", default=3.0, min=0.1, max=99.0, step=0.01),
                 io.Float.Input("y", default=4.0, min=0.1, max=99.0, step=0.01),
-                io.Float.Input("megapixels", default=1.0, min=0.05, max=20.0, step=0.01),
+                io.Float.Input("megapixels", default=1.0, min=0.0, max=20.0, step=0.01),
                 # Resolution multiplier applied to any mode's target size.
                 io.Float.Input("scale_factor", default=1.0, min=0.05, max=16.0, step=0.01),
                 # media resize (only used when an image or mask is connected).
@@ -159,12 +171,12 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
                 # latent format: on = Flux 2's 128ch /16x latent, off = standard 4ch /8x.
                 io.Boolean.Input("flux2_latent", display_name="Flux 2 latent (16x)", default=False),
-                # Optional VAE override: used to encode a connected image when no context is provided,
-                # or to override the context's VAE.
-                io.Vae.Input("vae", optional=True),
+                # Optional Load Upscale Model: when linked and an image is present, upscale it
+                # (Upscale Image (using Model)) before the resize.
+                io.UpscaleModel.Input("upscale_model", optional=True),
             ],
             outputs=[
-                # Updated context with finalized dimensions/latent/image (None if no context in).
+                # Updated context with finalized dimensions/latent/image (new context when none in).
                 _CONTEXT_TYPE.Output(display_name="context"),
                 io.Latent.Output(display_name="latent"),
                 io.Int.Output(display_name="width"),
@@ -176,14 +188,27 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, context=None, image=None, mask=None, mode="custom", width=1024, height=1024, aspect_ratio="3:4 (Portrait Standard)", x=3.0, y=4.0,
+    def execute(cls, context=None, image=None, mask=None, upscale_model=None, mode="custom", width=1024, height=1024, aspect_ratio="3:4 (Portrait Standard)", x=3.0, y=4.0,
                 megapixels=1.0, swap_dimensions=False, scale_factor=1.0,
                 multiple=8, batch_size=1, flux2_latent=False, upscale_method="lanczos",
-                keep_proportion="stretch", pad_color="0, 0, 0", crop_position="center", vae=None) -> io.NodeOutput:
+                keep_proportion="stretch", pad_color="0, 0, 0", crop_position="center") -> io.NodeOutput:
         # If no input image but context has one, use context's image
         if image is None and isinstance(context, dict):
             image = context.get("image")
-        
+
+        # Original media W/H before any model upscale; the size spec follows
+        # this, and the upscaled image is fitted into the target box.
+        OW = OH = 0
+        if image is not None:
+            OW, OH = image.shape[2], image.shape[1]
+        elif mask is not None:
+            OW, OH = mask.shape[2], mask.shape[1]
+
+        # Optional model upscale (Load Upscale Model + Upscale Image (using Model)),
+        # applied before the resize so the upscaled image is what gets fitted.
+        if upscale_model is not None and image is not None:
+            image, = ImageUpscaleWithModel.execute(upscale_model, image)
+
         has_media = image is not None or mask is not None
         # Source W/H; same shape indices for [B,H,W,C] images and [B,H,W] masks.
         SW = SH = 0
@@ -212,9 +237,15 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 rw, rh = ASPECT_RATIOS[aspect_ratio]
             else:
                 rw, rh = float(x), float(y)
-            scale_by = math.sqrt(megapixels * 1024 * 1024 / (rw * rh))
-            w = round(rw * scale_by / step) * step
-            h = round(rh * scale_by / step) * step
+            if megapixels == 0 and has_media:
+                # 0 megapixels: no target pixel count, rescale the original media's size
+                # (before upscale_model), so the upscaled image is fitted back to it.
+                w, h = float(OW), float(OH)
+            else:
+                # 0 megapixels without media defaults to 1 MP.
+                scale_by = math.sqrt((megapixels or 1.0) * 1024 * 1024 / (rw * rh))
+                w = round(rw * scale_by / step) * step
+                h = round(rh * scale_by / step) * step
 
         w *= scale_factor
         h *= scale_factor
@@ -268,33 +299,24 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
             samples = torch.zeros([batch_size, 4, fh // 8, fw // 8], device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
             latent = {"samples": samples, "downscale_ratio_spacial": 8}
 
-        # Resolve VAE: directly-connected overrides context
-        effective_vae = vae
-        if effective_vae is None and isinstance(context, dict):
-            effective_vae = context.get("vae")
+        # Update context with finalized dimensions and media. This node never
+        # encodes: with an image present its stale latent is cleared, otherwise
+        # the empty latent of the resulting size is stored. Without a context
+        # input a new one is created, so the output is always a context with
+        # width, height and the empty latent.
+        ctx = context.copy() if isinstance(context, dict) else {}
+        ctx["width"] = int(fw)
+        ctx["height"] = int(fh)
 
-        # Update context with finalized dimensions and media.
-        if isinstance(context, dict):
-            ctx = context.copy()
-            ctx["width"] = int(fw)
-            ctx["height"] = int(fh)
-
-            if image is not None:
-                ctx["image"] = img
-                if effective_vae is not None:
-                    ctx["latent"], = VAEEncode().encode(effective_vae, img)
-                    if mask is not None:
-                        ctx["mask"] = msk
-                        ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], msk)
-            else:
-                ctx["latent"] = latent
-        elif image is not None and effective_vae is not None:
-            # No context, but image + VAE: encode to latent
-            latent, = VAEEncode().encode(effective_vae, img)
-            if mask is not None:
-                latent, = SetLatentNoiseMask().set_mask(latent, msk)
+        if image is not None:
+            ctx["image"] = img
+            ctx["latent"] = None
+        else:
+            ctx["latent"] = latent
+        if mask is not None:
+            ctx["mask"] = msk
 
         return io.NodeOutput(
-            ctx if isinstance(context, dict) else None,  # context (None when not connected)
+            ctx,  # context (new context when none connected)
             latent, int(fw), int(fh), img if image is not None else None, msk if mask is not None else None
         )
