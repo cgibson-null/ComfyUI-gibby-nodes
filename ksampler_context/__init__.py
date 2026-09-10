@@ -38,7 +38,7 @@ except ImportError:
     get_schedule = None
 
 import comfy.utils as _comfy_utils
-from nodes import VAEEncode, VAEDecode, VAEDecodeTiled, SetLatentNoiseMask
+from nodes import VAEEncode, VAEDecode, VAEDecodeTiled, VAEEncodeTiled, SetLatentNoiseMask
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.nodes_post_processing import ColorTransfer
 from ..context import _CONTEXT_TYPE, GibbyContext
@@ -52,6 +52,32 @@ def _find_option(options_list, opt_type):
         if o.get("type") == opt_type:
             return o
     return None
+
+
+def _tiled_settings(options_list):
+    """Tiled VAE settings from the options list: (tiled, tile_size, overlap, temporal_size, temporal_overlap)."""
+    opts = _find_option(options_list, "tiled_vae")
+    if opts is None:
+        return False, 512, 64, 64, 8
+    return True, opts.get("tile_size", 512), opts.get("overlap", 64), opts.get("temporal_size", 64), opts.get("temporal_overlap", 8)
+
+
+def _encode_image(vae, image, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap):
+    """VAE-encode an image, tiled when the tiled VAE settings are on."""
+    if tiled_decode:
+        latent, = VAEEncodeTiled().encode(vae, image, tile_size, overlap, temporal_size, temporal_overlap)
+    else:
+        latent, = VAEEncode().encode(vae, image)
+    return latent
+
+
+def _decode_latent(vae, latent, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap):
+    """VAE-decode a latent, tiled when the tiled VAE settings are on."""
+    if tiled_decode:
+        image, = VAEDecodeTiled().decode(vae, latent, tile_size, overlap, temporal_size, temporal_overlap)
+    else:
+        image, = VAEDecode().decode(vae, latent)
+    return image
 
 
 def _normalize_mask(mask):
@@ -294,6 +320,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
     mask_scale_start = opts.get("mask_scale_start", 1.0)
     mask_scale_end = opts.get("mask_scale_end", 1.0)
     inpaint_mode = opts.get("inpaint_mode", "masked_only")
+    tiled_decode, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options_list)
 
     result_image = image.clone()
 
@@ -314,7 +341,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
 
         # Encode (ensure float32 for VAE)
         crop_img = crop_img.float()
-        crop_latent, = VAEEncode().encode(vae, crop_img)
+        crop_latent = _encode_image(vae, crop_img, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
 
         # Prepare noise
         latent_image = crop_latent["samples"]
@@ -339,7 +366,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
 
         # Decode
         if decode and vae is not None:
-            refined_crop, = VAEDecode().decode(vae, {"samples": samples})
+            refined_crop = _decode_latent(vae, {"samples": samples}, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
         else:
             refined_crop = None
 
@@ -376,7 +403,8 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
 
 def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_model, vae, model_obj,
                             seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative,
-                            inpaint_opts=None):
+                            inpaint_opts=None, tiled_decode=False, tile_size=512, overlap=64,
+                            temporal_size=64, temporal_overlap=8):
     """One iterative upscale step: scale image (and mask) to target size, encode, ksample, decode.
     With a mask, each step samples only the masked area (crop-inpaint options control the mask)."""
     import torch.nn.functional as F
@@ -401,7 +429,7 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
         else:
             mask = F.interpolate(mask, size=(target_h, target_w), mode="bilinear", align_corners=False)
 
-    latent, = VAEEncode().encode(vae, image.float())
+    latent = _encode_image(vae, image.float(), tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
     latent_samples = comfy.sample.fix_empty_latent_channels(
         model_obj, latent["samples"],
         latent.get("downscale_ratio_spacial", None),
@@ -422,7 +450,7 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
         callback=callback,
         disable_pbar=not _comfy_utils.PROGRESS_BAR_ENABLED, seed=seed
     )
-    image, = VAEDecode().decode(vae, {"samples": samples})
+    image = _decode_latent(vae, {"samples": samples}, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
     return image, mask
 
 
@@ -464,6 +492,7 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     mode = opts.get("mode", "total")
     upscale_model = opts.get("upscale_model")
     verbose = opts.get("verbose", False)
+    tiled_decode, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options_list)
 
     # The engine's output cache can hand back the same options object on
     # repeated runs - never mutate it, the step state travels on a copy
@@ -505,7 +534,8 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
         if verbose:
             print(f"Gibby Iterative Upscale: step {i}/{total_steps} scale={scale:.2f} size={target_w}x{target_h} denoise={denoise_step:.3f}")
         image, mask = _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_model, vae, model_obj,
-                                                seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative, inpaint_opts)
+                                                seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative, inpaint_opts,
+                                                tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
         next_step = i
 
     # After the final planned step, match the result's color back to the original image
@@ -755,15 +785,7 @@ class GibbyKSamplerContext(io.ComfyNode):
 
         # Tiled VAE settings come from the options list (Tiled VAE options node):
         # presence of the option switches encode/decode to the tiled variants
-        tiled_opts = _find_option(options, "tiled_vae")
-        if tiled_opts is not None:
-            tiled_decode = True
-            tile_size = tiled_opts.get("tile_size", 512)
-            overlap = tiled_opts.get("overlap", 64)
-            temporal_size = tiled_opts.get("temporal_size", 64)
-            temporal_overlap = tiled_opts.get("temporal_overlap", 8)
-        else:
-            tiled_decode, tile_size, overlap, temporal_size, temporal_overlap = False, 512, 64, 64, 8
+        tiled_decode, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options)
 
         # Apply image-based options (crop-inpaint, iterative upscale) in list
         # order before evaluate(), which would otherwise encode the image for nothing
@@ -975,11 +997,7 @@ class GibbyKSamplerContext(io.ComfyNode):
         
         if decode:
             if ctx.get("vae") is not None:
-                if tiled_decode:
-                    decoded_image, = VAEDecodeTiled().decode(
-                        ctx["vae"], out_latent, tile_size, overlap, temporal_size, temporal_overlap)
-                else:
-                    decoded_image, = VAEDecode().decode(ctx["vae"], out_latent)
+                decoded_image = _decode_latent(ctx["vae"], out_latent, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
 
             # Decode to audio for context update and output (overrides any existing context.audio)
             if ctx.get("vae_audio") is not None and vae_decode_audio is not None:
