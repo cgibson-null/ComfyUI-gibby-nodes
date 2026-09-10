@@ -28,6 +28,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
                 io.Boolean.Input("color_match", default=True, tooltip="After inpainting, match the result's color back to the original image with Transfer Color"),
                 io.Combo.Input("color_match_method", default="mkl_lab", options=["reinhard_lab", "mkl_lab", "histogram"], tooltip="Transfer Color method for color_match"),
                 io.Float.Input("color_match_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Transfer Color strength for color_match (0=off)"),
+                io.Boolean.Input("verbose", default=False, tooltip="Print the mask count (split mode) and each cropped area size to the console"),
             ],
             outputs=[
                 _KSAMPLER_OPTIONS_TYPE.Output("options"),
@@ -38,7 +39,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
     def execute(cls, crop_factor=3.0, megapixels=0.0, scale_factor=1.0, multiple=8,
                 upscale_method="lanczos", inpaint_mode=True, mask_mode=True,
                 mask_scale_start=1.0, mask_scale_end=1.0, mask_indices="",
-                color_match=True, color_match_method="mkl_lab", color_match_strength=1.0):
+                color_match=True, color_match_method="mkl_lab", color_match_strength=1.0, verbose=False):
         option = {
             "type": "inpaint",
             "crop_factor": crop_factor,
@@ -54,6 +55,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
             "color_match": color_match,
             "color_match_method": color_match_method,
             "color_match_strength": color_match_strength,
+            "verbose": verbose,
         }
         return io.NodeOutput([option])
 

@@ -13,9 +13,12 @@ Key behaviors:
 - Automatically uses Flux2Scheduler for Flux2 models
 - Updates context after sampling (removes latent/mask, stores decoded image)
 - Options are applied in list order: crop-inpaint and iterative upscale run
-  before evaluate, tiled VAE settings apply to encode/decode; the options
-  output returns the (updated) options for feeding back in
+  before evaluate, tiled VAE settings apply to encode/decode, clear VRAM
+  options free VRAM after sampling / encode-decode (like Clean VRAM Used);
+  the options output returns the (updated) options for feeding back in
 """
+
+import gc
 
 import torch
 import comfy.samplers
@@ -52,6 +55,17 @@ def _find_option(options_list, opt_type):
         if o.get("type") == opt_type:
             return o
     return None
+
+
+def _clear_vram(event, verbose=False):
+    """Free VRAM like Easy-Use's Clean VRAM Used: gc, CUDA sync, unload all models, empty the cache."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+    if verbose:
+        print(f"Gibby KSampler (Context): Clear VRAM: after {event}")
 
 
 def _tiled_settings(options_list):
@@ -302,7 +316,8 @@ def _color_match(image, reference, opts):
 
 
 def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
-                  sampler_obj, sigmas_tensor, cfg_value, positive, negative, decode, options_list=None):
+                  sampler_obj, sigmas_tensor, cfg_value, positive, negative, decode, options_list=None,
+                  clear_after_model=False, clear_after_vae=False, clear_verbose=False):
     """Crop image by mask bbox, resize, encode, sample, composite back."""
     image = ctx["image"]
     mask = ctx["mask"]
@@ -311,6 +326,10 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
     mask, regions = _inpaint_regions(image, mask, opts)
     if not regions:
         return io.NodeOutput(ctx, ctx.get("latent"), image, None, vae, ctx.get("vae_audio"), options_list)
+
+    verbose = opts.get("verbose", False)
+    if verbose and opts.get("mask_mode", "single") == "split":
+        print(f"Gibby Crop-Inpaint: {len(regions)} masks")
 
     # Process each region
     megapixels = opts.get("megapixels", 0.0)
@@ -327,6 +346,8 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
     for idx, (x0, y0, x1, y1, seg_mask) in enumerate(regions):
         cw = x1 - x0
         ch = y1 - y0
+        if verbose:
+            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={cw}x{ch}")
 
         # Crop image and mask (mask is 3D: B,H,W); in split mode only this
         # segment's pixels are kept
@@ -363,10 +384,16 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
             noise_mask=noise_mask, callback=callback,
             disable_pbar=not _comfy_utils.PROGRESS_BAR_ENABLED, seed=seed
         )
+        # The model is done after sampling: free it before the decode so large
+        # resolutions don't choke the VAE (Clear VRAM options)
+        if clear_after_model:
+            _clear_vram("model", clear_verbose)
 
         # Decode
         if decode and vae is not None:
             refined_crop = _decode_latent(vae, {"samples": samples}, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
+            if clear_after_vae:
+                _clear_vram("vae", clear_verbose)
         else:
             refined_crop = None
 
@@ -390,6 +417,10 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
                 result_image[:, y0:y1, x0:x1, :3] * (1 - pm)
             )
 
+    # Without a decode the VAE is done after the last region's encode: free it.
+    if clear_after_vae and not (decode and vae is not None):
+        _clear_vram("vae", clear_verbose)
+
     # Match the result's color back to the original image
     result_image = _color_match(result_image, image, opts)
 
@@ -404,7 +435,8 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value, denoise_value,
 def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_model, vae, model_obj,
                             seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative,
                             inpaint_opts=None, tiled_decode=False, tile_size=512, overlap=64,
-                            temporal_size=64, temporal_overlap=8):
+                            temporal_size=64, temporal_overlap=8,
+                            clear_after_model=False, clear_after_vae=False, clear_verbose=False):
     """One iterative upscale step: scale image (and mask) to target size, encode, ksample, decode.
     With a mask, each step samples only the masked area (crop-inpaint options control the mask)."""
     import torch.nn.functional as F
@@ -450,14 +482,21 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
         callback=callback,
         disable_pbar=not _comfy_utils.PROGRESS_BAR_ENABLED, seed=seed
     )
+    # The model is done after sampling: free it before the decode so large
+    # resolutions don't choke the VAE (Clear VRAM options)
+    if clear_after_model:
+        _clear_vram("model", clear_verbose)
     image = _decode_latent(vae, {"samples": samples}, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
+    if clear_after_vae:
+        _clear_vram("vae", clear_verbose)
     return image, mask
 
 
 def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                        cfg_value, sampler_obj, positive, negative,
                        start_step=0.0, end_step=10000.0, leftover_noise=False,
-                       inpaint_opts=None, skip_color_match=False):
+                       inpaint_opts=None, skip_color_match=False,
+                       clear_after_model=False, clear_after_vae=False, clear_verbose=False):
     """Iterative pixel-space upscale along a linear scale path (simple step mode).
 
     State (next_step, base size) lives in the options dict; on first run it is
@@ -535,7 +574,8 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
             print(f"Gibby Iterative Upscale: step {i}/{total_steps} scale={scale:.2f} size={target_w}x{target_h} denoise={denoise_step:.3f}")
         image, mask = _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_model, vae, model_obj,
                                                 seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative, inpaint_opts,
-                                                tiled_decode, tile_size, overlap, temporal_size, temporal_overlap)
+                                                tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
+                                                clear_after_model, clear_after_vae, clear_verbose)
         next_step = i
 
     # After the final planned step, match the result's color back to the original image
@@ -559,7 +599,8 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
 
 def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, model_obj, seed, steps_value,
                                cfg_value, sampler_obj, positive, negative,
-                               start_step=0.0, end_step=10000.0, leftover_noise=False):
+                               start_step=0.0, end_step=10000.0, leftover_noise=False,
+                               clear_after_model=False, clear_after_vae=False, clear_verbose=False):
     """Iterative inpaint upscale: crop the mask regions (crop-inpaint options), iteratively
     upscale each crop with the mask applied on every step, then composite the results back
     into the full image upscaled by the iterative total factor."""
@@ -569,6 +610,10 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
     mask, regions = _inpaint_regions(image, ctx["mask"], inpaint_opts)
     if not regions:
         return None
+
+    verbose = inpaint_opts.get("verbose", False)
+    if verbose and inpaint_opts.get("mask_mode", "single") == "split":
+        print(f"Gibby Crop-Inpaint: {len(regions)} masks")
 
     # Both options may carry color match - the one earlier in the options list
     # wins; when the inpaint one wins, the per-crop match is skipped and the
@@ -594,7 +639,9 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
     crop_method = inpaint_opts.get("upscale_method", "bilinear")
 
     out_options = options_list
-    for (x0, y0, x1, y1, seg_mask) in regions:
+    for idx, (x0, y0, x1, y1, seg_mask) in enumerate(regions):
+        if verbose:
+            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0}")
         crop_img = image[:, y0:y1, x0:x1, :]
         crop_mask = seg_mask[y0:y1, x0:x1].unsqueeze(0) if seg_mask is not None else mask[:, y0:y1, x0:x1]
         crop_img, crop_mask, _, _ = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, crop_method)
@@ -603,7 +650,9 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
         out = _iterative_upscale(crop_ctx, iterative_opts, options_list, model_obj, seed,
                                  steps_value, cfg_value, sampler_obj, positive, negative,
                                  start_step, end_step, leftover_noise, inpaint_opts=inpaint_opts,
-                                 skip_color_match=inpaint_wins)
+                                 skip_color_match=inpaint_wins,
+                                 clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
+                                 clear_verbose=clear_verbose)
         out_options = out[6]
         final_crop = out[2]
         final_mask = crop_ctx.get("mask")
@@ -731,7 +780,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                 io.Mask.Input("mask", optional=True),
                 io.Sampler.Input("sampler", optional=True),
                 io.Sigmas.Input("sigmas", optional=True),
-                _KSAMPLER_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect an options node (Crop-Inpaint, Iterative Upscale, Tiled VAE) or Merge KSampler Options"),
+                _KSAMPLER_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect an options node (Crop-Inpaint, Iterative Upscale, Tiled VAE, Clear VRAM) or Merge KSampler Options"),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate="fixed"),
                 io.Int.Input("steps", default=0, min=0, max=10000),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
@@ -790,6 +839,10 @@ class GibbyKSamplerContext(io.ComfyNode):
         # Apply image-based options (crop-inpaint, iterative upscale) in list
         # order before evaluate(), which would otherwise encode the image for nothing
         options_list = options or []
+        clear_opt = _find_option(options_list, "clear_vram")
+        clear_after_model = clear_opt.get("after_model", True) if clear_opt else False
+        clear_after_vae = clear_opt.get("after_vae", True) if clear_opt else False
+        clear_verbose = clear_opt.get("verbose", False) if clear_opt else False
         result = None
         # Both options together run the iterative inpaint upscale: crop, upscale with
         # the mask applied on every step, composite back
@@ -802,12 +855,15 @@ class GibbyKSamplerContext(io.ComfyNode):
             steps_value, cfg_value, sampler_name, sampler_obj = _resolve_early_params(ctx, steps)
             result = _iterative_inpaint_upscale(ctx, inpaint_opt, iterative_opt, options_list, model_obj, seed,
                                                  steps_value, cfg_value, sampler_obj, ctx.get("positive"), ctx.get("negative"),
-                                                 start_step, end_step, leftover_noise)
+                                                 start_step, end_step, leftover_noise,
+                                                 clear_after_model, clear_after_vae, clear_verbose)
             if result is None:
                 # No mask regions: just iteratively upscale the full image
                 result = _iterative_upscale(ctx, iterative_opt, options_list, model_obj, seed,
                                              steps_value, cfg_value, sampler_obj, ctx.get("positive"), ctx.get("negative"),
-                                             start_step, end_step, leftover_noise)
+                                             start_step, end_step, leftover_noise,
+                                             clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
+                                             clear_verbose=clear_verbose)
         for opt in options_list:
             if result is not None:
                 break
@@ -821,14 +877,16 @@ class GibbyKSamplerContext(io.ComfyNode):
                 sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name, denoise_value)
                 result = _crop_inpaint(ctx, opt, model_obj, seed, steps_value, denoise_value,
                                        sampler_obj, sigmas_tensor, cfg_value, ctx.get("positive"), ctx.get("negative"), decode,
-                                       options_list)
+                                       options_list, clear_after_model, clear_after_vae, clear_verbose)
             elif opt.get("type") == "iterative_upscale" and ctx.get("image") is not None and ctx.get("vae") is not None:
                 _ensure_conditioning(ctx)
                 model_obj = ctx.get("model")
                 steps_value, cfg_value, sampler_name, sampler_obj = _resolve_early_params(ctx, steps)
                 result = _iterative_upscale(ctx, opt, options_list, model_obj, seed,
                                              steps_value, cfg_value, sampler_obj, ctx.get("positive"), ctx.get("negative"),
-                                             start_step, end_step, leftover_noise)
+                                             start_step, end_step, leftover_noise,
+                                             clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
+                                             clear_verbose=clear_verbose)
         if result is not None:
             return result
 
@@ -985,6 +1043,11 @@ class GibbyKSamplerContext(io.ComfyNode):
                 disable_pbar=disable_pbar, seed=seed
             )
 
+        # The model is done after sampling: free it before the decode so the
+        # VAE gets the VRAM back (Clear VRAM options).
+        if decode and clear_after_model:
+            _clear_vram("model", clear_verbose)
+
         # Build output latent
         out_latent = ctx["latent"].copy()
         out_latent.pop("downscale_ratio_spacial", None)
@@ -1002,6 +1065,13 @@ class GibbyKSamplerContext(io.ComfyNode):
             # Decode to audio for context update and output (overrides any existing context.audio)
             if ctx.get("vae_audio") is not None and vae_decode_audio is not None:
                 decoded_audio = vae_decode_audio(ctx["vae_audio"], out_latent)
+
+            if clear_after_vae:
+                _clear_vram("vae", clear_verbose)
+        elif clear_after_model or clear_after_vae:
+            # No decode: the VAE is done with the pre-sample encode, so both
+            # are free to go.
+            _clear_vram("model and vae", clear_verbose)
 
         # Update context after sampling
         ctx.pop("mask", None)    # Remove mask

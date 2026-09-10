@@ -6,7 +6,7 @@
 // Right-click Extensions:
 // - "Add second pass upscale": 2x second pass to the right of the node -
 //   Resize Image / Empty Latent (Context) (Keep AR, 0 megapixels, scale factor 2)
-//   -> KSampler (Context) (denoise 0.6) -> Compare Images (original vs second pass).
+//   -> KSampler (Context) (denoise 0.6) -> Compare Images (resized vs second pass).
 // - "Add iterative upscale": Iterative Upscale options -> KSampler (Context),
 //   context straight from the original node, Compare Images at the end.
 // - "Add iterative step": KSampler (Context) fed by the original node's options
@@ -77,7 +77,7 @@ function addSecondPassUpscale(node) {
 
     node.connect(0, resize, 0);  // context -> context
     resize.connect(0, sampler, 0);  // context -> context
-    node.connect(2, compare, 0);  // original image -> image_a
+    resize.connect(4, compare, 0);  // resized image -> image_a
     sampler.connect(2, compare, 1);  // second pass image -> image_b
 }
 

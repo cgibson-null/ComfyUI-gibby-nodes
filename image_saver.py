@@ -6,8 +6,10 @@ workflows:
 - Generation settings (model name, seed, steps, sampler, prompts, size) come
   from the linked CONTEXT instead of widgets; an optional image input overrides
   the context's image.
-- LoRA names are pulled from the context's lora_stack and appended to the
-  positive prompt as <lora:name:weight> tags before metadata processing.
+- LoRA names are converted from the context's lora_stack with Lora Loader's
+  tag format and written to the metadata without touching the prompt; the
+  append_lora_names toggle appends them to the positive prompt as
+  <lora:name:weight> tags instead.
 - Resource hashes and Civitai data live in JSON caches at the plugin root
   (lora_info_cache.json via Lora Loader, model_info_cache.json here) instead
   of .sha256/.civitai.info files next to models; embeddings are hashed in
@@ -379,9 +381,7 @@ class PromptMetadataExtractor:
                 embeddings = re.findall(self.EMBEDDING, text, re.IGNORECASE | re.MULTILINE)
                 for embedding in embeddings:
                     self.__extract_embedding_information(embedding, weight)
-            loras = re.findall(self.LORA, prompt, re.IGNORECASE | re.MULTILINE)
-            for lora in loras:
-                self.__extract_lora_information(lora)
+        self.__loras = _extract_loras("\n".join(prompts))
 
     def __extract_embedding_information(self, embedding: str, weight: float) -> None:
         embedding_name = _civitai_embedding_key_name(embedding)
@@ -392,25 +392,31 @@ class PromptMetadataExtractor:
         sha = _hash_file_sync(embedding_path)[:10]
         self.__embeddings[embedding_name] = (embedding_path, weight, sha)
 
-    def __extract_lora_information(self, lora: tuple[str, str]) -> None:
+
+def _extract_loras(text: str) -> dict[str, tuple[str, float, str]]:
+    """Parse <lora:name:weight> tags into loras in the format as known by civitAI:
+    name -> (path, weight, 10-char hash)."""
+    loras: dict[str, tuple[str, float, str]] = {}
+    for lora in re.findall(PromptMetadataExtractor.LORA, text, re.IGNORECASE | re.MULTILINE):
         lora_name = _civitai_lora_key_name(lora[0])
         # Match by full filename (with subfolder) so hashing resolves the same
         # way Lora Loader does and reuses its info cache entries.
         matching_lora = _get_file_path_match("loras", lora[0])
         if not matching_lora:
             print(f'Gibby Image Saver: could not find full path to lora "{lora[0]}"')
-            return
+            continue
         matching_lora = os.path.normpath(matching_lora)
         lora_path = folder_paths.get_full_path("loras", matching_lora)
         try:
-            lora_weight = float(lora[1].split(':')[0])
+            lora_weight = float((lora[1] or "1").split(':')[0])
         except (ValueError, TypeError):
             lora_weight = 1.0
         # Hash via the shared lora info cache instead of writing .sha256 files
         digest = _lora_hash_for(matching_lora)
         if not digest:
-            return
-        self.__loras[lora_name] = (lora_path, lora_weight, digest[:10])
+            continue
+        loras[lora_name] = (lora_path, lora_weight, digest[:10])
+    return loras
 
 
 # --- Filename templating (ComfyUI-Image-Saver/nodes.py) ----------------------
@@ -620,16 +626,21 @@ def _clean_prompt(prompt: str, metadata_extractor: PromptMetadataExtractor) -> s
     return prompt
 
 
-def _make_metadata(modelname: str, positive: str, negative: str, width: int, height: int, seed_value: int, steps: int, cfg: float, sampler_name: str, scheduler_name: str, denoise: float, custom: str, additional_hashes: str, download_civitai_data: bool, easy_remix: bool) -> Metadata:
+def _make_metadata(modelname: str, positive: str, negative: str, width: int, height: int, seed_value: int, steps: int, cfg: float, sampler_name: str, scheduler_name: str, denoise: float, custom: str, additional_hashes: str, download_civitai_data: bool, easy_remix: bool, lora_names: str = "", append_lora_names: bool = False) -> Metadata:
     modelname, additional_hashes = _get_multiple_models(modelname, additional_hashes)
 
     ckpt_path = _full_checkpoint_path_for(modelname)
     model_digest = _model_hash_for(ckpt_path) if ckpt_path else None
     modelhash = model_digest[:10] if model_digest else ""
 
+    if append_lora_names and lora_names:
+        positive = f"{positive}, {lora_names}" if positive else lora_names
+
     metadata_extractor = PromptMetadataExtractor([positive, negative])
     embeddings = metadata_extractor.get_embeddings()
-    loras = metadata_extractor.get_loras()
+    # LoRAs come from the context's lora_stack; tags left in the prompt text
+    # still work, and the stack's entries win on name collisions.
+    loras = {**metadata_extractor.get_loras(), **_extract_loras(lora_names)}
     civitai_sampler_name = _get_civitai_sampler_name(sampler_name.replace('_gpu', ''), scheduler_name)
     basemodelname = _parse_checkpoint_name_without_extension(modelname)
 
@@ -869,7 +880,8 @@ class GibbyImageSaverContext(io.ComfyNode):
                     default="",
                     tooltip="hashes separated by commas, optionally with names. 'Name:HASH' (e.g., 'MyLoRA:FF735FF83F98')\nWith download_civitai_data set to true, weights can be added as well. (e.g., 'HASH:Weight', 'Name:HASH:Weight')",
                 ),
-                io.Boolean.Input("download_civitai_data", default=True, tooltip="Download and cache data from civitai.red to save correct metadata. Allows LoRA weights to be saved to the metadata."),
+                io.Boolean.Input("download_civitai_data", default=False, tooltip="Download and cache data from civitai.red to save correct metadata. Allows LoRA weights to be saved to the metadata."),
+                io.Boolean.Input("append_lora_names", default=False, tooltip="Append the context's lora names to the prompt as <lora:name:weight> tags in the saved metadata. Off: the prompt stays clean, LoRAs are still written to the hashes from the context."),
                 io.Boolean.Input("easy_remix", default=True, tooltip="Strip LoRAs and simplify 'embedding:path' from the prompt to make the Remix option on civitai.red more seamless."),
                 io.Boolean.Input("show_preview", default=True, tooltip="if True, displays saved images in the UI preview"),
                 io.String.Input("custom", default="", tooltip="custom string to add to the metadata, inserted into the a111 string before the model hash"),
@@ -886,7 +898,7 @@ class GibbyImageSaverContext(io.ComfyNode):
     def execute(cls, context=None, image=None, filename='%time_%basemodelname_%seed', path='', extension='png',
                 lossless_webp=True, quality_jpeg_or_webp=100, optimize_png=False, counter=0, denoise=1.0,
                 time_format="%Y-%m-%d-%H%M%S", save_workflow_as_json=False, embed_workflow=True, additional_hashes='',
-                download_civitai_data=True, easy_remix=True, show_preview=True, custom='', save_image=True) -> io.NodeOutput:
+                download_civitai_data=False, append_lora_names=False, easy_remix=True, show_preview=True, custom='', save_image=True) -> io.NodeOutput:
         # Generation settings from the context instead of widgets.
         ctx = context if isinstance(context, dict) else {}
         has_context = bool(ctx)
@@ -917,7 +929,9 @@ class GibbyImageSaverContext(io.ComfyNode):
             width = int(img_w)
             height = int(img_h)
 
-        # LoRA names from the context's lora_stack, appended to the positive prompt.
+        # LoRA names converted from the context's lora_stack with Lora
+        # Loader's tag format.
+        lora_names = ''
         lora_stack = ctx.get("lora_stack")
         if isinstance(lora_stack, list):
             tags = []
@@ -925,10 +939,9 @@ class GibbyImageSaverContext(io.ComfyNode):
                 if not item or len(item) < 3 or item[0] == "None":
                     continue
                 tags.append(_format_lora_tag(item[0], item[1]))
-            if tags:
-                positive = f"{positive}, {', '.join(tags)}" if positive else ', '.join(tags)
+            lora_names = ", ".join(tags)
 
-        metadata = _make_metadata(modelname, positive, negative, width, height, seed_value, steps, cfg, sampler_name, scheduler_name, denoise, custom, additional_hashes, download_civitai_data, easy_remix)
+        metadata = _make_metadata(modelname, positive, negative, width, height, seed_value, steps, cfg, sampler_name, scheduler_name, denoise, custom, additional_hashes, download_civitai_data, easy_remix, lora_names, append_lora_names)
 
         path = _make_pathname(path, width, height, seed_value, modelname, counter, time_format, sampler_name, steps, cfg, scheduler_name, denoise, custom)
         

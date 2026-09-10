@@ -41,6 +41,7 @@ import comfy.model_base
 import comfy.utils
 from comfy_api.latest import io
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
+from comfy_extras.color_util import hex_to_rgb
 
 from ..context import _CONTEXT_TYPE
 
@@ -105,11 +106,11 @@ def _crop_offsets(ow, oh, cw, ch, position):
 
 
 def _pad_color_tensor(pad_color, dtype, device):
-    vals = [float(v) for v in pad_color.split(",")]
-    if len(vals) == 1:
-        vals = vals * 3
-    scale = 1 / 255.0 if max(vals[:3]) > 1 else 1.0
-    return torch.tensor([v * scale for v in vals[:3]], dtype=dtype, device=device)
+    # Same format as the core Color Picker: #RRGGBB or #RRGGBBAA.
+    if len(pad_color) not in (7, 9) or pad_color[0] != "#":
+        raise ValueError("Color must be in format #RRGGBB or #RRGGBBAA")
+    r, g, b = hex_to_rgb(pad_color[:7])
+    return torch.tensor([v / 255.0 for v in (r, g, b)], dtype=dtype, device=device)
 
 
 def _color_pad(img, left, right, top, bottom, bg):
@@ -148,7 +149,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Image.Input("image", optional=True),
                 io.Mask.Input("mask", optional=True),
                 # Mode switcher (rendered as a horizontal toggle by resolution_latent.js).
-                io.Combo.Input("mode", options=["keep_ar", "custom", "aspect_ratio", "custom_aspect_ratio"], default="custom"),
+                io.Combo.Input("mode", options=["keep_ar", "custom", "aspect_ratio", "custom_aspect_ratio"], default="aspect_ratio"),
                 # custom mode: explicit width x height.
                 io.Int.Input("width", default=1024, min=8, max=16384),
                 io.Int.Input("height", default=1024, min=8, max=16384),
@@ -163,7 +164,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 # media resize (only used when an image or mask is connected).
                 io.Combo.Input("upscale_method", options=["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], default="lanczos"),
                 io.Combo.Input("keep_proportion", options=KEEP_PROPORTIONS, default="stretch", advanced=True),
-                io.String.Input("pad_color", default="0, 0, 0", advanced=True),
+                io.Color.Input("pad_color", default="#000000", advanced=True),
                 io.Combo.Input("crop_position", options=CROP_POSITIONS, default="center", advanced=True),
                 # shared settings (plain booleans render as pill toggles).
                 io.Boolean.Input("swap_dimensions", display_name="Swap dimensions", default=False),
@@ -188,10 +189,10 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, context=None, image=None, mask=None, upscale_model=None, mode="custom", width=1024, height=1024, aspect_ratio="3:4 (Portrait Standard)", x=3.0, y=4.0,
+    def execute(cls, context=None, image=None, mask=None, upscale_model=None, mode="aspect_ratio", width=1024, height=1024, aspect_ratio="3:4 (Portrait Standard)", x=3.0, y=4.0,
                 megapixels=1.0, swap_dimensions=False, scale_factor=1.0,
                 multiple=8, batch_size=1, flux2_latent=False, upscale_method="lanczos",
-                keep_proportion="stretch", pad_color="0, 0, 0", crop_position="center") -> io.NodeOutput:
+                keep_proportion="stretch", pad_color="#000000", crop_position="center") -> io.NodeOutput:
         # If no input image but context has one, use context's image
         if image is None and isinstance(context, dict):
             image = context.get("image")

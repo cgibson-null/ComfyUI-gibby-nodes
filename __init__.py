@@ -24,6 +24,7 @@ import os
 from comfy_api.latest import ComfyExtension, io
 
 from .lora_loader import GibbyLoraLoader
+from .clear_vram_options import GibbyClearVramOptions
 from .context import GibbyContext
 from .context.context_override import GibbyContextOverride
 from .context.sampling_parameters import GibbySamplingParametersContext
@@ -36,6 +37,8 @@ from .h3_pipe import H3PipeCreate, H3PipeApply
 from .reference_latent_context import GibbyReferenceLatentContext
 from .pipe_any import PipeAny
 from .crop_image import GibbyCropImage
+from .crop_image_by_mask import GibbyCropImageByMaskBatch
+from .paste_image_by_mask import GibbyPasteImageByMaskBatch
 from .pause_execution import GibbyPauseExecution
 from .crop_inpaint_options import GibbyCropInpaintOptions
 from .iterative_upscale_options import GibbyIterativeUpscaleOptions
@@ -97,7 +100,7 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyCropImage, GibbyCropInpaintOptions, GibbyIterativeUpscaleOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
+        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyIterativeUpscaleOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

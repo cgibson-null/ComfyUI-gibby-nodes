@@ -24,7 +24,7 @@ from comfy_extras.nodes_audio import VAEEncodeAudio
 from comfy_extras.nodes_lt import LTXVConcatAVLatent
 from comfy_api.latest import io
 
-from ..lora_loader import _apply_lora, _format_lora_tag
+from ..lora_loader import _apply_lora
 
 _CONTEXT_TYPE = io.Custom("CONTEXT")
 _lora_stack = io.Custom("LORA_STACK")
@@ -118,7 +118,6 @@ class GibbyContext(io.ComfyNode):
                 io.String.Output(display_name="positive_prompt"),
                 io.String.Output(display_name="negative_prompt"),
                 io.AnyType.Output(display_name="any"),
-                io.String.Output(display_name="lora_names"),
             ],
         )
 
@@ -178,15 +177,6 @@ class GibbyContext(io.ComfyNode):
                 name, sm, sc = item[0], item[1], item[2]
                 ctx["model"], ctx["clip"] = _apply_lora(ctx["model"], ctx["clip"], name, sm, sc)
 
-        # LoRA names for downstream nodes, like Lora Loader's lora_names output.
-        lora_tags = []
-        if isinstance(ctx["lora_stack"], list):
-            for item in ctx["lora_stack"]:
-                if not item or len(item) < 3 or item[0] == "None":
-                    continue
-                lora_tags.append(_format_lora_tag(item[0], item[1]))
-        ctx["lora_names"] = ", ".join(lora_tags)
-
         return io.NodeOutput(
             ctx,  # context
             ctx["model"],  # model
@@ -213,7 +203,6 @@ class GibbyContext(io.ComfyNode):
             ctx["positive_prompt"],  # positive_prompt
             ctx["negative_prompt"],  # negative_prompt
             ctx["any"],  # any_value
-            ctx["lora_names"],  # lora_names
         )
 
     @staticmethod

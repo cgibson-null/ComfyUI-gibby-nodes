@@ -7,19 +7,35 @@ import { app } from "../../../scripts/app.js";
 // considers REQUIRED inputs and slices each list to the
 // Comfy.NodeSuggestions.number setting. Nodes whose slot is optional by design
 // never make it in - append them manually after registration (like rgthree
-// does) so every node that accepts or produces the type ends up in the list
-// in both directions.
+// does): dragging from an output offers nodes that accept the type, dragging
+// into an input offers nodes that produce it.
 
-const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS"];
+const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO"];
+
+// Autogrow inputs (COMFY_AUTOGROW_V3) hide their real type inside
+// spec.template.input - e.g. Merge KSampler Options' option1...option10.
+function autogrowMatches(spec, type) {
+    const templateInput = spec?.template?.input;
+    if (!templateInput || typeof templateInput !== "object") return false;
+    return Object.values(templateInput).some(
+        (group) => typeof group === "object" && group &&
+            Object.values(group).some((s) => specMatches(s, type))
+    );
+}
 
 function specMatches(spec, type) {
     // spec can be ["TYPE", {}] or {type: "TYPE"} or "TYPE"
-    if (Array.isArray(spec) && spec[0] === type) return true;
-    if (typeof spec === "string" && spec === type) return true;
-    if (typeof spec === "object" && spec && !Array.isArray(spec)) {
+    if (Array.isArray(spec)) {
+        if (spec[0] === type) return true;
+        if (spec[0] === "COMFY_AUTOGROW_V3") return autogrowMatches(spec[1], type);
+        return false;
+    }
+    if (typeof spec === "string") return spec === type;
+    if (typeof spec === "object" && spec) {
         const t = spec.type;
         if (Array.isArray(t)) return t.includes(type);
-        return t === type;
+        if (t === type) return true;
+        return autogrowMatches(spec, type);
     }
     return false;
 }
@@ -80,26 +96,21 @@ app.registerExtension({
             };
 
             for (const type of SUGGESTED_TYPES) {
-                const both = new Set([
-                    ...(inputTypes.get(type) || []),
-                    ...(outputTypes.get(type) || []),
-                ]);
-
-                // Dragging from an output of this type
+                // Dragging from an output of this type: nodes that accept it
                 const outSuggestions =
                     LiteGraph.slot_types_default_out[type] ||
                     (LiteGraph.slot_types_default_out[type] = ["Reroute"]);
-                for (const t of both) {
+                for (const t of inputTypes.get(type) || []) {
                     if (!outSuggestions.includes(t)) outSuggestions.push(t);
                 }
                 sortSuggestions(outSuggestions);
 
-                // Dragging into an input of this type
+                // Dragging into an input of this type: nodes that produce it
                 if (!LiteGraph.slot_types_default_in) LiteGraph.slot_types_default_in = {};
                 const inSuggestions =
                     LiteGraph.slot_types_default_in[type] ||
                     (LiteGraph.slot_types_default_in[type] = ["Reroute"]);
-                for (const t of both) {
+                for (const t of outputTypes.get(type) || []) {
                     if (!inSuggestions.includes(t)) inSuggestions.push(t);
                 }
                 sortSuggestions(inSuggestions);

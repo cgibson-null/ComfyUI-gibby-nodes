@@ -13,9 +13,9 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
             description="Outputs iterative upscale options. Feed into KSampler (Context) options input; the upscale model travels inside the options.",
             inputs=[
                 io.Float.Input("upscale_factor", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Total resolution multiplier across all steps"),
-                io.Int.Input("steps", default=3, min=1, max=100, step=1, tooltip="Number of iterative upscale steps"),
+                io.Int.Input("steps", default=2, min=1, max=100, step=1, tooltip="Number of iterative upscale steps"),
                 io.Float.Input("start_denoise", default=0.6, min=0.0, max=1.0, step=0.01, tooltip="Denoise of the first step; ramps down to target_denoise by the last step"),
-                io.Float.Input("target_denoise", default=0.1, min=0.0, max=1.0, step=0.01, tooltip="Denoise of the last step; kept for steps beyond 'steps'"),
+                io.Float.Input("target_denoise", default=0.3, min=0.0, max=1.0, step=0.01, tooltip="Denoise of the last step; kept for steps beyond 'steps'"),
                 io.Combo.Input("upscale_method", default="lanczos", options=["bilinear", "area", "nearest", "lanczos"], tooltip="Resize method used on each step when no upscale model is connected"),
                 io.Boolean.Input("mode", default=True, label_on="total", label_off="single", tooltip="total: run all remaining steps at once. single: run one step per KSampler (Context) run."),
                 io.Boolean.Input("color_match", default=True, tooltip="After the final step (total mode), match the result's color back to the original image with Transfer Color"),
@@ -30,7 +30,7 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, upscale_factor=2.0, steps=3, start_denoise=0.6, target_denoise=0.1,
+    def execute(cls, upscale_factor=2.0, steps=2, start_denoise=0.6, target_denoise=0.3,
                 upscale_method="lanczos", mode=True, color_match=True,
                 color_match_method="mkl_lab", color_match_strength=1.0, verbose=False, upscale_model=None):
         option = {

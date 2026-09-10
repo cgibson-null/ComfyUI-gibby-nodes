@@ -150,7 +150,7 @@ function syncDomInputs(node) {
 // widgets (upscale_method/keep_proportion/pad_color/crop_position) and
 // batch_size/flux2_latent stay visible regardless of a linked media input.
 function refreshModeVisibility(node) {
-    const mode = getWidgetValue(node, "mode") || "custom";
+    const mode = getWidgetValue(node, "mode") || "aspect_ratio";
 
     // Standard Vue-rendered rows (hidden via options.hidden).
     setWidgetHidden(findWidget(node, "width"), mode !== "custom");
