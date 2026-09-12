@@ -68,7 +68,7 @@ class GibbyContextLoader(io.ComfyNode):
                                     io.DynamicCombo.Option("4", _clip_name_inputs(4)),
                                 ],
                             ),
-                            io.Combo.Input("type", options=CLIPLoader.INPUT_TYPES()["required"]["type"][0], default="stable_diffusion"),
+                            io.Combo.Input("type", options=CLIPLoader.INPUT_TYPES()["required"]["type"][0], default="krea2"),
                             io.Combo.Input("device", options=["default", "cpu"], default="default", advanced=True),
                             io.Combo.Input("vae_name", options=["None"] + VAELoader.vae_list(VAELoader), default="None"),
                             io.Combo.Input("vae_audio_name", options=["None"] + VAELoader.vae_list(VAELoader), optional=True, default="None"),
