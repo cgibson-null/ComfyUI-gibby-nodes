@@ -9,6 +9,9 @@ Key behaviors:
 - Uses context values unless overridden by inputs or widgets
 - Encodes images to latents automatically (with mask support)
 - With an image present, samples with refiner steps instead of base steps
+- Iterative Options with no image in the context: the 1st step is the basic
+  generation (denoise 1.0, base steps, no mask), and the image it generates
+  is treated as if it had been provided (color match reference)
 - Handles start_step/end_step as offsets from total steps when negative
 - Automatically uses Flux2Scheduler for Flux2 models
 - Updates context after sampling (removes latent/mask, stores decoded image)
@@ -18,7 +21,9 @@ Key behaviors:
   encode-decode (like Clean VRAM Used), lora travel retunes the lora
   strengths per step, and prompt travel is native: when a context prompt
   carries a Forge-style [before:after:step] group the positive/negative prompts
-  are swapped per step, re-encoded grafted onto the context conditionings so
+  are swapped per step, a [before:after:step:radius] group crossfades them
+  linearly around the step (radius steps each side stays pure), the per-step
+  prompts are re-encoded grafted onto the context conditionings so
   reference payloads (flux2 reference_latents, h3 minimax refs/keyframes) survive;
   the options output returns the (updated) options for feeding back in
 """
@@ -166,7 +171,8 @@ def _load_lora_into_clip(clip, lora, strength):
 
 def _travel_step_strength(lora, step):
     """The lora's model strength at a step index: its stack strength scaled by the linear
-    ramp from start_str (at start) to end_str (at the last active step, end-1); 0.0
+    ramp from start_str (at start) to end_str (at the last active step, end-1) - the
+    ramp value itself when the stack strength is 0 (absolute, not a modifier); 0.0
     outside [start, end)."""
     if not (lora["start"] <= step < lora["end"]):
         return 0.0
@@ -175,20 +181,25 @@ def _travel_step_strength(lora, step):
         factor = lora["start_str"]
     else:
         factor = lora["start_str"] + (lora["end_str"] - lora["start_str"]) * (step - lora["start"]) / (last - lora["start"])
-    return lora["strength"] * factor
+    return factor if lora["strength"] == 0 else lora["strength"] * factor
 
 
-def _prepare_lora_travels(model_obj, travel_opts, steps_value):
+def _prepare_lora_travels(model_obj, travel_opts, steps_value, iteration_steps=None):
     """Apply every travel's lora stack to a clone of the model at zero strength and
     record each lora's patch entries, so the per-step callback can retune them.
+    With iteration_steps (per_iteration travels with an iterative upscale), the
+    strength is retuned per iteration step instead: start/end resolve against the
+    iteration count and every sampling step of an iteration shares one strength.
     Returns None when there is nothing to travel."""
     if not travel_opts or not steps_value or steps_value <= 0:
         return None
 
+    per_iteration = iteration_steps is not None and any(opt.get("per_iteration", False) for opt in travel_opts)
+    range_steps = iteration_steps if per_iteration else steps_value
     patcher = model_obj.clone()
     loras = []
     for opt in travel_opts:
-        start, end = _resolve_step_range(steps_value, opt.get("start_step", 0.0), opt.get("end_step", 100.0))
+        start, end = _resolve_step_range(range_steps, opt.get("start_step", 0.0), opt.get("end_step", 100.0))
         if end <= start:
             continue
         start_str = opt.get("start_str", 0.6)
@@ -197,7 +208,7 @@ def _prepare_lora_travels(model_obj, travel_opts, steps_value):
             if not item or len(item) < 3 or item[0] in (None, "None"):
                 continue
             name, strength = item[0], item[1]
-            if not strength:
+            if strength is None:
                 continue
             lora = _load_lora_state(name)
             if lora is None:
@@ -225,7 +236,8 @@ def _prepare_lora_travels(model_obj, travel_opts, steps_value):
     return {
         "patcher": patcher,
         "loras": loras,
-        "steps": steps_value,
+        "steps": range_steps,
+        "per_iteration": per_iteration,
         "verbose": any(opt.get("verbose", False) for opt in travel_opts),
     }
 
@@ -297,7 +309,13 @@ def _sample_with_lora_travels(travel_state, noise, cfg_value, sampler_obj, sigma
                               latent_image, noise_mask, callback, disable_pbar, seed, step_offset=0):
     """Sample with the travel loras retuned on every step: each step is denoised with
     the strength the travels have at its global index (i + step_offset), so the run
-    proceeds step by step (0-1, 1-2, ...) with per-step lora strengths."""
+    proceeds step by step (0-1, 1-2, ...) with per-step lora strengths. With
+    per_iteration on, the strengths were set per iteration step by the iterative
+    upscale loop and every sampling step of an iteration shares them."""
+    if travel_state.get("per_iteration"):
+        return comfy.sample.sample_custom(travel_state["patcher"], noise, cfg_value, sampler_obj, sigmas_tensor,
+                                          positive, negative, latent_image, noise_mask=noise_mask,
+                                          callback=callback, disable_pbar=disable_pbar, seed=seed)
     steps = len(sigmas_tensor) - 1
     for lora in travel_state["loras"]:
         lora["current"] = 0.0
@@ -347,15 +365,18 @@ def _parse_travel_group(content):
     """The parsed contents of a [...] group:
     - [before:after:step] -> a (before, after, step) switch; before is active until
       the step, after from it on (step with a dot=fraction of steps, without=absolute).
-    - [before:after] or [before:after,period] -> an ("alt", before, after, period)
+    - [before:after:step:radius] -> a ("blend", before, after, step, radius) crossfade:
+      the prompts mix linearly around the step, radius is how many steps each side
+      stays pure (with a dot a fraction of the steps).
+    - [before:after] or [before:after|period] -> an ("alt", before, after, period)
       alternate that flips between before and after; period is how many steps each
       side stays active (default 1, with a dot a fraction of the steps).
     Otherwise the content is plain text."""
     parts = _split_travel(content)
     if len(parts) == 2:
         after_text, period = parts[1], ""
-        if "," in after_text:
-            after_text, _, period = after_text.partition(",")
+        if "|" in after_text:
+            after_text, _, period = after_text.partition("|")
             try:
                 float(period)
             except ValueError:
@@ -367,6 +388,14 @@ def _parse_travel_group(content):
         float(parts[-1])
     except ValueError:
         return content
+    if len(parts) >= 4:
+        try:
+            float(parts[-2])
+        except ValueError:
+            pass
+        else:
+            return ("blend", _parse_travel_expr(":".join(parts[:-3])), _parse_travel_expr(parts[-3]),
+                    parts[-2], parts[-1])
     return (_parse_travel_expr(":".join(parts[:-2])), _parse_travel_expr(parts[-2]), parts[-1])
 
 
@@ -405,9 +434,9 @@ def _parse_travel_expr(text):
 
 
 def _resolve_travel_step(node, steps_value):
-    """Resolve every switch step and alternate period of a travel tree against the
-    total step count (a value with a dot is a fraction of the steps, without one an
-    absolute count) and clamp it into range."""
+    """Resolve every switch step, blend step/radius and alternate period of a travel
+    tree against the total step count (a value with a dot is a fraction of the steps,
+    without one an absolute count) and clamp it into range."""
     if isinstance(node, str):
         return node
     if isinstance(node, list):
@@ -421,34 +450,76 @@ def _resolve_travel_step(node, steps_value):
             period = 1
         return ("alt", _resolve_travel_step(before, steps_value),
                 _resolve_travel_step(after, steps_value), period)
+    if node[0] == "blend":
+        _, before, after, center, radius = node
+        c = int(float(center) * steps_value) if "." in center else int(float(center))
+        r = int(float(radius) * steps_value) if "." in radius else int(float(radius))
+        return ("blend", _resolve_travel_step(before, steps_value),
+                _resolve_travel_step(after, steps_value),
+                max(0, min(steps_value, c)), max(1, r))
     before, after, step = node
     val = int(float(step) * steps_value) if "." in step else int(float(step))
     return (_resolve_travel_step(before, steps_value), _resolve_travel_step(after, steps_value),
             max(0, min(steps_value, val)))
 
 
+def _pieces(item):
+    """A rendered prompt piece as (text, weight) endpoints: a plain string is a
+    single full-strength endpoint, a ("mix", ...) item its endpoints."""
+    return [(item, 1.0)] if isinstance(item, str) else item[1]
+
+
+def _mix_pieces(a, b, w):
+    """Blend two prompt pieces at weight w of the second: the endpoints of both
+    pieces, scaled by their side's weight."""
+    return [(t, wt * (1.0 - w)) for t, wt in _pieces(a)] + [(t, wt * w) for t, wt in _pieces(b)]
+
+
+def _fold_pieces(items):
+    """Join a sequence of prompt pieces into one prompt: the endpoints are the
+    cartesian product of the pieces' endpoints with multiplied weights; a single
+    endpoint collapses back to a plain string."""
+    out = [("", 1.0)]
+    for item in items:
+        out = [(t + t2, wt * wt2) for t, wt in out for t2, wt2 in _pieces(item)]
+    return out[0][0] if len(out) == 1 else ("mix", out)
+
+
 def _render_travel(node, step):
-    """The prompt text of a travel tree at a (global) step index."""
+    """The prompt of a travel tree at a (global) step index: a string for plain and
+    switching prompts, a ("mix", [(text, weight), ...]) item where a crossfade
+    mixes the endpoints (step is the 1-based step number the weight is measured at)."""
     if isinstance(node, str):
         return node
     if isinstance(node, list):
-        return "".join(_render_travel(n, step) for n in node)
+        return _fold_pieces([_render_travel(n, step) for n in node])
     if node[0] == "alt":
         _, before, after, period = node
         return _render_travel(before if (step // period) % 2 == 0 else after, step)
+    if node[0] == "blend":
+        _, before, after, center, radius = node
+        w = (step + 1 - center + radius) / (2.0 * radius)
+        if w <= 0.0:
+            return _render_travel(before, step)
+        if w >= 1.0:
+            return _render_travel(after, step)
+        return ("mix", _mix_pieces(_render_travel(before, step), _render_travel(after, step), w))
     before, after, start = node
     return _render_travel(after if step >= start else before, step)
 
 
 def _plan_prompt_travel(text, steps_value):
-    """The per-step prompt strings for a travel prompt text, one per global step index."""
+    """The per-step prompts for a travel prompt text, one per global step index: a
+    string for plain and switching prompts, a ("mix", [(text, weight), ...]) item
+    in the crossfade window."""
     tree = _resolve_travel_step(_parse_travel_expr(text), steps_value)
     return [_render_travel(tree, i) for i in range(steps_value)]
 
 
 def _has_travel_group(text):
     """True when the prompt text contains at least one travel group: a
-    [before:after:step] switch or a [before:after] alternate."""
+    [before:after:step] switch, a [before:after:step:radius] crossfade or a
+    [before:after] alternate."""
     if not text:
         return False
     def has(node):
@@ -490,26 +561,39 @@ def _prepare_prompt_travels(ctx, pos_text, neg_text, steps_value, verbose):
             cache[key] = _recondition_text(clip, base, text, ctx)
         return cache[key]
 
-    pos_conds = [encode(t, base_pos) for t in pos_plan]
+    def cond_for(item, base):
+        if isinstance(item, tuple):
+            return ("mix", [(encode(t, base), w) for t, w in item[1]])
+        return encode(item, base)
+
+    pos_conds = [cond_for(t, base_pos) for t in pos_plan]
     if ctx.get("cfg") == 1:
         zero_cache = {}
         def zero_out(cond):
+            if isinstance(cond, tuple):
+                return ("mix", [(zero_out(c), w) for c, w in cond[1]])
             if id(cond) not in zero_cache:
                 zero_cache[id(cond)], = ConditioningZeroOut().zero_out(cond)
             return zero_cache[id(cond)]
         neg_conds = [zero_out(c) for c in pos_conds]
     else:
-        neg_conds = [encode(t, base_neg) for t in neg_plan]
+        neg_conds = [cond_for(t, base_neg) for t in neg_plan]
 
     if all(c is pos_conds[0] for c in pos_conds) and all(c is neg_conds[0] for c in neg_conds):
         ctx["positive"] = pos_conds[0]
         ctx["negative"] = neg_conds[0]
         return None
+
+    def show(item):
+        if isinstance(item, tuple):
+            return " + ".join("{} {:.2f}".format(t, w) for t, w in item[1])
+        return item
+
     return {
         "positive": pos_conds,
         "negative": neg_conds,
-        "positive_text": pos_plan,
-        "negative_text": neg_plan,
+        "positive_text": [show(t) for t in pos_plan],
+        "negative_text": [show(t) for t in neg_plan],
         "steps": steps_value,
         "verbose": verbose,
         "current_pos": pos_conds[0],
@@ -528,6 +612,75 @@ def _log_prompt_step(state, step, new_row=False):
     print("Gibby Prompt Travel: step {}/{}".format(step + 1, state["steps"]))
     print("  positive: {}".format(state["positive_text"][step]))
     print("  negative: {}".format(state["negative_text"][step]))
+
+
+def _pad_match(x, y):
+    """Zero-pad x and y along the dim where they differ so they share a shape."""
+    if x.shape == y.shape:
+        return x, y
+    dim = next(d for d in range(x.dim()) if x.shape[d] != y.shape[d])
+    n = max(x.shape[dim], y.shape[dim])
+    def pad(t):
+        if t.shape[dim] == n:
+            return t
+        pairs = [(0, 0)] * t.dim()
+        pairs[dim] = (0, n - t.shape[dim])
+        return torch.nn.functional.pad(t, tuple(v for p in reversed(pairs) for v in p))
+    return pad(x), pad(y)
+
+
+def _mix_encoded(conds):
+    """Weighted mix of encoded prompts: conds is a list of (encoded, weight) pairs
+    summing to 1. The cross_attn sequences and the float values (pooled output,
+    t5xxl weights) are zero-padded to the common length and summed, the integer
+    token keys (t5xxl ids, minimax tags) keep the longest one so the length-coupled
+    model paths (anima llm adapter, h3 tag runs) stay consistent, and the shared
+    payloads (reference latents, h3 refs/keyframes) come from the first endpoint
+    untouched."""
+    out = []
+    for i, (cross, vals) in enumerate(conds[0][0]):
+        mixed = None
+        for enc, w in conds:
+            c = enc[i][0]
+            if mixed is None:
+                mixed = c * w
+            else:
+                mixed, c = _pad_match(mixed, c)
+                mixed = mixed + c * w
+        mixed_vals = {}
+        for key, x in vals.items():
+            if not torch.is_tensor(x):
+                mixed_vals[key] = x
+                continue
+            if not x.is_floating_point():
+                best = x
+                for enc, w in conds[1:]:
+                    y = enc[i][1].get(key)
+                    if torch.is_tensor(y) and y.numel() > best.numel():
+                        best = y
+                mixed_vals[key] = best
+                continue
+            acc = None
+            for enc, w in conds:
+                y = enc[i][1].get(key)
+                if not torch.is_tensor(y):
+                    continue
+                if acc is None:
+                    acc = y * w
+                else:
+                    acc, y = _pad_match(acc, y)
+                    acc = acc + y * w
+            mixed_vals[key] = acc
+        out.append([mixed, mixed_vals])
+    return out
+
+
+def _materialize_cond(item):
+    """The encoded conds of a per-step prompt item: itself when a plain prompt, the
+    weighted mix when a ("mix", [(encoded, weight), ...]) item."""
+    if not isinstance(item, tuple):
+        return item
+    return _mix_encoded(item[1])
 
 
 def _set_cond_text(conds_list, encoded, inner, noise, device, prompt_type):
@@ -554,8 +707,8 @@ def _update_prompt_step(state, guider, model, noise, step, new_row=False):
         return
     inner = model.model if hasattr(model, "model") else model
     device = noise.device
-    _set_cond_text(guider.conds["positive"], pos, inner, noise, device, "positive")
-    _set_cond_text(guider.conds["negative"], neg, inner, noise, device, "negative")
+    _set_cond_text(guider.conds["positive"], _materialize_cond(pos), inner, noise, device, "positive")
+    _set_cond_text(guider.conds["negative"], _materialize_cond(neg), inner, noise, device, "negative")
     state["current_pos"], state["current_neg"] = pos, neg
     _log_prompt_step(state, step, new_row)
 
@@ -576,12 +729,16 @@ def _sample_with_travels(model_obj, lora_state, prompt_state, noise, cfg_value, 
                                           disable_pbar, seed, step_offset)
     steps = len(sigmas_tensor) - 1
     model = lora_state["patcher"] if lora_state is not None else model_obj
-    if lora_state is not None:
+    # per_iteration travels keep the strength the iterative upscale loop set for
+    # the whole iteration; only prompt steps travel per sampling step
+    lora_per_step = lora_state is not None and not lora_state.get("per_iteration")
+    if lora_per_step:
         for lora in lora_state["loras"]:
             lora["current"] = 0.0
         _update_travel_step(lora_state, step_offset)
     guider = comfy.samplers.CFGGuider(model)
-    guider.set_conds(prompt_state["positive"][step_offset], prompt_state["negative"][step_offset])
+    guider.set_conds(_materialize_cond(prompt_state["positive"][step_offset]),
+                     _materialize_cond(prompt_state["negative"][step_offset]))
     guider.set_cfg(cfg_value)
     prompt_state["current_pos"] = prompt_state["positive"][step_offset]
     prompt_state["current_neg"] = prompt_state["negative"][step_offset]
@@ -590,7 +747,7 @@ def _sample_with_travels(model_obj, lora_state, prompt_state, noise, cfg_value, 
     def travel_callback(step, x0, x, total_steps):
         if step + 1 < steps:
             next_step = step_offset + step + 1
-            if lora_state is not None:
+            if lora_per_step:
                 _update_travel_step(lora_state, next_step, new_row=True)
             _update_prompt_step(prompt_state, guider, model, noise, next_step, new_row=True)
         if callback is not None:
@@ -967,11 +1124,12 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
                           sigmas_tensor, positive, negative, inpaint_opts,
                           tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
                           decode=True, clear_after_model=False, clear_after_vae=False, clear_verbose=False,
-                          verbose=False, travel_state=None, prompt_state=None, step_offset=0):
-    """Shared sample step: encode the image, sample it (masked when a mask is
-    present, per the crop-inpaint options), and decode the result. Returns
-    (image, model_obj); image is None when decode is off."""
-    latent = _encode_image(vae, image.float(), tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose)
+                          verbose=False, travel_state=None, prompt_state=None, step_offset=0, latent=None):
+    """Shared sample step: encode the image (or use the given latent), sample it
+    (masked when a mask is present, per the crop-inpaint options), and decode the
+    result. Returns (image, model_obj); image is None when decode is off."""
+    if latent is None:
+        latent = _encode_image(vae, image.float(), tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose)
     latent_samples = comfy.sample.fix_empty_latent_channels(
         model_obj, latent["samples"],
         latent.get("downscale_ratio_spacial", None),
@@ -1103,18 +1261,24 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                        start_step=0.0, end_step=10000.0, leftover_noise=False,
                        inpaint_opts=None, skip_color_match=False,
                        clear_after_model=False, clear_after_vae=False, clear_verbose=False, verbose=False,
-                       travel_state=None, prompt_state=None):
+                       travel_state=None, prompt_state=None, steps=0):
     """Iterative pixel-space upscale along a linear scale path (simple step mode).
 
     State (next_step, base size) lives in the options dict; on first run it is
     initialized from the current image and the options returned with the
     updated next_step, so the output can be fed back in for further steps.
     A mask in the context is resized with the image and applied on every step
-    (inpaint mode and mask scaling come from the crop-inpaint options).
+    (inpaint mode and mask scaling come from the crop-inpaint options) - it
+    only applies once an image exists.
+    With no image in the context, the 1st step is the basic generation (the
+    context's latent sampled as-is, denoise overridden to 1.0, base steps, no
+    mask); the image it generates is then treated as if it had been provided
+    (it becomes the color match reference) and the remaining steps ramp
+    start_denoise -> target_denoise.
     In total mode, after the final planned step the result's color is matched
     back to the original image (Transfer Color, mkl_lab).
     """
-    image = ctx["image"]
+    image = ctx.get("image")
     mask = ctx.get("mask")
     vae = ctx["vae"]
     # VAEs round-trip exactly only at multiples of their spatial downscale
@@ -1140,14 +1304,34 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     opt_verbose = opts.get("verbose", False)
     tiled_decode, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options_list)
 
+    # No image in the context: the 1st step is the basic generation (denoise
+    # overridden to 1.0, base steps, no mask - the mask only applies once an
+    # image exists); make sure the context has a latent to sample
+    no_image = image is None
+    if no_image:
+        GibbyContext.evaluate(ctx)
+    # Steps of the basic-gen 1st step: the widget's steps, else the base steps
+    # (the refiner steps the upscale steps use only apply to re-sampling an
+    # existing image)
+    gen_steps = steps_value if steps > 0 else (ctx.get("steps") or steps_value)
+
     # The engine's output cache can hand back the same options object on
     # repeated runs - never mutate it, the step state travels on a copy
     opts = dict(opts)
     if "next_step" not in opts:
-        # First run: record the initial image size and reset the step counter
+        # First run: record the initial size (the image, or the latent when the
+        # 1st step is the basic generation) and reset the step counter
         opts["next_step"] = 0
-        opts["base_w"] = image.shape[2]
-        opts["base_h"] = image.shape[1]
+        if image is not None:
+            opts["base_w"] = image.shape[2]
+            opts["base_h"] = image.shape[1]
+        else:
+            w, h, _ = _latent_dims(ctx["latent"], vae)
+            opts["base_w"] = w
+            opts["base_h"] = h
+            # The 1st step is the basic generation: the denoise ramp of the
+            # upscale steps starts from the 2nd one
+            opts["gen_first"] = True
 
     original_image = image  # color reference for the final step
 
@@ -1164,34 +1348,79 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     # indexed by global step, so shift their range by it
     step_offset = _resolve_step_range(steps_value, start_step, end_step)[0]
 
+    per_iteration = travel_state is not None and travel_state.get("per_iteration")
+    # Set when the flow started with no image: the 1st step was the basic
+    # generation, so the denoise ramp of the upscale steps covers 2..N
+    gen_first = opts.get("gen_first", False)
+
     for i in step_indices:
-        scale = 1.0 + (factor - 1.0) * i / total_steps
-        target_w = max(1, int(round(base_w * scale / w_ratio)) * w_ratio)
-        target_h = max(1, int(round(base_h * scale / h_ratio)) * h_ratio)
-        # Denoise ramps from start to target across the planned steps, then holds at target
-        if i > total_steps:
-            denoise_step = target_denoise
-        elif total_steps == 1:
-            denoise_step = start_denoise
+        if no_image and i == 1:
+            # Basic generation: sample the context's latent as-is (no mask -
+            # it only applies once an image exists), full denoise, no upscale
+            gen_step = True
+            scale = 1.0
+            target_w, target_h = base_w, base_h
+            denoise_step = 1.0
+            run_steps = gen_steps
         else:
-            denoise_step = start_denoise + (target_denoise - start_denoise) * (i - 1) / (total_steps - 1)
-        sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name, denoise_step)
-        sigmas_tensor, skip = _apply_start_end_steps(sigmas_tensor, steps_value, start_step, end_step, leftover_noise)
+            gen_step = False
+            scale = 1.0 + (factor - 1.0) * i / total_steps
+            target_w = max(1, int(round(base_w * scale / w_ratio)) * w_ratio)
+            target_h = max(1, int(round(base_h * scale / h_ratio)) * h_ratio)
+            # Denoise ramps from start to target across the planned steps, then
+            # holds at target; the basic-gen 1st step (no image) is 1.0, so the
+            # ramp covers the rest
+            if i > total_steps:
+                denoise_step = target_denoise
+            elif gen_first:
+                denoise_step = target_denoise if total_steps == 2 else start_denoise + (target_denoise - start_denoise) * (i - 2) / (total_steps - 2)
+            elif total_steps == 1:
+                denoise_step = start_denoise
+            else:
+                denoise_step = start_denoise + (target_denoise - start_denoise) * (i - 1) / (total_steps - 1)
+            run_steps = steps_value
+        sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, run_steps, sampler_name, denoise_step)
+        sigmas_tensor, skip = _apply_start_end_steps(sigmas_tensor, run_steps, start_step, end_step, leftover_noise)
         if skip:
-            # Start step beyond the available steps: keep the image, advance the step
-            next_step = i
+            # Start step beyond the available steps: keep the image, advance the
+            # step (a skipped basic gen keeps the latent and the step so the
+            # next run retries it)
+            if not gen_step:
+                next_step = i
             continue
         if opt_verbose:
             print(f"Gibby Iterative Upscale: step {i}/{total_steps} scale={scale:.2f} size={target_w}x{target_h} denoise={denoise_step:.3f}")
-        image, mask = _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_model, vae, model_obj,
-                                                seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative, inpaint_opts,
-                                                tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
-                                                clear_after_model, clear_after_vae, clear_verbose, verbose,
-                                                travel_state, prompt_state, step_offset)
+        if per_iteration:
+            # One strength for the whole iteration: all its sampling steps share it
+            _update_travel_step(travel_state, i - 1)
+        if gen_step:
+            # The context's latent as-is; prompt travel is planned over the
+            # upscale steps' steps, so the basic gen samples the context conds
+            # as-is
+            image, model_obj = _encode_sample_decode(None, None, vae, model_obj, seed, run_steps, cfg_value, sampler_obj,
+                                                      sigmas_tensor, positive, negative, None,
+                                                      tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
+                                                      clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
+                                                      clear_verbose=clear_verbose, verbose=verbose,
+                                                      travel_state=travel_state, prompt_state=None,
+                                                      step_offset=_resolve_step_range(run_steps, start_step, end_step)[0],
+                                                      latent=ctx["latent"])
+            # Treat the generated image as if it had been provided: it becomes
+            # the color match reference for the final step
+            if original_image is None:
+                original_image = image
+        else:
+            image, mask = _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_model, vae, model_obj,
+                                                    seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative, inpaint_opts,
+                                                    tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
+                                                    clear_after_model, clear_after_vae, clear_verbose, verbose,
+                                                    travel_state, prompt_state, step_offset)
         next_step = i
 
-    # After the final planned step, match the result's color back to the original image
-    if not skip_color_match and mode == "total" and next_step == total_steps:
+    # After the final planned step, match the result's color back to the
+    # original image (the provided one, or the basic-gen 1st step's image
+    # when none was)
+    if not skip_color_match and mode == "total" and next_step == total_steps and original_image is not None:
         image = _color_match(image, original_image, opts)
 
     opts["next_step"] = next_step
@@ -1204,7 +1433,8 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
         ctx.pop("mask", None)
     else:
         ctx["mask"] = mask
-    ctx.pop("latent", None)
+    if image is not None:
+        ctx.pop("latent", None)
 
     return io.NodeOutput(ctx, None, image, None, vae, ctx.get("vae_audio"), options_list)
 
@@ -1375,7 +1605,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                 io.Mask.Input("mask", optional=True),
                 io.Sampler.Input("sampler", optional=True),
                 io.Sigmas.Input("sigmas", optional=True),
-                _KSAMPLER_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect an options node (Crop-Inpaint, Iterative Upscale, Tiled VAE, Clear VRAM) or Merge KSampler Options"),
+                _KSAMPLER_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect an options node (Crop-Inpaint, Iterative Options, Tiled VAE, Clear VRAM) or Merge KSampler Options"),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate="fixed"),
                 io.Int.Input("steps", default=0, min=0, max=10000),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
@@ -1451,6 +1681,8 @@ class GibbyKSamplerContext(io.ComfyNode):
         # evaluate(), which would otherwise encode the image for nothing
         inpaint_opt = _find_option(options_list, "inpaint")
         iterative_opt = _find_option(options_list, "iterative_upscale")
+        # The iteration count per_iteration travels ramp across
+        iter_steps = max(int(iterative_opt.get("steps", 3)), 1) if iterative_opt is not None else None
         has_image = ctx.get("image") is not None
         has_mask = ctx.get("mask") is not None
         has_vae = ctx.get("vae") is not None
@@ -1462,7 +1694,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             steps_value, cfg_value, sampler_name, sampler_obj = _resolve_early_params(ctx, steps)
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
             _ensure_conditioning(ctx)
-            travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value)
+            travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value, iteration_steps=iter_steps)
             prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
             result = _iterative_inpaint_upscale(ctx, inpaint_opt, iterative_opt, options_list, model_obj, seed,
@@ -1478,14 +1710,16 @@ class GibbyKSamplerContext(io.ComfyNode):
                                              clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
                                              clear_verbose=clear_verbose, verbose=verbose,
                                              travel_state=travel_state, prompt_state=prompt_state)
-        elif iterative_opt is not None and has_image and has_vae:
+        elif iterative_opt is not None and has_vae:
             # No crop-inpaint (or no mask for it): iterative on the existing image,
-            # masked on every step when a mask is present
+            # masked on every step when a mask is present. With no image in the
+            # context the 1st step is the basic generation (denoise 1.0), and the
+            # image it generates is treated as if it had been provided
             model_obj = ctx.get("model")
             steps_value, cfg_value, sampler_name, sampler_obj = _resolve_early_params(ctx, steps)
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
             _ensure_conditioning(ctx)
-            travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value)
+            travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value, iteration_steps=iter_steps)
             prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
             result = _iterative_upscale(ctx, iterative_opt, options_list, model_obj, seed,
@@ -1493,7 +1727,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                                          start_step, end_step, leftover_noise,
                                          clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
                                          clear_verbose=clear_verbose, verbose=verbose,
-                                         travel_state=travel_state, prompt_state=prompt_state)
+                                         travel_state=travel_state, prompt_state=prompt_state, steps=steps)
         elif inpaint_opt is not None and has_image and has_mask:
             # Crop-inpaint only: crop, sample each crop, composite back. With an
             # empty mask there are no regions and the normal path below samples
@@ -1519,8 +1753,8 @@ class GibbyKSamplerContext(io.ComfyNode):
 
         # Resolve sampling parameters from context with widget overrides
         model_obj = ctx.get("model")
-        if "seed_value" not in ctx:
-            ctx["seed_value"] = seed
+        if ctx.get("seed") is None:
+            ctx["seed"] = seed
 
         # Denoise: use widget value only if image exists, otherwise force 1.0
         has_image = ctx.get("image") is not None

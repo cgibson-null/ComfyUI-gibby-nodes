@@ -219,8 +219,8 @@ def _fetch_civitai_by_hash(digest):
 
 
 def _get_excluded_words():
-    """Get excluded words from ComfyUI settings."""
-    return set(_civitai_settings.get("exclude_words", []))
+    """Get excluded words from ComfyUI settings (normalized to lowercase)."""
+    return {w.lower() for w in _civitai_settings.get("exclude_words", []) if isinstance(w, str)}
 
 
 def _should_exclude_media(prompt, tags):
@@ -345,6 +345,41 @@ def _get_or_fetch_lora_civitai_info(filepath, digest):
     return info
 
 
+def _is_http_url(url):
+    return isinstance(url, str) and url.lower().startswith(("http://", "https://"))
+
+
+def _sanitize_civitai_blob(blob):
+    """Re-shape a caller-supplied civitai blob to the known fields, dropping
+    unknown keys and any URL that isn't plain http(s)."""
+    if not isinstance(blob, dict):
+        return None
+    images = []
+    for img in blob.get("images") or []:
+        if not isinstance(img, dict) or not _is_http_url(img.get("url")):
+            continue
+        images.append({
+            "url": img["url"],
+            "prompt": img.get("prompt") if isinstance(img.get("prompt"), str) else "",
+            "type": img.get("type") if isinstance(img.get("type"), str) else "image",
+        })
+    url = blob.get("url")
+    name = blob.get("name")
+    base_model = blob.get("base_model")
+    version_name = blob.get("version_name")
+    air = blob.get("air")
+    return {
+        "url": url if _is_http_url(url) else None,
+        "name": name if isinstance(name, str) else "",
+        "base_model": base_model if isinstance(base_model, str) else "",
+        "trigger_words": [w for w in (blob.get("trigger_words") or []) if isinstance(w, str)],
+        "images": images,
+        "version_name": version_name if isinstance(version_name, str) else "",
+        "air": air if isinstance(air, str) else "",
+        "model_version_id": blob.get("model_version_id"),
+    }
+
+
 try:
     from aiohttp import web
     from server import PromptServer
@@ -379,17 +414,19 @@ try:
         lora_name = data.get("lora")
         if not lora_name:
             return web.json_response({"error": "missing lora"}, status=400)
+        if lora_name not in folder_paths.get_filename_list("loras"):
+            return web.json_response({"error": "unknown lora"}, status=404)
 
         cache = _load_info_cache()
         entry = cache.get(lora_name, {})
         for key in ("name", "strength_min", "strength_max", "notes"):
             if key in data:
                 entry[key] = data[key]
-        
+
         # Handle civitai data
         if "civitai" in data:
-            entry["civitai"] = data["civitai"]
-        
+            entry["civitai"] = _sanitize_civitai_blob(data["civitai"])
+
         cache[lora_name] = entry
         _save_info_cache(cache)
         return web.json_response({"ok": True})
@@ -429,7 +466,19 @@ try:
     async def _save_civitai_settings(request):
         global _civitai_settings
         data = await request.json()
-        _civitai_settings.update(data)
+        if not isinstance(data, dict):
+            return web.json_response({"error": "settings must be an object"}, status=400)
+        if "exclude_words" in data:
+            words = data["exclude_words"]
+            if not isinstance(words, list) or not all(isinstance(w, str) for w in words):
+                return web.json_response({"error": "exclude_words must be a list of strings"}, status=400)
+            # Stored lowercase: the media filter compares against lowercased tags/prompts.
+            _civitai_settings["exclude_words"] = [w.lower() for w in words]
+        if "media_limit" in data:
+            limit = data["media_limit"]
+            if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+                return web.json_response({"error": "media_limit must be a positive integer"}, status=400)
+            _civitai_settings["media_limit"] = limit
         return web.json_response({"ok": True, "settings": _civitai_settings})
 
     logging.info("[Lora Loader] Registered lora info / Civitai routes")

@@ -16,8 +16,9 @@ class GibbyLoraTravelOptions(io.ComfyNode):
                 _lora_stack.Input("lora_stack", tooltip="Lora stack (Lora Loader output) whose strength travels across the sampling steps"),
                 io.Float.Input("start_step", default=0.0, min=-10000.0, max=10000.0, step=0.01, tooltip="First step the loras are applied at. >=1=absolute step, 0-1=percentage of steps, <0=steps from the end"),
                 io.Float.Input("end_step", default=100.0, min=-10000.0, max=10000.0, step=0.01, tooltip="Step the loras stop at (exclusive). >=1=absolute step, 0-1=percentage of steps, <0=steps from the end"),
-                io.Float.Input("start_str", default=0.6, min=-10.0, max=10.0, step=0.01, tooltip="Strength multiplier at start_step"),
+                io.Float.Input("start_str", default=0.6, min=-10.0, max=10.0, step=0.01, tooltip="Strength multiplier at start_step - the applied strength itself when a lora's stack strength is 0"),
                 io.Float.Input("end_str", default=1.0, min=-10.0, max=10.0, step=0.01, tooltip="Strength multiplier at end_step; ramps linearly from start_str"),
+                io.Boolean.Input("per_iteration", default=False, tooltip="With Iterative Options: retune the strength per iteration step instead of per sampling step - all sampling steps of an iteration share one strength, and start/end steps count iterations"),
                 io.Boolean.Input("verbose", default=False, tooltip="Print the active lora names and strengths on each active step"),
             ],
             outputs=[
@@ -26,7 +27,7 @@ class GibbyLoraTravelOptions(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, lora_stack, start_step=0.0, end_step=100.0, start_str=0.6, end_str=1.0, verbose=False):
+    def execute(cls, lora_stack, start_step=0.0, end_step=100.0, start_str=0.6, end_str=1.0, per_iteration=False, verbose=False):
         option = {
             "type": "lora_travel",
             "lora_stack": lora_stack,
@@ -34,6 +35,7 @@ class GibbyLoraTravelOptions(io.ComfyNode):
             "end_step": end_step,
             "start_str": start_str,
             "end_str": end_str,
+            "per_iteration": per_iteration,
             "verbose": verbose,
         }
         return io.NodeOutput([option])

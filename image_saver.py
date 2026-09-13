@@ -795,6 +795,15 @@ def _format_batch_filename(filename_prefix: str, base_suffix: int | None, batch_
     return f"{filename_prefix}_{base_suffix + batch_index:02d}"
 
 
+def _resolve_under_output(*fragments: str) -> str:
+    """Resolve the fragments under Comfy's output directory, refusing anything that lands outside it."""
+    output_root = os.path.abspath(folder_paths.output_directory)
+    resolved = os.path.abspath(os.path.join(output_root, *fragments))
+    if resolved != output_root and not resolved.startswith(output_root + os.sep):
+        raise ValueError(f"Save path escapes the output directory: {os.path.join(*fragments)}")
+    return resolved
+
+
 def _save_images(
     images,
     filename_pattern: str,
@@ -810,15 +819,17 @@ def _save_images(
     counter: int,
     time_format: str,
     metadata: Metadata
-) -> list[str]:
+) -> tuple[list[str], str]:
     filename_prefix = _make_filename(filename_pattern, metadata.width, metadata.height, metadata.seed, metadata.modelname, counter, time_format, metadata.sampler_name, metadata.steps, metadata.cfg, metadata.scheduler_name, metadata.denoise, metadata.custom)
 
-    output_path = os.path.join(folder_paths.output_directory, path)
+    # The pattern may carry its own subdirectory; fold it in with the path
+    # widget before the containment check, then write by basename only.
+    output_path = _resolve_under_output(path, os.path.dirname(filename_prefix))
+    filename_prefix = os.path.basename(filename_prefix)
 
-    if output_path.strip() != '':
-        if not os.path.exists(output_path.strip()):
-            print(f'The path `{output_path.strip()}` specified doesn\'t exist! Creating directory.')
-            os.makedirs(output_path, exist_ok=True)
+    if not os.path.exists(output_path):
+        print(f'The path `{output_path}` specified doesn\'t exist! Creating directory.')
+        os.makedirs(output_path, exist_ok=True)
 
     result_paths: list[str] = list()
     num_images = len(images)
@@ -838,7 +849,9 @@ def _save_images(
             _save_json(extra_pnginfo, os.path.join(output_path, current_filename_prefix))
 
         result_paths.append(final_filename)
-    return result_paths
+
+    subfolder = os.path.relpath(output_path, folder_paths.output_directory)
+    return result_paths, (subfolder if subfolder != '.' else '')
 
 
 # --- Node --------------------------------------------------------------------
@@ -970,13 +983,12 @@ class GibbyImageSaverContext(io.ComfyNode):
                 a111_params="",
                 final_hashes=""
             )
-            filenames = _save_images(images, "image", extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, None, None, False, False, counter, time_format, minimal_metadata)
+            filenames, subfolder = _save_images(images, "image", extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, None, None, False, False, counter, time_format, minimal_metadata)
         else:
-            filenames = _save_images(images, filename, extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, cls.hidden.prompt, cls.hidden.extra_pnginfo, save_workflow_as_json, embed_workflow, counter, time_format, metadata)
+            filenames, subfolder = _save_images(images, filename, extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, cls.hidden.prompt, cls.hidden.extra_pnginfo, save_workflow_as_json, embed_workflow, counter, time_format, metadata)
 
-        subfolder = os.path.normpath(path)
         ui = None
         if show_preview:
-            ui = {"images": [{"filename": filename, "subfolder": subfolder if subfolder != '.' else '', "type": 'output'} for filename in filenames]}
+            ui = {"images": [{"filename": filename, "subfolder": subfolder, "type": 'output'} for filename in filenames]}
 
         return io.NodeOutput(ctx, metadata.final_hashes, metadata.a111_params, ui=ui)

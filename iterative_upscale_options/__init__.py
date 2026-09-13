@@ -7,13 +7,13 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="GibbyIterativeUpscaleOptions",
-            display_name="Iterative Upscale options",
+            display_name="Iterative Options",
             category="gibby/flow",
             search_aliases=["upscale", "iterative", "hires", "options", "config"],
             description="Outputs iterative upscale options. Feed into KSampler (Context) options input; the upscale model travels inside the options.",
             inputs=[
                 io.Float.Input("upscale_factor", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Total resolution multiplier across all steps"),
-                io.Int.Input("steps", default=2, min=1, max=100, step=1, tooltip="Number of iterative upscale steps"),
+                io.Int.Input("steps", default=2, min=1, max=100, step=1, tooltip="Number of iterative upscale steps; with no image in the context the 1st step is the basic generation (denoise 1.0)"),
                 io.Float.Input("start_denoise", default=0.6, min=0.0, max=1.0, step=0.01, tooltip="Denoise of the first step; ramps down to target_denoise by the last step"),
                 io.Float.Input("target_denoise", default=0.3, min=0.0, max=1.0, step=0.01, tooltip="Denoise of the last step; kept for steps beyond 'steps'"),
                 io.Combo.Input("upscale_method", default="lanczos", options=["bilinear", "area", "nearest", "lanczos"], tooltip="Resize method used on each step when no upscale model is connected"),

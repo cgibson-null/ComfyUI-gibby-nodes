@@ -38,6 +38,59 @@ def _clip_name_inputs(count):
     return [io.Combo.Input(f"clip_name{i}", options=clip_options, default="None") for i in range(1, count + 1)]
 
 
+# execute() runs once per list item when a list input is mapped over, so the
+# model loads are cached: each part is built once per key, not once per item.
+# A single entry per part keeps the cache from holding extra models in memory.
+_last_checkpoint = None  # (ckpt_name, (model, clip, vae))
+_last_unet = None  # (unet_name, weight_dtype, model)
+_last_clip = None  # ((clip_paths, type, device), clip)
+_last_vae = None  # (vae_name, vae)
+_last_vae_audio = None  # (vae_audio_name, vae_audio)
+
+
+def _load_checkpoint(ckpt_name):
+    global _last_checkpoint
+    if _last_checkpoint is None or _last_checkpoint[0] != ckpt_name:
+        _last_checkpoint = (ckpt_name, CheckpointLoaderSimple().load_checkpoint(ckpt_name))
+    return _last_checkpoint[1]
+
+
+def _load_unet(unet_name, weight_dtype):
+    global _last_unet
+    if _last_unet is None or _last_unet[:2] != (unet_name, weight_dtype):
+        model, = UNETLoader().load_unet(unet_name, weight_dtype)
+        _last_unet = (unet_name, weight_dtype, model)
+    return _last_unet[2]
+
+
+def _load_clip(clip_paths, type_, device):
+    global _last_clip
+    key = (tuple(clip_paths), type_, device)
+    if _last_clip is None or _last_clip[0] != key:
+        clip_type = getattr(comfy.sd.CLIPType, type_.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+        model_options = {}
+        if device == "cpu":
+            model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
+        _last_clip = (key, comfy.sd.load_clip(ckpt_paths=clip_paths, embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options))
+    return _last_clip[1]
+
+
+def _load_vae(vae_name):
+    global _last_vae
+    if _last_vae is None or _last_vae[0] != vae_name:
+        vae, = VAELoader().load_vae(vae_name)
+        _last_vae = (vae_name, vae)
+    return _last_vae[1]
+
+
+def _load_vae_audio(vae_audio_name):
+    global _last_vae_audio
+    if _last_vae_audio is None or _last_vae_audio[0] != vae_audio_name:
+        vae_audio, = VAELoader().load_vae(vae_audio_name)
+        _last_vae_audio = (vae_audio_name, vae_audio)
+    return _last_vae_audio[1]
+
+
 class GibbyContextLoader(io.ComfyNode):
     """Load models from files and build a complete CONTEXT object."""
 
@@ -122,7 +175,7 @@ class GibbyContextLoader(io.ComfyNode):
         if selected == "checkpoint":
             ckpt_name = mode.get("ckpt_name")
             if ckpt_name and ckpt_name != "None":
-                model, clip, vae = CheckpointLoaderSimple().load_checkpoint(ckpt_name)
+                model, clip, vae = _load_checkpoint(ckpt_name)
                 model_name = ckpt_name
         elif selected == "diffusion_model":
             unet_name = mode.get("unet_name")
@@ -134,7 +187,7 @@ class GibbyContextLoader(io.ComfyNode):
 
             if unet_name and unet_name != "None":
                 model_name = unet_name
-                model, = UNETLoader().load_unet(unet_name, weight_dtype)
+                model = _load_unet(unet_name, weight_dtype)
 
             # Clip(s): native ComfyUI loading; multiple paths like Clip Loader - Dual/Triple/Quad.
             clips = mode.get("clip_count", {}) or {}
@@ -145,16 +198,12 @@ class GibbyContextLoader(io.ComfyNode):
                 if name and name != "None":
                     clip_paths.append(folder_paths.get_full_path_or_raise("text_encoders", name))
             if clip_paths:
-                clip_type = getattr(comfy.sd.CLIPType, type_.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-                model_options = {}
-                if device == "cpu":
-                    model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
-                clip = comfy.sd.load_clip(ckpt_paths=clip_paths, embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options)
+                clip = _load_clip(clip_paths, type_, device)
 
             if vae_name and vae_name != "None":
-                vae, = VAELoader().load_vae(vae_name)
+                vae = _load_vae(vae_name)
             if vae_audio_name and vae_audio_name != "None":
-                vae_audio, = VAELoader().load_vae(vae_audio_name)
+                vae_audio = _load_vae_audio(vae_audio_name)
         else:
             raise ValueError(f"Unknown mode '{selected}'.")
 

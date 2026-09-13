@@ -180,6 +180,12 @@ function isVideoMedia(img) {
     return /\.(mp4|webm|mov)(\?|$)/i.test(img.url || "");
 }
 
+// Cache-supplied URLs are untrusted: only plain http(s) may reach an
+// href/src, and a "javascript:" URL would run on click.
+function safeMediaUrl(url) {
+    return typeof url === "string" && /^https?:\/\//i.test(url) ? url : null;
+}
+
 // A searchable, filter-as-you-type lora picker. Native <select> elements
 // only support "jump to the first option starting with what I typed",
 // which is useless for oddly-named loras - this instead shows a live
@@ -534,10 +540,11 @@ function openMediaPreview(img) {
     closeBtn.addEventListener("click", close);
     panel.appendChild(closeBtn);
 
+    const mediaUrl = safeMediaUrl(img.url) || "";
     let mediaEl;
     if (isVideoMedia(img)) {
         mediaEl = document.createElement("video");
-        mediaEl.src = img.url;
+        mediaEl.src = mediaUrl;
         mediaEl.controls = true;
         mediaEl.autoplay = true;
         mediaEl.loop = true;
@@ -545,7 +552,7 @@ function openMediaPreview(img) {
         // view, unlike the grid thumbnails.
     } else {
         mediaEl = document.createElement("img");
-        mediaEl.src = img.url;
+        mediaEl.src = mediaUrl;
     }
     mediaEl.style.display = "block";
     mediaEl.style.maxWidth = "100%";
@@ -844,7 +851,7 @@ function openLoraInfoModal(loraFilename) {
         // Get media limit from settings
         const mediaLimit = app.ui.settings.getSettingValue("GibbyNodes.CivitaiMedia.MediaLimit") || 5;
         
-        const withMedia = (images || []).filter((img) => img.url).slice(0, mediaLimit);
+        const withMedia = (images || []).filter((img) => safeMediaUrl(img.url)).slice(0, mediaLimit);
         galleryHint.style.display = withMedia.length ? "block" : "none";
         for (const img of withMedia) {
             const cell = document.createElement("div");
@@ -853,7 +860,7 @@ function openLoraInfoModal(loraFilename) {
 
             const isVideo = isVideoMedia(img);
             const thumbEl = document.createElement(isVideo ? "video" : "img");
-            thumbEl.src = img.url;
+            thumbEl.src = safeMediaUrl(img.url) || "";
             thumbEl.style.width = "100%";
             thumbEl.style.height = "110px";
             thumbEl.style.objectFit = "cover";
@@ -965,7 +972,7 @@ function openLoraInfoModal(loraFilename) {
             fetchBtn.textContent = "Re-fetch from Civitai";
             civitaiLinkContainer.innerHTML = "";
             const link = document.createElement("a");
-            link.href = data.civitai.url || "#";
+            link.href = safeMediaUrl(data.civitai.url) || "#";
             link.target = "_blank";
             link.rel = "noopener noreferrer";
             link.textContent = "View on Civitai \u2197";
