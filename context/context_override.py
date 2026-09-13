@@ -8,10 +8,9 @@ conditionings from them).
 """
 
 import comfy.samplers
-from nodes import CLIPTextEncode, ConditioningZeroOut
 from comfy_api.latest import io
 
-from . import _CONTEXT_TYPE
+from . import _CONTEXT_TYPE, recondition_prompts
 
 
 class GibbyContextOverride(io.ComfyNode):
@@ -90,16 +89,13 @@ class GibbyContextOverride(io.ComfyNode):
             ctx["sampler"] = sampler
             ctx["scheduler"] = scheduler
 
-        # Prompts plus regenerated conditionings, only when the toggle is on.
+        # Prompts plus regenerated conditionings, only when the toggle is on. The
+        # re-encode is grafted onto the existing conditionings so reference payloads
+        # (flux2 reference_latents, h3 minimax_refs/keyframes) are preserved.
         if override_prompts:
             ctx["positive_prompt"] = positive_prompt
             ctx["negative_prompt"] = negative_prompt
-            if ctx.get("clip") is not None:
-                ctx["positive"], = CLIPTextEncode().encode(ctx["clip"], positive_prompt)
-                if ctx.get("cfg") == 1:
-                    ctx["negative"], = ConditioningZeroOut().zero_out(ctx["positive"])
-                elif negative_prompt:
-                    ctx["negative"], = CLIPTextEncode().encode(ctx["clip"], negative_prompt)
+            ctx["positive"], ctx["negative"] = recondition_prompts(ctx, positive_prompt, negative_prompt)
 
         return io.NodeOutput(
             ctx,  # context

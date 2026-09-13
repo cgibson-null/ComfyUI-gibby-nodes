@@ -138,10 +138,10 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
         pipe.get("ref_video_audios", {}), pipe.get("ref_audios", {}))
 
     # Tokenize prompt with refs or keyframe images
+    kf_imgs = []
     if ref_items:
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
     else:
-        kf_imgs = []
         if first_frame is not None:
             kf_imgs.append(_resize(first_frame[:1], kf_width, kf_height, "center"))
         if last_frame is not None:
@@ -172,7 +172,7 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
         cond = node_helpers.conditioning_set_values(cond, values)
 
     latent, _ = _empty_av_latent(width, height, length)
-    return cond, latent
+    return cond, latent, ref_items, kf_imgs
 
 
 class H3PipeCreate(io.ComfyNode):
@@ -319,10 +319,17 @@ class H3PipeApply(io.ComfyNode):
 
         tw = target_width if target_width > 0 else None
         th = target_height if target_height > 0 else None
-        cond, latent = _apply_pipe_to_conditioning(clip, vae, audio_vae, h3_pipe, tw, th)
+        cond, latent, ref_items, kf_imgs = _apply_pipe_to_conditioning(clip, vae, audio_vae, h3_pipe, tw, th)
 
         # Store results back in context
         ctx["positive"] = cond
+        # The raw prompt the positive was built from, so KSampler (Context) can
+        # detect [before:after:step] travel groups in it and re-encode per step.
+        ctx["positive_prompt"] = h3_pipe.get("prompt") or ""
         ctx["latent"] = latent
+        # Bare-minimum h3 re-condition data: the pre-processed ref items / keyframe
+        # images, so a prompt re-encode reuses them instead of re-deriving the media.
+        ctx["h3_ref_items"] = ref_items
+        ctx["h3_kf_imgs"] = kf_imgs
 
         return io.NodeOutput(ctx, cond, latent)

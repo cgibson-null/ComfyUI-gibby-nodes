@@ -16,8 +16,10 @@ Key behaviors:
   before evaluate, tiled VAE settings apply to encode/decode, clear VRAM
   options free VRAM at the start/end of the execution and after sampling /
   encode-decode (like Clean VRAM Used), lora travel retunes the lora
-  strengths per step, prompt travel swaps the positive/negative prompts per
-  step (Forge-style [before:after:step] groups, encoded with the context clip);
+  strengths per step, and prompt travel is native: when a context prompt
+  carries a Forge-style [before:after:step] group the positive/negative prompts
+  are swapped per step, re-encoded grafted onto the context conditionings so
+  reference payloads (flux2 reference_latents, h3 minimax refs/keyframes) survive;
   the options output returns the (updated) options for feeding back in
 """
 
@@ -54,7 +56,7 @@ import comfy.utils as _comfy_utils
 from nodes import VAEEncode, VAEDecode, VAEDecodeTiled, VAEEncodeTiled, SetLatentNoiseMask
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.nodes_post_processing import ColorTransfer
-from ..context import _CONTEXT_TYPE, GibbyContext
+from ..context import _CONTEXT_TYPE, GibbyContext, _recondition_text
 from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
 
 
@@ -342,11 +344,24 @@ def _split_travel(text):
 
 
 def _parse_travel_group(content):
-    """The parsed contents of a [...] group: a (before, after, step) switch when the
-    content ends in a step, otherwise the content as plain text (Forge prompt travel:
-    [before:after:step], step with a dot=fraction of steps, without=absolute step)."""
+    """The parsed contents of a [...] group:
+    - [before:after:step] -> a (before, after, step) switch; before is active until
+      the step, after from it on (step with a dot=fraction of steps, without=absolute).
+    - [before:after] or [before:after,period] -> an ("alt", before, after, period)
+      alternate that flips between before and after; period is how many steps each
+      side stays active (default 1, with a dot a fraction of the steps).
+    Otherwise the content is plain text."""
     parts = _split_travel(content)
-    if len(parts) < 2:
+    if len(parts) == 2:
+        after_text, period = parts[1], ""
+        if "," in after_text:
+            after_text, _, period = after_text.partition(",")
+            try:
+                float(period)
+            except ValueError:
+                return content
+        return ("alt", _parse_travel_expr(parts[0]), _parse_travel_expr(after_text), period)
+    if len(parts) < 3:
         return content
     try:
         float(parts[-1])
@@ -357,9 +372,9 @@ def _parse_travel_group(content):
 
 def _parse_travel_expr(text):
     """Parse a travel prompt into a tree: plain text is a string, a sequence is a
-    list, and a switch is a (before, after, step) tuple - before is active until
-    the step, after from it on. A group without a trailing step is plain text, an
-    unbalanced bracket stays as-is, and () groups are atomic weight syntax."""
+    list, a [before:after:step] group a (before, after, step) switch, and a
+    [before:after] group an ("alt", ...) alternate. An unbalanced bracket stays
+    as-is, and () groups are atomic weight syntax."""
     nodes, i, n = [], 0, len(text)
     while i < n:
         ch = text[i]
@@ -390,13 +405,22 @@ def _parse_travel_expr(text):
 
 
 def _resolve_travel_step(node, steps_value):
-    """Resolve every switch step of a travel tree against the total step count
-    (a step with a dot is a fraction of the steps, without one an absolute step)
-    and clamp it to [0, steps_value]."""
+    """Resolve every switch step and alternate period of a travel tree against the
+    total step count (a value with a dot is a fraction of the steps, without one an
+    absolute count) and clamp it into range."""
     if isinstance(node, str):
         return node
     if isinstance(node, list):
         return [_resolve_travel_step(n, steps_value) for n in node]
+    if node[0] == "alt":
+        _, before, after, period = node
+        if period:
+            val = int(float(period) * steps_value) if "." in period else int(float(period))
+            period = max(1, val)
+        else:
+            period = 1
+        return ("alt", _resolve_travel_step(before, steps_value),
+                _resolve_travel_step(after, steps_value), period)
     before, after, step = node
     val = int(float(step) * steps_value) if "." in step else int(float(step))
     return (_resolve_travel_step(before, steps_value), _resolve_travel_step(after, steps_value),
@@ -409,6 +433,9 @@ def _render_travel(node, step):
         return node
     if isinstance(node, list):
         return "".join(_render_travel(n, step) for n in node)
+    if node[0] == "alt":
+        _, before, after, period = node
+        return _render_travel(before if (step // period) % 2 == 0 else after, step)
     before, after, start = node
     return _render_travel(after if step >= start else before, step)
 
@@ -419,35 +446,51 @@ def _plan_prompt_travel(text, steps_value):
     return [_render_travel(tree, i) for i in range(steps_value)]
 
 
-def _prepare_prompt_travels(ctx, opt, steps_value):
-    """Plan the option's per-step prompts and encode every unique prompt once with
-    the context clip (the option's prompts override the context's). Constant prompts
-    are set on the context and sampled normally; switching prompts come back as a
-    state for the per-step sampling loop. Returns the state (None when there is
-    nothing to travel)."""
-    if opt is None:
+def _has_travel_group(text):
+    """True when the prompt text contains at least one travel group: a
+    [before:after:step] switch or a [before:after] alternate."""
+    if not text:
+        return False
+    def has(node):
+        if isinstance(node, tuple):
+            return True
+        if isinstance(node, list):
+            return any(has(n) for n in node)
+        return False
+    return has(_parse_travel_expr(text))
+
+
+def _prepare_prompt_travels(ctx, pos_text, neg_text, steps_value, verbose):
+    """Plan the per-step prompts from the context's raw prompts and encode every
+    unique prompt once, grafted onto the context's conditionings so their reference
+    payloads (flux2 reference_latents, h3 minimax_refs/keyframes) survive. Only runs
+    when a prompt carries a travel group; constant prompts are set on the context and
+    sampled normally, switching ones come back as a state for the per-step loop.
+    Returns the state (None when there is nothing to travel)."""
+    if not _has_travel_group(pos_text) and not _has_travel_group(neg_text):
         return None
-    positive = opt.get("positive") or ""
-    negative = opt.get("negative") or ""
-    if not positive.strip() and not negative.strip():
+    if not pos_text.strip() and not neg_text.strip():
         return None
     if steps_value is None or steps_value <= 0:
         return None
     clip = ctx.get("clip")
     if clip is None:
-        print("Gibby KSampler (Context): Prompt Travel options skipped: the context has no clip")
+        print("Gibby KSampler (Context): Prompt Travel skipped: the context has no clip")
         return None
 
-    pos_plan = _plan_prompt_travel(positive, steps_value)
-    neg_plan = _plan_prompt_travel(negative, steps_value)
+    pos_plan = _plan_prompt_travel(pos_text, steps_value)
+    neg_plan = _plan_prompt_travel(neg_text, steps_value)
 
+    base_pos = ctx.get("positive")
+    base_neg = ctx.get("negative")
     cache = {}
-    def encode(text):
-        if text not in cache:
-            cache[text], = CLIPTextEncode().encode(clip, text)
-        return cache[text]
+    def encode(text, base):
+        key = (text, id(base))
+        if key not in cache:
+            cache[key] = _recondition_text(clip, base, text, ctx)
+        return cache[key]
 
-    pos_conds = [encode(t) for t in pos_plan]
+    pos_conds = [encode(t, base_pos) for t in pos_plan]
     if ctx.get("cfg") == 1:
         zero_cache = {}
         def zero_out(cond):
@@ -456,7 +499,7 @@ def _prepare_prompt_travels(ctx, opt, steps_value):
             return zero_cache[id(cond)]
         neg_conds = [zero_out(c) for c in pos_conds]
     else:
-        neg_conds = [encode(t) for t in neg_plan]
+        neg_conds = [encode(t, base_neg) for t in neg_plan]
 
     if all(c is pos_conds[0] for c in pos_conds) and all(c is neg_conds[0] for c in neg_conds):
         ctx["positive"] = pos_conds[0]
@@ -468,7 +511,7 @@ def _prepare_prompt_travels(ctx, opt, steps_value):
         "positive_text": pos_plan,
         "negative_text": neg_plan,
         "steps": steps_value,
-        "verbose": opt.get("verbose", False),
+        "verbose": verbose,
         "current_pos": pos_conds[0],
         "current_neg": neg_conds[0],
     }
@@ -490,10 +533,13 @@ def _log_prompt_step(state, step, new_row=False):
 def _set_cond_text(conds_list, encoded, inner, noise, device, prompt_type):
     """Replace the text-derived parts of the processed conds with an encoded prompt
     and rebuild the model conds from them - the model reads the text through
-    model_conds, which process_conds built from the prompt at the start of the run."""
+    model_conds, which process_conds built from the prompt at the start of the run.
+    minimax_token_tags is h3's per-token modality tags and t5xxl_ids/t5xxl_weights
+    are anima's, all length-coupled to the text sequence, so they must swap with the
+    text (the ref latents are left untouched)."""
     for processed, (cross_attn, cond_dict) in zip(conds_list, encoded):
         processed["cross_attn"] = cross_attn
-        for key in ("pooled_output", "prompt"):
+        for key in ("pooled_output", "prompt", "minimax_token_tags", "t5xxl_ids", "t5xxl_weights"):
             if key in cond_dict:
                 processed[key] = cond_dict[key]
     if hasattr(inner, "extra_conds"):
@@ -591,15 +637,15 @@ def _travel_signature(travel_opts, steps_value):
     return tuple(sig)
 
 
-def _prompt_travel_signature(opt, steps_value):
+def _prompt_travel_signature(pos_text, neg_text, steps_value):
     """Hashable signature of the prompt travel settings for the sample cache; None when there is none."""
-    if opt is None or not steps_value or steps_value <= 0:
+    if not steps_value or steps_value <= 0:
         return None
-    positive = opt.get("positive") or ""
-    negative = opt.get("negative") or ""
-    if not positive.strip() and not negative.strip():
+    pos_text = pos_text or ""
+    neg_text = neg_text or ""
+    if not pos_text.strip() and not neg_text.strip():
         return None
-    return (positive, negative)
+    return (pos_text, neg_text)
 
 
 def _steps_display(steps_value, start_step, end_step):
@@ -1359,7 +1405,6 @@ class GibbyKSamplerContext(io.ComfyNode):
         t_start = time.time()
         options_list = options or []
         travel_opts = [o for o in options_list if o.get("type") == "lora_travel"]
-        prompt_opt = _find_option(options_list, "prompt_travel")
         clear_opt = _find_option(options_list, "clear_vram")
         clear_at_start = clear_opt.get("at_start", True) if clear_opt else False
         clear_after_finish = clear_opt.get("after_finish", True) if clear_opt else False
@@ -1371,6 +1416,9 @@ class GibbyKSamplerContext(io.ComfyNode):
 
         # Start with context dict and apply overrides
         ctx = dict(context) if isinstance(context, dict) else {}
+        # The raw prompts drive native prompt travel (Forge [before:after:step] groups)
+        pos_prompt_text = ctx.get("positive_prompt") or ""
+        neg_prompt_text = ctx.get("negative_prompt") or ""
 
         if model is not None:
             ctx["model"] = model
@@ -1415,7 +1463,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
             _ensure_conditioning(ctx)
             travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value)
-            prompt_state = _prepare_prompt_travels(ctx, prompt_opt, steps_value)
+            prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
             result = _iterative_inpaint_upscale(ctx, inpaint_opt, iterative_opt, options_list, model_obj, seed,
                                                  steps_value, cfg_value, sampler_obj, ctx.get("positive"), ctx.get("negative"),
@@ -1438,7 +1486,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
             _ensure_conditioning(ctx)
             travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value)
-            prompt_state = _prepare_prompt_travels(ctx, prompt_opt, steps_value)
+            prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
             result = _iterative_upscale(ctx, iterative_opt, options_list, model_obj, seed,
                                          steps_value, cfg_value, sampler_obj, ctx.get("positive"), ctx.get("negative"),
@@ -1455,7 +1503,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
             _ensure_conditioning(ctx)
             travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value)
-            prompt_state = _prepare_prompt_travels(ctx, prompt_opt, steps_value)
+            prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
             scheduler_name = ctx.get("scheduler", "normal")
             sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name, denoise)
@@ -1516,7 +1564,7 @@ class GibbyKSamplerContext(io.ComfyNode):
         # the latent output wasn't connected during the first run (result discarded
         # by the engine) but is connected now.
         travel_sig = _travel_signature(travel_opts, run_steps)
-        prompt_sig = _prompt_travel_signature(prompt_opt, run_steps)
+        prompt_sig = _prompt_travel_signature(pos_prompt_text, neg_prompt_text, run_steps)
         cached = ctx.get("_kctx_sampled")
         if cached is not None:
             if (cached.get("seed") == seed and cached.get("steps") == steps_value
@@ -1598,10 +1646,11 @@ class GibbyKSamplerContext(io.ComfyNode):
                 sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name_for_sigmas, denoise_value)
                 use_start_end_steps = True
 
-        # Prompt Travel options: plan the per-step prompts and encode the unique
-        # ones with the context clip; constant prompts replace the context
-        # conditioning, switching ones travel per step
-        prompt_state = _prepare_prompt_travels(ctx, prompt_opt, run_steps)
+        # Prompt travel (native): when a raw prompt carries a [before:after:step]
+        # group, plan the per-step prompts and encode the unique ones grafted onto
+        # the context's conditionings (reference payloads preserved); constant
+        # prompts replace the context conditioning, switching ones travel per step
+        prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, run_steps, verbose)
 
         # Conditioning was filled in by evaluate() above if it was missing.
         positive = ctx.get("positive")

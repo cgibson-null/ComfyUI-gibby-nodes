@@ -50,6 +50,48 @@ def _stringify(value):
     return str(value)
 
 
+def _recondition_text(clip, base_cond, text, ctx):
+    """Re-encode `text` against clip, grafted onto base_cond's values so its
+    reference payloads survive (flux2 reference_latents, h3 minimax_refs/keyframes).
+    For h3 the context carries the pre-processed ref items / keyframe images, and
+    the text is tokenized with them so the Qwen vision tokens stay consistent."""
+    ref_items = ctx.get("h3_ref_items")
+    kf_imgs = ctx.get("h3_kf_imgs")
+    if ref_items:
+        tokens = clip.tokenize(text, minimax_ref_items=ref_items)
+    elif kf_imgs:
+        tokens = clip.tokenize(text, images=kf_imgs)
+    else:
+        tokens = clip.tokenize(text)
+    new_conds = clip.encode_from_tokens_scheduled(tokens)
+    if base_cond is None:
+        return new_conds
+    out = []
+    for (new_mc, new_vals), (_, base_vals) in zip(new_conds, base_cond):
+        vals = dict(base_vals)
+        vals.update(new_vals)
+        out.append([new_mc, vals])
+    return out
+
+
+def recondition_prompts(ctx, positive_text, negative_text):
+    """Re-encode positive/negative prompt texts against the context clip, grafted
+    onto the context's existing conditionings so their reference payloads survive.
+    Returns (positive, negative); falls back to the existing conditionings when
+    there is no clip or nothing to re-encode."""
+    clip = ctx.get("clip")
+    if clip is None or (not positive_text and not negative_text):
+        return ctx.get("positive"), ctx.get("negative")
+    positive = _recondition_text(clip, ctx.get("positive"), positive_text, ctx)
+    if ctx.get("cfg") == 1:
+        negative, = ConditioningZeroOut().zero_out(positive)
+    elif negative_text:
+        negative = _recondition_text(clip, ctx.get("negative"), negative_text, ctx)
+    else:
+        negative = ctx.get("negative")
+    return positive, negative
+
+
 class GibbyContext(io.ComfyNode):
     """Bundle many values into a single CONTEXT object and pass them along."""
 
