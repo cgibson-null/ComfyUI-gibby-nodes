@@ -122,6 +122,8 @@ def _latent_downscale(vae, channels):
         if isinstance(r, (tuple, list)):
             return int(r[2]), int(r[1])
         return int(r), int(r)
+    if vae is not None and getattr(vae, "vae_ratio", None) is not None:
+        return int(vae.vae_ratio), int(vae.vae_ratio)
     d = 16 if channels == 128 else 8
     return d, d
 
@@ -131,9 +133,9 @@ def _latent_dims(latent, vae=None):
     if latent is None:
         return None, None, None
     s = latent["samples"]
-    if s.dim() == 4:
+    if s.ndim == 4:
         lw, lh, length = s.shape[3], s.shape[2], None
-    elif s.dim() == 5:
+    elif s.ndim == 5:
         lw, lh, length = s.shape[4], s.shape[3], s.shape[2]
     else:
         return None, None, None
