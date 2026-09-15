@@ -1087,11 +1087,16 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
         btn.style.cursor = ok ? "pointer" : "default";
     }
 
+    // Drag handle - press and hold to drag this row to a new position.
+    const dragBtn = makeSmallButton("\u283f", "#8c8");
+    dragBtn.title = "Press and hold to drag this lora slot to a new position";
+    dragBtn.style.cursor = "grab";
+
     const removeBtn = makeSmallButton("\u00d7", "#f88");
     removeBtn.title = "Remove this lora slot";
 
     // When lora is "None", hide everything except the dropdown.
-    const extraFields = [infoBtn, strength, upBtn, downBtn, removeBtn];
+    const extraFields = [infoBtn, strength, dragBtn, upBtn, downBtn, removeBtn];
     function updateRowVisibility() {
         const isNone = combo?.getValue() === "None";
         for (const el of extraFields) {
@@ -1112,10 +1117,100 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
     downBtn.addEventListener("click", () => callbacks.onMove?.(controller, 1));
     removeBtn.addEventListener("click", () => callbacks.onRemove(controller));
 
+    // Drag-to-reorder: the row itself follows the cursor (a transform, so the
+    // container's layout stays put) and a sticky line marks the gap it will
+    // land in. The drop position is decided by row TOPS: the row lands after
+    // every row whose top edge the cursor has crossed.
+    dragBtn.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        const startY = e.clientY;
+        const parent = row.parentNode;
+        const originalBackground = row.style.background;
+        row.style.position = "relative";
+        row.style.zIndex = "1000";
+        row.style.background = "rgba(74, 158, 255, 0.25)";
+        row.style.borderRadius = "4px";
+        dragBtn.style.cursor = "grabbing";
+        document.body.style.userSelect = "none";
+
+        const dropLine = document.createElement("div");
+        dropLine.style.position = "fixed";
+        dropLine.style.height = "2px";
+        dropLine.style.background = "#4a9eff";
+        dropLine.style.borderRadius = "1px";
+        dropLine.style.zIndex = "1001";
+        dropLine.style.pointerEvents = "none";
+        document.body.appendChild(dropLine);
+
+        function dropIndexAt(y) {
+            let idx = 0;
+            for (const child of parent.children) {
+                if (child === row) continue;
+                const rect = child.getBoundingClientRect();
+                if (y >= rect.top) idx++;
+            }
+            // Empty rows stay at the bottom: a row starting above the first
+            // empty one can't be dropped below it (the same crossing the
+            // down-arrow refuses). A row already below it is unconstrained.
+            const limit = callbacks.getReorderLimit?.() ?? parent.children.length;
+            if (limit < parent.children.length) {
+                const myIdx = Array.prototype.indexOf.call(parent.children, row);
+                if (myIdx < limit) idx = Math.min(idx, limit - 1);
+            }
+            return idx;
+        }
+
+        function moveDropLine(idx) {
+            const cRect = parent.getBoundingClientRect();
+            let seen = 0;
+            let top = null;
+            for (const child of parent.children) {
+                if (child === row) continue;
+                const rect = child.getBoundingClientRect();
+                if (seen === idx) {
+                    top = rect.top;
+                    break;
+                }
+                seen++;
+                top = rect.bottom;
+            }
+            if (top === null) return;
+            dropLine.style.left = `${cRect.left}px`;
+            dropLine.style.width = `${cRect.width}px`;
+            dropLine.style.top = `${top - 1}px`;
+        }
+
+        function onMove(ev) {
+            // The DOM overlay is scaled by the canvas zoom, so the
+            // screen-pixel cursor delta has to be divided by it to become
+            // DOM pixels. The row's rendered height gives that zoom (its
+            // layout height is fixed, and the transform doesn't scale it).
+            const scale = row.getBoundingClientRect().height / ROW_HEIGHT;
+            row.style.transform = `translateY(${(ev.clientY - startY) / scale}px)`;
+            moveDropLine(dropIndexAt(ev.clientY));
+        }
+        function onUp(ev) {
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", onUp);
+            dropLine.remove();
+            row.style.transform = "";
+            row.style.position = "";
+            row.style.zIndex = "";
+            row.style.background = originalBackground;
+            dragBtn.style.cursor = "grab";
+            document.body.style.userSelect = "";
+            callbacks.onReorder?.(controller, dropIndexAt(ev.clientY));
+        }
+        moveDropLine(dropIndexAt(e.clientY));
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+    });
+
     row.appendChild(toggle.element);
     row.appendChild(comboWrapper);
     row.appendChild(strength);
     row.appendChild(infoBtn);
+    row.appendChild(dragBtn);
     row.appendChild(upBtn);
     row.appendChild(downBtn);
     row.appendChild(removeBtn);
@@ -1316,6 +1411,8 @@ function setupDynamicLoraRows(node) {
                 onCommitted: handleLoraCommitted,
                 onRemove: handleRemoveRow,
                 onMove: handleMoveRow,
+                onReorder: handleReorderRow,
+                getReorderLimit,
                 onChange: () => {
                     syncWidgetValues();
                 },
@@ -1362,6 +1459,27 @@ function setupDynamicLoraRows(node) {
         [rowControllers[idx], rowControllers[target]] = [rowControllers[target], rowControllers[idx]];
         // Re-append in array order so the DOM matches (appendChild moves an
         // existing child rather than duplicating it).
+        for (const c of rowControllers) container.appendChild(c.element);
+        refreshMoveButtons();
+        syncWidgetValues();
+    }
+
+    // Index of the first empty row in the full list (or the list length when
+    // there is none) - the drag's drop line and drop position clamp to it,
+    // the same "empty slots stay at the bottom" rule as the move arrows.
+    function getReorderLimit() {
+        for (let i = 0; i < rowControllers.length; i++) {
+            if (rowControllers[i].getValue().lora === "None") return i;
+        }
+        return rowControllers.length;
+    }
+
+    // Drag-reorder: move this row to an absolute position in the list.
+    function handleReorderRow(controller, targetIndex) {
+        const idx = rowControllers.indexOf(controller);
+        if (idx === -1) return;
+        rowControllers.splice(idx, 1);
+        rowControllers.splice(Math.max(0, Math.min(targetIndex, rowControllers.length)), 0, controller);
         for (const c of rowControllers) container.appendChild(c.element);
         refreshMoveButtons();
         syncWidgetValues();

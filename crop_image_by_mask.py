@@ -6,8 +6,10 @@ import torch.nn.functional as F
 from comfy_extras.color_util import hex_to_rgb
 from comfy_api.latest import io
 
+from .context import _CONTEXT_TYPE
 
-# Carries the originals, the mask and the paste rectangles to Image Paste By Mask (Batch)
+
+# Carries the originals, the mask and the paste rectangles to Image Paste By Mask (Batch) (Context)
 _CROP_INFO_TYPE = io.Custom("GIBBY_CROP_INFO")
 
 # Two consecutive crop regions count as a shot change when they barely overlap
@@ -80,13 +82,15 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
     def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="Gibby_CropImageByMask_Batch",
-            display_name="Image Crop By Mask (Batch)",
+            display_name="Image Crop By Mask (Batch) (Context)",
             category="gibby/image",
             search_aliases=["crop", "mask", "batch"],
-            description="Crops each image by its own mask (image i by mask i); smaller crops are scaled up to the total size, taking the surrounding pixels from the original image. Optional temporal stabilization for video batches: constant crop size per shot and a smoothed crop center, with cuts detected from mask jumps. Also outputs the crop info for pasting results back with Image Paste By Mask (Batch).",
+            description="Crops each image by its own mask (image i by mask i); every crop is scaled up until it fills the total size, so subjects keep a consistent scale across the batch - when a crop's shape differs from the canvas its edges are trimmed. Optional temporal stabilization for video batches: constant crop size per shot and a smoothed crop center, with cuts detected from mask jumps. Also outputs the crop info for pasting results back with Image Paste By Mask (Batch) (Context). Optional context in/out: its image and mask are used when none are connected; the output context carries the cropped image and mask plus the crop info (which holds the originals).",
             inputs=[
-                io.Image.Input("image"),
-                io.Mask.Input("mask"),
+                _CONTEXT_TYPE.Input("context", optional=True,
+                                     tooltip="Base context; its image and mask are used when none are connected"),
+                io.Image.Input("image", optional=True, tooltip="Overrides the context image"),
+                io.Mask.Input("mask", optional=True, tooltip="Overrides the context mask"),
                 io.Float.Input("crop_factor", default=1.5, min=1.0, max=10.0, step=0.1,
                                tooltip="Scales the cropped area outside of mask bounds"),
                 io.Float.Input("megapixels", default=1.0, min=0.0, max=100.0, step=0.1,
@@ -107,6 +111,7 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
                                tooltip="Background color for remove_bg; connect the hex output of a Color Picker"),
             ],
             outputs=[
+                _CONTEXT_TYPE.Output("context"),
                 io.Image.Output("image"),
                 io.Mask.Output("mask"),
                 _CROP_INFO_TYPE.Output("crop_info"),
@@ -114,9 +119,17 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, image, mask, crop_factor=1.5, megapixels=1.0, scale_factor=1.0, multiple=8, enable_smoothing=False,
+    def execute(cls, context=None, image=None, mask=None, crop_factor=1.5, megapixels=1.0, scale_factor=1.0, multiple=8, enable_smoothing=False,
                 center_smoothing=0.8, size_source="shot_max",
                 remove_bg=False, color="#000000"):
+        ctx = dict(context) if isinstance(context, dict) else {}
+        # Connected image/mask override the context's
+        image = image if image is not None else ctx.get("image")
+        mask = mask if mask is not None else ctx.get("mask")
+        if image is None:
+            raise ValueError("No image to crop: connect an image or a context carrying one")
+        if mask is None:
+            raise ValueError("No mask to crop by: connect a mask or a context carrying one")
         B, H, W, C = image.shape
         if mask.shape[1:] != (H, W):
             mask = F.interpolate(mask.unsqueeze(1), size=(H, W), mode="nearest-exact").squeeze(1)
@@ -188,13 +201,16 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
         max_h = max(multiple, int(max_h) // multiple * multiple)
 
         # Fit every crop to the total size: the crop stays centered and is scaled up
-        # uniformly, the rest of the canvas is taken from the original image around it
+        # uniformly until it fills the canvas (cover-fit). When the crop's shape differs
+        # from the canvas, its edges are trimmed; widening the source area instead would
+        # shrink subjects by a per-frame aspect mismatch, so a far shot would end up with
+        # a smaller subject than the close-ups it shares the canvas with.
         out = []
         rects = []  # (sx0, sy0, src_w, src_h) per frame: where the crop came from
         for i, idx, cx, cy, x0, y0, w, h in regions:
-            s = min(max_w / w, max_h / h)
-            src_w = min(int(max_w / s), W)
-            src_h = min(int(max_h / s), H)
+            s = max(max_w / w, max_h / h)
+            src_w = max(1, int(max_w / s))
+            src_h = max(1, int(max_h / s))
             sx0 = max(0, min(int(cx - src_w / 2), W - src_w))
             sy0 = max(0, min(int(cy - src_h / 2), H - src_h))
             rects.append((sx0, sy0, src_w, src_h))
@@ -208,5 +224,10 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
                 region = comfy.utils.common_upscale(region.movedim(-1, 1), max_w, max_h, "lanczos", "disabled").movedim(1, -1)
             out.append(region.squeeze(0))
 
+        out_image = torch.stack(out)
         info = {"image": image, "mask": mask, "rects": rects}
-        return io.NodeOutput(torch.stack(out), mask, info)
+        # The context carries the node's cropped outputs; the originals live in crop_info
+        ctx["image"] = out_image
+        ctx["mask"] = mask
+        ctx["crop_info"] = info
+        return io.NodeOutput(ctx, out_image, mask, info)

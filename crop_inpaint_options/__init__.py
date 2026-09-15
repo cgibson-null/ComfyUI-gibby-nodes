@@ -25,7 +25,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
                 io.Float.Input("mask_scale_start", default=1.0, min=0.0, max=3.0, step=0.05, tooltip="Mask size multiplier on first step. <1=smaller, >1=larger than actual mask."),
                 io.Float.Input("mask_scale_end", default=1.0, min=0.0, max=3.0, step=0.05, tooltip="Mask size multiplier on last step."),
                 io.String.Input("mask_indices", default="", tooltip="When mask_mode=split: which mask indices to process. Extracts integers from string, ignores indices >= mask count. Empty=all."),
-                io.Boolean.Input("color_match", default=True, tooltip="After inpainting, match the result's color back to the original image with Transfer Color"),
+                io.Boolean.Input("color_match", default=True, tooltip="After inpainting, match each crop's color back to the original crop with Transfer Color"),
                 io.Combo.Input("color_match_method", default="mkl_lab", options=["reinhard_lab", "mkl_lab", "histogram"], tooltip="Transfer Color method for color_match"),
                 io.Float.Input("color_match_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Transfer Color strength for color_match (0=off)"),
                 io.Boolean.Input("verbose", default=False, tooltip="Print the mask count (split mode) and each cropped area size to the console"),

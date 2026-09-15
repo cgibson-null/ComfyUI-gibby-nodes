@@ -86,11 +86,22 @@ def _clear_vram(event, verbose=False):
 
 
 def _tiled_settings(options_list):
-    """Tiled VAE settings from the options list: (tiled, tile_size, overlap, temporal_size, temporal_overlap)."""
+    """Tiled VAE settings from the options list: (above_megapixels, tile_size, overlap, temporal_size, temporal_overlap).
+    above_megapixels is None when the option is absent (never tiled) and 0.0 for always tiled."""
     opts = _find_option(options_list, "tiled_vae")
     if opts is None:
-        return False, 512, 64, 64, 8
-    return True, opts.get("tile_size", 512), opts.get("overlap", 64), opts.get("temporal_size", 64), opts.get("temporal_overlap", 8)
+        return None, 512, 64, 64, 8
+    return opts.get("above_megapixels", 1.0), opts.get("tile_size", 512), opts.get("overlap", 64), opts.get("temporal_size", 64), opts.get("temporal_overlap", 8)
+
+
+def _tiled_for(w, h, above_megapixels):
+    """Whether the tiled VAE is used for a w x h image: never without the option,
+    always with a 0 threshold, otherwise for sizes at or above the threshold in MP."""
+    if above_megapixels is None:
+        return False
+    if above_megapixels <= 0:
+        return True
+    return (w * h) / 1_000_000 >= above_megapixels
 
 
 def _image_dims(image):
@@ -847,7 +858,8 @@ def _log_finish(verbose, image, latent, t_start, vae=None):
 def _encode_image(vae, image, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose=False):
     """VAE-encode an image, tiled when the tiled VAE settings are on."""
     if verbose:
-        print("Gibby KSampler (Context): VAE encode starting")
+        w, h, _ = _image_dims(image)
+        print(f"Gibby KSampler (Context): VAE encode starting {w}x{h}")
     t0 = time.time()
     if tiled_decode:
         latent, = VAEEncodeTiled().encode(vae, image, tile_size, overlap, temporal_size, temporal_overlap)
@@ -868,7 +880,8 @@ def _decode_latent(vae, latent, tiled_decode, tile_size, overlap, temporal_size,
     else:
         image, = VAEDecode().decode(vae, latent)
     if verbose:
-        print(f"Gibby KSampler (Context): VAE decode took {time.time() - t0:.2f}s")
+        w, h, _ = _image_dims(image)
+        print(f"Gibby KSampler (Context): VAE decode took {time.time() - t0:.2f}s {w}x{h}")
     return image
 
 
@@ -1122,14 +1135,19 @@ def _composite_region(full, crop, mask, y0, y1, x0, x1):
 
 def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_value, sampler_obj,
                           sigmas_tensor, positive, negative, inpaint_opts,
-                          tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
+                          tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                           decode=True, clear_after_model=False, clear_after_vae=False, clear_verbose=False,
                           verbose=False, travel_state=None, prompt_state=None, step_offset=0, latent=None):
     """Shared sample step: encode the image (or use the given latent), sample it
     (masked when a mask is present, per the crop-inpaint options), and decode the
     result. Returns (image, model_obj); image is None when decode is off."""
+    if image is not None:
+        tiled = _tiled_for(image.shape[2], image.shape[1], tiled_above)
+    else:
+        w, h, _ = _latent_dims(latent, vae)
+        tiled = _tiled_for(w, h, tiled_above) if w else False
     if latent is None:
-        latent = _encode_image(vae, image.float(), tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose)
+        latent = _encode_image(vae, image.float(), tiled, tile_size, overlap, temporal_size, temporal_overlap, verbose)
     latent_samples = comfy.sample.fix_empty_latent_channels(
         model_obj, latent["samples"],
         latent.get("downscale_ratio_spacial", None),
@@ -1152,7 +1170,7 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
         _clear_vram("after model", clear_verbose)
     if not decode:
         return None, model_obj
-    image = _decode_latent(vae, {"samples": samples}, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose)
+    image = _decode_latent(vae, {"samples": samples}, tiled, tile_size, overlap, temporal_size, temporal_overlap, verbose)
     if clear_after_vae:
         _clear_vram("after vae", clear_verbose)
     return image, model_obj
@@ -1181,33 +1199,34 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
     scale_factor = opts.get("scale_factor", 1.0)
     multiple = opts.get("multiple", 8)
     method = opts.get("upscale_method", "bilinear")
-    tiled_decode, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options_list)
+    tiled_above, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options_list)
 
     result_image = image.clone()
 
     for idx, (x0, y0, x1, y1, seg_mask) in enumerate(regions):
         cw = x1 - x0
         ch = y1 - y0
-        if opt_verbose:
-            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={cw}x{ch}")
-
         crop_img, crop_mask = _crop_region(result_image, mask, seg_mask, x0, y0, x1, y1)
-        crop_img, crop_mask, _, _ = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, method)
+        crop_img, crop_mask, new_w, new_h = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, method)
+        if opt_verbose:
+            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={cw}x{ch} -> {new_w}x{new_h}")
         refined_crop, model_obj = _encode_sample_decode(crop_img, crop_mask, vae, model_obj, seed, steps_value,
                                                         cfg_value, sampler_obj, sigmas_tensor, positive, negative, opts,
-                                                        tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
+                                                        tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                                                         decode and vae is not None,
                                                         clear_after_model, clear_after_vae, clear_verbose, verbose,
                                                         travel_state=travel_state, prompt_state=prompt_state)
         if refined_crop is not None:
+            # Match the crop's color back to the original crop before pasting,
+            # so the match is anchored to this region, not the whole image
+            refined_crop = _color_match(refined_crop, crop_img, opts)
+            if opt_verbose:
+                print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined_crop.shape[2]}x{refined_crop.shape[1]} -> {cw}x{ch}")
             _composite_region(result_image, refined_crop, crop_mask, y0, y1, x0, x1)
 
     # Without a decode the VAE is done after the last region's encode: free it.
     if clear_after_vae and not (decode and vae is not None):
         _clear_vram("after vae", clear_verbose)
-
-    # Match the result's color back to the original image
-    result_image = _color_match(result_image, image, opts)
 
     # Update context
     ctx["image"] = result_image
@@ -1219,7 +1238,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
 
 def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_model, vae, model_obj,
                             seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative,
-                            inpaint_opts=None, tiled_decode=False, tile_size=512, overlap=64,
+                            inpaint_opts=None, tiled_above=None, tile_size=512, overlap=64,
                             temporal_size=64, temporal_overlap=8,
                             clear_after_model=False, clear_after_vae=False, clear_verbose=False, verbose=False,
                             travel_state=None, prompt_state=None, step_offset=0):
@@ -1249,7 +1268,7 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
 
     image, model_obj = _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_value, sampler_obj,
                                               sigmas_tensor, positive, negative, inpaint_opts,
-                                              tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
+                                              tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                                               clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
                                               clear_verbose=clear_verbose, verbose=verbose,
                                               travel_state=travel_state, prompt_state=prompt_state, step_offset=step_offset)
@@ -1302,7 +1321,7 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     mode = opts.get("mode", "total")
     upscale_model = opts.get("upscale_model")
     opt_verbose = opts.get("verbose", False)
-    tiled_decode, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options_list)
+    tiled_above, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options_list)
 
     # No image in the context: the 1st step is the basic generation (denoise
     # overridden to 1.0, base steps, no mask - the mask only applies once an
@@ -1354,6 +1373,9 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     gen_first = opts.get("gen_first", False)
 
     for i in step_indices:
+        # With upscale_factor 1 every pass runs at the same size and would
+        # sample identical noise - vary the seed per iteration
+        step_seed = seed + i if factor == 1.0 else seed
         if no_image and i == 1:
             # Basic generation: sample the context's latent as-is (no mask -
             # it only applies once an image exists), full denoise, no upscale
@@ -1397,9 +1419,9 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
             # The context's latent as-is; prompt travel is planned over the
             # upscale steps' steps, so the basic gen samples the context conds
             # as-is
-            image, model_obj = _encode_sample_decode(None, None, vae, model_obj, seed, run_steps, cfg_value, sampler_obj,
+            image, model_obj = _encode_sample_decode(None, None, vae, model_obj, step_seed, run_steps, cfg_value, sampler_obj,
                                                       sigmas_tensor, positive, negative, None,
-                                                      tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
+                                                      tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                                                       clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
                                                       clear_verbose=clear_verbose, verbose=verbose,
                                                       travel_state=travel_state, prompt_state=None,
@@ -1411,8 +1433,8 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                 original_image = image
         else:
             image, mask = _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_model, vae, model_obj,
-                                                    seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative, inpaint_opts,
-                                                    tiled_decode, tile_size, overlap, temporal_size, temporal_overlap,
+                                                    step_seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative, inpaint_opts,
+                                                    tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                                                     clear_after_model, clear_after_vae, clear_verbose, verbose,
                                                     travel_state, prompt_state, step_offset)
         next_step = i
@@ -1458,8 +1480,8 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
         print(f"Gibby Crop-Inpaint: {len(regions)} masks")
 
     # Both options may carry color match - the one earlier in the options list
-    # wins; when the inpaint one wins, the per-crop match is skipped and the
-    # full image is matched back after compositing
+    # wins its settings: the crop is matched back to the original crop with
+    # the winning option's color match before compositing
     inpaint_wins = options_list.index(inpaint_opts) < options_list.index(iterative_opts)
 
     # The result stays at the original resolution: each crop is refined by the
@@ -1474,10 +1496,10 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
 
     out_options = options_list
     for idx, (x0, y0, x1, y1, seg_mask) in enumerate(regions):
-        if opt_verbose:
-            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0}")
         crop_img, crop_mask = _crop_region(image, mask, seg_mask, x0, y0, x1, y1)
-        crop_img, crop_mask, _, _ = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, crop_method)
+        crop_img, crop_mask, new_w, new_h = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, crop_method)
+        if opt_verbose:
+            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {new_w}x{new_h}")
         crop_ctx = {"image": crop_img, "mask": crop_mask, "vae": vae,
                     "scheduler": ctx.get("scheduler", "normal"), "sampler": ctx.get("sampler", "euler")}
         # Pass the crop (image + mask) to the iterative upscale
@@ -1488,14 +1510,16 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
                                  clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
                                  clear_verbose=clear_verbose, verbose=verbose, travel_state=travel_state, prompt_state=prompt_state)
         out_options = out[6]
+        # When the inpaint option's color match wins, match the crop back to
+        # the original crop (the iterative one already did it per its settings)
+        refined = out[2]
+        if inpaint_wins:
+            refined = _color_match(refined, crop_img, inpaint_opts)
         # Composite the refined crop back into its original-resolution region
         if x1 > x0 and y1 > y0:
             if opt_verbose:
-                print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {out[2].shape[2]}x{out[2].shape[1]} -> {x1 - x0}x{y1 - y0}")
-            _composite_region(full, out[2], crop_ctx.get("mask"), y0, y1, x0, x1)
-
-    if inpaint_wins:
-        full = _color_match(full, image, inpaint_opts)
+                print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined.shape[2]}x{refined.shape[1]} -> {x1 - x0}x{y1 - y0}")
+            _composite_region(full, refined, crop_ctx.get("mask"), y0, y1, x0, x1)
 
     if opt_verbose:
         print(f"Gibby Crop-Inpaint: composited {len(regions)} region(s) into {full.shape[2]}x{full.shape[1]} (final image)")
@@ -1674,8 +1698,8 @@ class GibbyKSamplerContext(io.ComfyNode):
             ctx["mask"] = mask
 
         # Tiled VAE settings come from the options list (Tiled VAE options node):
-        # presence of the option switches encode/decode to the tiled variants
-        tiled_decode, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options)
+        # encode/decode use the tiled variants for sizes at or above above_megapixels
+        tiled_above, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options)
 
         # Apply image-based options (crop-inpaint, iterative upscale) before
         # evaluate(), which would otherwise encode the image for nothing
@@ -1776,13 +1800,18 @@ class GibbyKSamplerContext(io.ComfyNode):
         _apply_travel_clip_loras(ctx, travel_opts, run_steps)
 
         # Fill in derived values on demand (latent from image, conditioning, width/height).
-        # With tiled_decode on, the image is encoded with VAE Encode (Tiled). The
-        # image->latent encode runs inside evaluate(); time that call when it will run.
+        # The image->latent encode runs inside evaluate(), tiled per the threshold;
+        # time that call when it will run.
         encode_will_run = ctx.get("latent") is None and ctx.get("image") is not None and ctx.get("vae") is not None
-        if verbose and encode_will_run:
-            print("Gibby KSampler (Context): VAE encode starting")
+        if encode_will_run:
+            w, h, _ = _image_dims(ctx["image"])
+            encode_tiled = _tiled_for(w, h, tiled_above)
+            if verbose:
+                print(f"Gibby KSampler (Context): VAE encode starting {w}x{h}")
+        else:
+            encode_tiled = False
         t0 = time.time()
-        GibbyContext.evaluate(ctx, tiled=tiled_decode, tile_size=tile_size, overlap=overlap,
+        GibbyContext.evaluate(ctx, tiled=encode_tiled, tile_size=tile_size, overlap=overlap,
                                temporal_size=temporal_size, temporal_overlap=temporal_overlap)
         if verbose and encode_will_run:
             print(f"Gibby KSampler (Context): VAE encode took {time.time() - t0:.2f}s")
@@ -1792,6 +1821,10 @@ class GibbyKSamplerContext(io.ComfyNode):
             ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], mask)
 
         _log_start(verbose, ctx, seed, steps_value, denoise_value, start_step, end_step)
+
+        # The final decode's tiled VAE is decided by the latent's size
+        w, h, _ = _latent_dims(ctx.get("latent"), ctx.get("vae"))
+        tiled_decode = _tiled_for(w, h, tiled_above) if w else False
 
         # Cache check: if this context already has a sampled result with matching
         # parameters, return it instead of re-sampling. This handles the case where

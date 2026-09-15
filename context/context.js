@@ -9,8 +9,13 @@ import { app } from "../../../scripts/app.js";
 // never make it in - append them manually after registration (like rgthree
 // does): dragging from an output offers nodes that accept the type, dragging
 // into an input offers nodes that produce it.
+//
+// The core rebuilds both LiteGraph globals from its own lists on every node
+// registration (including subgraph types registered when a workflow loads) and
+// on suggestion-count changes, which wipes a one-time patch - so the append is
+// re-applied after each rebuild by hooking the core extension's setDefaults.
 
-const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO"];
+const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO", "LORA_STACK"];
 
 // Autogrow inputs (COMFY_AUTOGROW_V3) hide their real type inside
 // spec.template.input - e.g. Merge KSampler Options' option1...option10.
@@ -54,7 +59,6 @@ function hasTypeOutput(nodeData, type) {
 
 const inputTypes = new Map(); // type -> Set of node classes with an input of that type
 const outputTypes = new Map(); // type -> Set of node classes with an output of that type
-let scheduled = false;
 
 function track(nodeType, nodeData) {
     for (const type of SUGGESTED_TYPES) {
@@ -69,52 +73,63 @@ function track(nodeType, nodeData) {
     }
 }
 
+// Append every tracked node to the drag lists for its types, in place, sorted
+// by name. Idempotent - safe to run after each core rebuild.
+function applySuggestions() {
+    const sortSuggestions = (suggestions) => {
+        const items = suggestions.slice().sort((a, b) => {
+            const nameA = (a.content || String(a)).toLowerCase();
+            const nameB = (b.content || String(b)).toLowerCase();
+            return nameA.localeCompare(nameB);
+        });
+        for (let i = 0; i < suggestions.length; i++) {
+            suggestions[i] = items[i];
+        }
+    };
+
+    for (const type of SUGGESTED_TYPES) {
+        // Dragging from an output of this type: nodes that accept it
+        const outSuggestions =
+            LiteGraph.slot_types_default_out[type] ||
+            (LiteGraph.slot_types_default_out[type] = ["Reroute"]);
+        for (const t of inputTypes.get(type) || []) {
+            if (!outSuggestions.includes(t)) outSuggestions.push(t);
+        }
+        sortSuggestions(outSuggestions);
+
+        // Dragging into an input of this type: nodes that produce it
+        const inSuggestions =
+            LiteGraph.slot_types_default_in[type] ||
+            (LiteGraph.slot_types_default_in[type] = ["Reroute"]);
+        for (const t of outputTypes.get(type) || []) {
+            if (!inSuggestions.includes(t)) inSuggestions.push(t);
+        }
+        sortSuggestions(inSuggestions);
+    }
+}
+
+// Wrap the core SlotDefaults extension's setDefaults so our nodes survive
+// every rebuild of the LiteGraph globals it performs.
+function hookSlotDefaults() {
+    const slotDefaults = app.extensionManager?.enabledExtensions?.find((e) => e.name === "Comfy.SlotDefaults");
+    if (!slotDefaults || slotDefaults._gibbyHooked) return;
+    slotDefaults._gibbyHooked = true;
+    const rebuild = slotDefaults.setDefaults;
+    slotDefaults.setDefaults = (value) => {
+        rebuild.call(slotDefaults, value);
+        applySuggestions();
+    };
+    applySuggestions();
+}
+
 app.registerExtension({
     name: "Gibby.SlotSuggestions",
-    async beforeRegisterNodeDef(nodeType, nodeData) {
+    setup() {
+        hookSlotDefaults();
+    },
+    beforeRegisterNodeDef(nodeType, nodeData) {
         track(nodeType.comfyClass, nodeData);
-
-        if (scheduled) return;
-        scheduled = true;
-        // Wait for all node registrations to finish so the core SlotDefaults
-        // extension has rebuilt its lists, then append ourselves and sort.
-        setTimeout(() => {
-            // Refresh the sets in case new nodes were registered
-            for (const [nodeType, nodeData] of Object.entries(LiteGraph.registered_node_types)) {
-                track(nodeType, nodeData);
-            }
-            // Sort suggestion items by display name, in place
-            const sortSuggestions = (suggestions) => {
-                const items = suggestions.slice().sort((a, b) => {
-                    const nameA = (a.content || String(a)).toLowerCase();
-                    const nameB = (b.content || String(b)).toLowerCase();
-                    return nameA.localeCompare(nameB);
-                });
-                for (let i = 0; i < suggestions.length; i++) {
-                    suggestions[i] = items[i];
-                }
-            };
-
-            for (const type of SUGGESTED_TYPES) {
-                // Dragging from an output of this type: nodes that accept it
-                const outSuggestions =
-                    LiteGraph.slot_types_default_out[type] ||
-                    (LiteGraph.slot_types_default_out[type] = ["Reroute"]);
-                for (const t of inputTypes.get(type) || []) {
-                    if (!outSuggestions.includes(t)) outSuggestions.push(t);
-                }
-                sortSuggestions(outSuggestions);
-
-                // Dragging into an input of this type: nodes that produce it
-                if (!LiteGraph.slot_types_default_in) LiteGraph.slot_types_default_in = {};
-                const inSuggestions =
-                    LiteGraph.slot_types_default_in[type] ||
-                    (LiteGraph.slot_types_default_in[type] = ["Reroute"]);
-                for (const t of outputTypes.get(type) || []) {
-                    if (!inSuggestions.includes(t)) inSuggestions.push(t);
-                }
-                sortSuggestions(inSuggestions);
-            }
-        }, 1000);
+        hookSlotDefaults();
+        applySuggestions();
     },
 });

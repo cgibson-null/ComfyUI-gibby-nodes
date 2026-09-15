@@ -13,6 +13,7 @@ schema, each living in its own self-contained folder:
 - H3_pipe/: H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe (raw refs stored, encoded at apply time).
 - reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to 1MP, scaled, encoded with context VAE).
 - pipe_any/: Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe.
+- detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
 
 INSTALL:
 Put this whole folder in ComfyUI/custom_nodes/, then restart ComfyUI.
@@ -46,6 +47,7 @@ from .lora_travel_options import GibbyLoraTravelOptions
 from .tiled_vae_options import GibbyTiledVaeOptions
 from .merge_ksampler_options import GibbyMergeKSamplerOptions
 from .merge_contexts import GibbyMergeContexts
+from .detection import GibbyDetection
 
 # WEB_DIRECTORY points at the plugin root so ComfyUI discovers every node's
 # JS file (it globs recursively) and serves them under /extensions/<this>.
@@ -101,7 +103,7 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyIterativeUpscaleOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
+        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyIterativeUpscaleOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:
