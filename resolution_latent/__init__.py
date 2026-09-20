@@ -62,6 +62,18 @@ KEEP_PROPORTIONS = ["stretch", "resize", "pad", "crop", "total_pixels"]
 CROP_POSITIONS = ["center", "top", "bottom", "left", "right"]
 
 
+def _resize_to_mp_scale(w, h, megapixels, scale_factor, multiple):
+    """Target size from a source size: exact megapixels at the source's aspect
+    ratio (0 = own size), then scale_factor, then floored to a multiple."""
+    if megapixels > 0:
+        scale_by = math.sqrt(megapixels * 1024 * 1024 / (w * h))
+        w *= scale_by
+        h *= scale_by
+    w *= scale_factor
+    h *= scale_factor
+    return max(multiple, int(w) // multiple * multiple), max(multiple, int(h) // multiple * multiple)
+
+
 def _fit_size(sw, sh, box_w, box_h, keep_proportion, step):
     # Content size that fits the source (sw x sh) into the target box per Resize
     # Image v2's keep_proportion modes; always snapped to a valid latent grid.
@@ -229,7 +241,11 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         step = multiple * base // math.gcd(multiple, base)
 
         if mode == "custom":
-            w, h = float(width), float(height)
+            w, h, mp = float(width), float(height), 0.0
+        elif megapixels == 0 and has_media:
+            # 0 megapixels: no target pixel count, rescale the original media's size
+            # (before upscale_model), so the upscaled image is fitted back to it.
+            w, h, mp = float(OW), float(OH), 0.0
         else:
             # Resolution Selector math at the selected ratio; keep_ar uses media's ratio or falls back to aspect_ratio.
             if mode == "keep_ar" and has_media:
@@ -238,23 +254,12 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 rw, rh = ASPECT_RATIOS[aspect_ratio]
             else:
                 rw, rh = float(x), float(y)
-            if megapixels == 0 and has_media:
-                # 0 megapixels: no target pixel count, rescale the original media's size
-                # (before upscale_model), so the upscaled image is fitted back to it.
-                w, h = float(OW), float(OH)
-            else:
-                # 0 megapixels without media defaults to 1 MP.
-                scale_by = math.sqrt((megapixels or 1.0) * 1024 * 1024 / (rw * rh))
-                w = round(rw * scale_by / step) * step
-                h = round(rh * scale_by / step) * step
+            # 0 megapixels without media defaults to 1 MP.
+            w, h, mp = rw, rh, megapixels or 1.0
 
-        w *= scale_factor
-        h *= scale_factor
+        w, h = _resize_to_mp_scale(w, h, mp, scale_factor, step)
         if swap_dimensions:
             w, h = h, w
-
-        w = max(step, int(w) // step * step)
-        h = max(step, int(h) // step * step)
 
         # Media mode: fit the source into the (w x h) box per keep_proportion.
         if has_media:

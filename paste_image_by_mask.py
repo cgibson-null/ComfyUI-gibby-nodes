@@ -86,7 +86,8 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
             region = out[i:i + 1, sy0:sy0 + sh, sx0:sx0 + sw, :]
             out[i, sy0:sy0 + sh, sx0:sx0 + sw] = (pasted * m + region * (1 - m)).squeeze(0)
 
-        # The context carries the pasted-back images; the mask is discarded
+        # The context carries the pasted-back images; the mask and crop info are discarded
         ctx["image"] = out
         ctx.pop("mask", None)
+        ctx.pop("crop_info", None)
         return io.NodeOutput(ctx, out)

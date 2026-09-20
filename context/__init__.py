@@ -50,15 +50,19 @@ def _stringify(value):
     return str(value)
 
 
-def _recondition_text(clip, base_cond, text, ctx):
+def _recondition_text(clip, base_cond, text, ctx, images=None):
     """Re-encode `text` against clip, grafted onto base_cond's values so its
     reference payloads survive (flux2 reference_latents, h3 minimax_refs/keyframes).
     For h3 the context carries the pre-processed ref items / keyframe images, and
-    the text is tokenized with them so the Qwen vision tokens stay consistent."""
+    the text is tokenized with them so the Qwen vision tokens stay consistent.
+    With images the text is tokenized with them, so the model splices reference
+    latents at the vision slots (qwen2.1)."""
     ref_items = ctx.get("h3_ref_items")
     kf_imgs = ctx.get("h3_kf_imgs")
     if ref_items:
         tokens = clip.tokenize(text, minimax_ref_items=ref_items)
+    elif images:
+        tokens = clip.tokenize(text, images=images, keep_vision=False, prevent_empty_text=True)
     elif kf_imgs:
         tokens = clip.tokenize(text, images=kf_imgs)
     else:
@@ -74,7 +78,7 @@ def _recondition_text(clip, base_cond, text, ctx):
     return out
 
 
-def recondition_prompts(ctx, positive_text, negative_text):
+def recondition_prompts(ctx, positive_text, negative_text, images=None):
     """Re-encode positive/negative prompt texts against the context clip, grafted
     onto the context's existing conditionings so their reference payloads survive.
     Returns (positive, negative); falls back to the existing conditionings when
@@ -82,11 +86,11 @@ def recondition_prompts(ctx, positive_text, negative_text):
     clip = ctx.get("clip")
     if clip is None or (not positive_text and not negative_text):
         return ctx.get("positive"), ctx.get("negative")
-    positive = _recondition_text(clip, ctx.get("positive"), positive_text, ctx)
+    positive = _recondition_text(clip, ctx.get("positive"), positive_text, ctx, images)
     if ctx.get("cfg") == 1:
         negative, = ConditioningZeroOut().zero_out(positive)
     elif negative_text:
-        negative = _recondition_text(clip, ctx.get("negative"), negative_text, ctx)
+        negative = _recondition_text(clip, ctx.get("negative"), negative_text, ctx, images)
     else:
         negative = ctx.get("negative")
     return positive, negative

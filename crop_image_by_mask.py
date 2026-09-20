@@ -1,5 +1,3 @@
-import math
-
 import comfy.utils
 import torch
 import torch.nn.functional as F
@@ -7,6 +5,7 @@ from comfy_extras.color_util import hex_to_rgb
 from comfy_api.latest import io
 
 from .context import _CONTEXT_TYPE
+from .resolution_latent import _resize_to_mp_scale
 
 
 # Carries the originals, the mask and the paste rectangles to Image Paste By Mask (Batch) (Context)
@@ -189,16 +188,8 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
 
         max_w = max(w for *_, w, h in regions)
         max_h = max(h for *_, w, h in regions)
-        if megapixels > 0:
-            # Target pixel count for the cropped area, keeping its aspect (Resize Image principle)
-            scale_by = math.sqrt(megapixels * 1024 * 1024 / (max_w * max_h))
-            max_w *= scale_by
-            max_h *= scale_by
-        max_w *= scale_factor
-        max_h *= scale_factor
-        # Round down to a multiple so sampling doesn't re-adjust the size
-        max_w = max(multiple, int(max_w) // multiple * multiple)
-        max_h = max(multiple, int(max_h) // multiple * multiple)
+        # Target pixel count for the cropped area, keeping its aspect (Resize Image principle)
+        max_w, max_h = _resize_to_mp_scale(max_w, max_h, megapixels, scale_factor, multiple)
 
         # Fit every crop to the total size: the crop stays centered and is scaled up
         # uniformly until it fills the canvas (cover-fit). When the crop's shape differs

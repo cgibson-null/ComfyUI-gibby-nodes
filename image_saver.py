@@ -722,6 +722,11 @@ def _save_image(image: Image.Image, filepath: str, extension: str, quality_jpeg_
 
         image.save(filepath, pnginfo=metadata, optimize=optimize_png)
     else: # webp & jpeg
+        # JPEG has no alpha channel; flatten RGBA onto white
+        if extension in ('jpg', 'jpeg') and image.mode == 'RGBA':
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            background.paste(image, mask=image.getchannel('A'))
+            image = background
         image.save(filepath, optimize=True, quality=quality_jpeg_or_webp, lossless=lossless_webp)
         if piexif is None:
             return

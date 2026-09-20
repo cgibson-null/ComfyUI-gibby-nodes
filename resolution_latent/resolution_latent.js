@@ -34,14 +34,14 @@ const MODES = [
     ["custom_aspect_ratio", "Custom AR"],
 ];
 
-// Canonical order of standard widgets (schema order, excluding our DOM rows).
-// Used by serialize/configure overrides to ensure stable value mapping during
-// duplicate/undo regardless of which widgets are visually hidden via options.hidden.
+// Standard widget names in schema order (excluding the DOM switcher, which is
+// not serialized). configure() maps legacy positional widgets_values onto
+// these; with widgets_values_named present the order is irrelevant.
 const CANONICAL_WIDGETS = [
     "mode", "width", "height", "aspect_ratio", "x", "y", "megapixels",
-    "scale_factor", "swap_dimensions",
-    "upscale_method", "keep_proportion", "pad_color", "crop_position",
-    "multiple", "batch_size", "flux2_latent"
+    "scale_factor", "upscale_method", "keep_proportion", "pad_color",
+    "crop_position", "swap_dimensions", "multiple", "batch_size",
+    "flux2_latent"
 ];
 
 function findWidget(node, name) {
@@ -187,7 +187,13 @@ function setupResolutionNode(node) {
         getValue: () => getWidgetValue(node, "mode"),
         setValue: (v) => setWidgetValue(node, "mode", v),
     });
-    if (modeDom) modeDom.computeLayoutSize = () => ({ minHeight: modeEl.style.display === "none" ? 0 : 26, minWidth: 1 });
+    if (modeDom) {
+        // Keep the switcher out of the serialized widget list: it mirrors
+        // "mode", and its value as the first positional widgets_values entry
+        // shifts every other value by one slot on graph reload.
+        modeDom.serialize = false;
+        modeDom.computeLayoutSize = () => ({ minHeight: modeEl.style.display === "none" ? 0 : 26, minWidth: 1 });
+    }
 
     // Keep width/height and x/y as standard ComfyUI inputs
     // (shown/hidden per mode via options.hidden).
@@ -260,29 +266,25 @@ app.registerExtension({
             return [Math.min(natural[0], this.size[0]), Math.min(natural[1], this.size[1])];
         };
 
-        // ComfyUI's clone/undo serialize widget values by position and skip
-        // options.hidden widgets, so duplicating a node in aspect_ratio mode
-        // shifts width=512 into megapixels etc. Force a canonical value list
-        // (all standard widgets, schema order) on both ends instead.
-        const origSerialize = nodeType.prototype.serialize;
-        nodeType.prototype.serialize = function () {
-            const data = origSerialize.apply(this);
-            if (!data || !Array.isArray(data.widgets_values)) return data;
-
-            const values = [];
-            for (const name of CANONICAL_WIDGETS) {
-                const w = findWidget(this, name);
-                values.push(w ? w.value : null);
-            }
-            data.widgets_values = values;
-            return data;
-        };
-
+        // Widget values restore positionally by default, and lists saved
+        // while the DOM switcher sat in node.widgets carry its value as the
+        // first positional entry, shifting every other value by one slot.
+        // Restore by name when the data carries widgets_values_named (which
+        // also repairs those shifted lists); fall back to the canonical
+        // positional order for legacy data without the named map.
         const origConfigure = nodeType.prototype.configure;
         nodeType.prototype.configure = function (data) {
             origConfigure.apply(this, arguments);
 
-            if (data && Array.isArray(data.widgets_values)) {
+            if (data && data.widgets_values_named) {
+                for (const name of CANONICAL_WIDGETS) {
+                    const w = findWidget(this, name);
+                    const v = data.widgets_values_named[name];
+                    if (w && v !== null && v !== undefined) {
+                        w.value = v;
+                    }
+                }
+            } else if (data && Array.isArray(data.widgets_values)) {
                 const vals = data.widgets_values;
                 for (let i = 0; i < Math.min(vals.length, CANONICAL_WIDGETS.length); i++) {
                     const w = findWidget(this, CANONICAL_WIDGETS[i]);

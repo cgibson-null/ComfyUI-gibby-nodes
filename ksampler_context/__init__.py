@@ -63,6 +63,7 @@ from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.nodes_post_processing import ColorTransfer
 from ..context import _CONTEXT_TYPE, GibbyContext, _recondition_text
 from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
+from ..resolution_latent import _resize_to_mp_scale
 
 
 def _find_option(options_list, opt_type):
@@ -926,25 +927,8 @@ def _get_mask_bbox(mask):
 
 def _resize_to_target(img, mask, megapixels, scale_factor, multiple, method):
     """Resize image and mask to target size. Returns (img, mask, new_w, new_h)."""
-    h, w = img.shape[1], img.shape[2]
-
-    if scale_factor != 1.0:
-        h = int(h * scale_factor)
-        w = int(w * scale_factor)
-
-    if megapixels > 0:
-        target_px = megapixels * 1_000_000
-        current_px = h * w
-        if current_px > 0:
-            scale = (target_px / current_px) ** 0.5
-            h = int(h * scale)
-            w = int(w * scale)
-
-    if multiple > 1:
-        h = max(multiple, (h // multiple) * multiple)
-        w = max(multiple, (w // multiple) * multiple)
-
-    if h == img.shape[1] and w == img.shape[2]:
+    w, h = _resize_to_mp_scale(img.shape[2], img.shape[1], megapixels, scale_factor, multiple)
+    if (w, h) == (img.shape[2], img.shape[1]):
         return img, mask, w, h
 
     import torch.nn.functional as F

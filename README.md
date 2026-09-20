@@ -82,7 +82,7 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 **Resize Image / Empty Latent (Context)** - creates empty latent or resizes connectd image/mask allowing to keep proportions. Encodes image with mask into latent and assigns latent to context. Always outputs a context - without a context input it creates a new one with width, height and the empty latent.
 
-**Reference Latent (Context)** - faster flux2 referenes, rescale all to 1mp then to `scale`.
+**Reference Latent (Context)** - faster flux2/klein referenes, rescale all to the `megapixels` target then to `scale` (0 = own size). With qwen image 2.1 the size is a multiple of 32 and the prompts are also re-encoded with the images so the latents splice at the vision slots.
 
 **Image Saver (Context)** - saves image with a1111 metadata (civit compatible) created from context values. Ripoff from [ImageSaver](https://github.com/alexopus/ComfyUI-Image-Saver) pack.
 
