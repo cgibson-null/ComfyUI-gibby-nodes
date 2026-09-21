@@ -329,11 +329,12 @@ class GibbyContext(io.ComfyNode):
             "any": any_value,
         }
 
-        # Fall back to the base context's values for anything not connected.
+        # Fall back to the base context's values for anything not connected,
+        # carrying through keys this node doesn't model (crop_info and the like).
         if isinstance(context, dict):
-            for key in ctx:
-                if ctx[key] is None and key in context:
-                    ctx[key] = context[key]
+            for key, value in context.items():
+                if ctx.get(key) is None:
+                    ctx[key] = value
 
         # Stringify after inheritance so an unconnected model_name can still be
         # picked up from the base context instead of becoming "".

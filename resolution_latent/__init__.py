@@ -57,6 +57,8 @@ ASPECT_RATIOS = {
     "16:9 (Widescreen)": (16, 9),
     "21:9 (Ultrawide)": (21, 9),
 }
+# Picks the preset closest to the connected media's ratio; 3:4 without media.
+CLOSEST_RATIO = "closest to image"
 
 KEEP_PROPORTIONS = ["stretch", "resize", "pad", "crop", "total_pixels"]
 CROP_POSITIONS = ["center", "top", "bottom", "left", "right"]
@@ -159,11 +161,21 @@ def _crop_offsets(ow, oh, cw, ch, position):
 
 
 def _pad_color_tensor(pad_color, dtype, device):
-    # Same format as the core Color Picker: #RRGGBB or #RRGGBBAA.
-    if len(pad_color) not in (7, 9) or pad_color[0] != "#":
-        raise ValueError("Color must be in format #RRGGBB or #RRGGBBAA")
-    r, g, b = hex_to_rgb(pad_color[:7])
-    return torch.tensor([v / 255.0 for v in (r, g, b)], dtype=dtype, device=device)
+    # The core Color Picker's #RRGGBB / #RRGGBBAA, or "R, G, B[, A]" 0-255 as
+    # the frontend's color widget stores it.
+    if pad_color.startswith("#"):
+        if len(pad_color) not in (7, 9):
+            raise ValueError("Color must be in format #RRGGBB or R, G, B")
+        rgb = hex_to_rgb(pad_color[:7])
+    else:
+        try:
+            rgb = [float(v) for v in pad_color.split(",")]
+        except ValueError:
+            raise ValueError("Color must be in format #RRGGBB or R, G, B")
+        if not 3 <= len(rgb) <= 4:
+            raise ValueError("Color must be in format #RRGGBB or R, G, B")
+        rgb = rgb[:3]
+    return torch.tensor([v / 255.0 for v in rgb], dtype=dtype, device=device)
 
 
 def _color_pad(img, left, right, top, bottom, bg):
@@ -188,14 +200,15 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
             description=(
                 "Creates an empty latent from a resolution spec instead of raw width/height. "
                 "Modes: keep AR (megapixels at the media's aspect ratio, like Scale Image to Total Pixels), "
-                "custom (width x height), aspect ratio (preset + megapixels) or custom aspect ratio "
-                "(manual w:h + megapixels). Megapixels 0 rescales the media's own size instead, or "
+                "custom (width x height), aspect ratio (preset, or closest to the image, + megapixels) "
+                "or custom aspect ratio (manual w:h + megapixels). Megapixels 0 rescales the media's own size instead, or "
                 "defaults to 1 MP with no media linked. "
                 "Shared: swap dimensions, scale factor, multiple and batch size; latent type toggle for "
                 "standard 8x vs Flux2 16x latents. With an image or mask connected it is fitted into the "
                 "target box per keep_proportion (stretch/resize/pad/crop/total_pixels) and output resized. "
                 "An optional vae overrides the context's vae; encoded_latent outputs the resized image "
-                "encoded with it (the context's vae when unconnected), or empty_latent without an image or vae."
+                "encoded with it (the context's vae when unconnected), or empty_latent without an image or vae. "
+                "mask_padded marks the pad border (1 = padding), empty for the other fit modes."
             ),
             inputs=[
                 # Optional context: width/height overridden with finalized size; latent or image+latent updated.
@@ -209,7 +222,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Int.Input("width", default=1024, min=8, max=16384),
                 io.Int.Input("height", default=1024, min=8, max=16384),
                 # aspect ratio modes.
-                io.Combo.Input("aspect_ratio", options=list(ASPECT_RATIOS), default="3:4 (Portrait Standard)"),
+                io.Combo.Input("aspect_ratio", options=list(ASPECT_RATIOS) + [CLOSEST_RATIO], default="3:4 (Portrait Standard)"),
                 # custom aspect ratio mode: manual w : h floats.
                 io.Float.Input("x", default=3.0, min=0.1, max=99.0, step=0.01),
                 io.Float.Input("y", default=4.0, min=0.1, max=99.0, step=0.01),
@@ -245,6 +258,8 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 # Resized input media (None when not connected).
                 io.Image.Output(display_name="image"),
                 io.Mask.Output(display_name="mask"),
+                # 1 where the pad border was filled in, 0 over the content; empty for the other fit modes.
+                io.Mask.Output(display_name="mask_padded"),
             ],
         )
 
@@ -300,7 +315,14 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
             if mode == "keep_ar" and has_media:
                 rw, rh = float(SW), float(SH)
             elif mode == "aspect_ratio" or (mode == "keep_ar" and not has_media):
-                rw, rh = ASPECT_RATIOS[aspect_ratio]
+                if aspect_ratio == CLOSEST_RATIO:
+                    # Closest preset to the media's own ratio; 3:4 without media.
+                    if has_media:
+                        rw, rh = min(ASPECT_RATIOS.values(), key=lambda r: abs(r[0] / r[1] - SW / SH))
+                    else:
+                        rw, rh = ASPECT_RATIOS["3:4 (Portrait Standard)"]
+                else:
+                    rw, rh = ASPECT_RATIOS[aspect_ratio]
             else:
                 rw, rh = float(x), float(y)
             # 0 megapixels without media defaults to 1 MP.
@@ -344,8 +366,17 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
 
             fw = out_w + pad_left + pad_right
             fh = out_h + pad_top + pad_bottom
+            # 1 where the pad border was filled in, 0 over the content; empty for the other fit modes
+            ref = img if image is not None else msk
+            mask_padded = torch.zeros(ref.shape[0], fh, fw, dtype=torch.float32, device=ref.device)
+            if keep_proportion == "pad":
+                mask_padded[:, :pad_top, :] = 1
+                mask_padded[:, pad_top + out_h:, :] = 1
+                mask_padded[:, :, :pad_left] = 1
+                mask_padded[:, :, pad_left + out_w:] = 1
         else:
             fw, fh = w, h
+            mask_padded = None
 
         latent = empty_latent(fw, fh, batch_size=batch_size, flux2=is_flux2)
 
@@ -377,5 +408,6 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
 
         return io.NodeOutput(
             ctx,  # context (new context when none connected)
-            latent, encoded_latent, int(fw), int(fh), img if image is not None else None, msk if mask is not None else None
+            latent, encoded_latent, int(fw), int(fh), img if image is not None else None, msk if mask is not None else None,
+            mask_padded
         )

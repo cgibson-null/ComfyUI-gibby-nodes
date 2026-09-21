@@ -14,7 +14,7 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
             display_name="Image Paste By Mask (Batch) (Context)",
             category="gibby/image",
             search_aliases=["paste", "mask", "batch"],
-            description="Pastes images back onto the originals by mask: from an Image Crop By Mask (Batch) (Context) crop info (the exact inverse of the crop), or standalone with images_original and masks, where each mask's bbox is the paste area. Optional context in/out: its image is pasted back by default and its crop_info is used when none is connected; the output context carries the pasted-back images.",
+            description="Pastes images back onto the originals by mask: from an Image Crop By Mask (Batch) (Context) crop info (the exact inverse of the crop), or standalone with images_original and masks, where each mask's bbox is the paste area. When the batches differ, the smaller size wins. Optional context in/out: its image is pasted back by default and its crop_info is used when none is connected; the output context carries the pasted-back images.",
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True,
                                      tooltip="Base context; its image is pasted back by default and its crop_info is used when none is connected"),
@@ -56,8 +56,8 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
             mask = _resize_mask(mask, W, H, "nearest-exact")
         BM = mask.shape[0]
 
-        if images_to_paste.shape[0] != B:
-            raise ValueError(f"images_to_paste has {images_to_paste.shape[0]} images, the originals have {B}")
+        # Batches need not match: paste the first n frames, where n is the smaller batch size
+        n = min(B, images_to_paste.shape[0])
 
         # Match the originals' channel count (e.g., an RGBA paste over RGB drops the alpha)
         if images_to_paste.shape[-1] != C:
@@ -70,12 +70,12 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
             rects = crop_info["rects"]
         else:
             rects = []
-            for i in range(B):
+            for i in range(n):
                 bbox = _mask_bbox(mask[min(i, BM - 1)])
                 rects.append(bbox if bbox is not None else (0, 0, W, H))
 
-        out = original.clone()
-        for i in range(B):
+        out = original[:n].clone()
+        for i in range(n):
             sx0, sy0, sw, sh = rects[i]
             m = mask[min(i, BM - 1)][sy0:sy0 + sh, sx0:sx0 + sw]
             m = m.clamp(0, 1).unsqueeze(-1).to(original.dtype)
