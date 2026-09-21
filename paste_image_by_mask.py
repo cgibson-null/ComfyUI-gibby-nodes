@@ -59,6 +59,12 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
         if images_to_paste.shape[0] != B:
             raise ValueError(f"images_to_paste has {images_to_paste.shape[0]} images, the originals have {B}")
 
+        # Match the originals' channel count (e.g., an RGBA paste over RGB drops the alpha)
+        if images_to_paste.shape[-1] != C:
+            c = images_to_paste.shape[-1]
+            images_to_paste = images_to_paste[..., :C] if c > C else torch.cat(
+                [images_to_paste, images_to_paste.new_zeros(images_to_paste.shape[:-1] + (C - c,))], -1)
+
         # Paste rectangle per frame: the crop's source rect, or the mask's bbox
         if crop_info is not None:
             rects = crop_info["rects"]
