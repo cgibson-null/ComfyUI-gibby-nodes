@@ -1,4 +1,4 @@
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 
 
 class GibbyPauseExecution(io.ComfyNode):
@@ -24,12 +24,3 @@ class GibbyPauseExecution(io.ComfyNode):
         if stop:
             return io.NodeOutput(input, block_execution="paused")
         return io.NodeOutput(input)
-
-
-class GibbyPauseExecutionExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [GibbyPauseExecution]
-
-
-async def comfy_entrypoint() -> GibbyPauseExecutionExtension:
-    return GibbyPauseExecutionExtension()

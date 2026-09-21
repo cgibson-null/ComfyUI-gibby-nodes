@@ -43,7 +43,7 @@ Use **inputs** to override context values (override happens first, so output con
 
 **Denoise:** only applies when an image is present, otherwise forced to 1.0.
 
-**Decode:** on by default. Decodes the output latent to image/audio/both and removes latent from context. Disable to skip decoding in case you're chaining ksamplers (wan high pass).
+**Decode:** on by default. Decodes the output latent to image/audio/both and removes latent from context. An image whose size is not a multiple of the VAE's downscale ratio is pre-scaled to it before encoding, and the decoded image is stretched back to the original size, so the content stays aligned with the original. Disable to skip decoding in case you're chaining ksamplers (wan high pass).
 
 **Options:** connect options nodes to the `options` input - **Crop-Inpaint options**, **Iterative Options**, **Lora Travel options**, **Tiled VAE options**, **Clear VRAM options**, or **Merge KSampler Options** (dynamic `option1…option10` inputs that append several options lists into one).
 
@@ -80,9 +80,9 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 **Group Header Toggles** - three small buttons (queue / bypass / mute) in the top-right corner of each group header. Active by default, available in settings. Stolen from [rgthree](https://github.com/rgthree/rgthree-comfy).
 
-**Resize Image / Empty Latent (Context)** - creates empty latent or resizes connectd image/mask allowing to keep proportions. Encodes image with mask into latent and assigns latent to context. Always outputs a context - without a context input it creates a new one with width, height and the empty latent.
+**Resize Image / Empty Latent (Context)** - creates empty latent or resizes connectd image/mask allowing to keep proportions. Optional vae overrides the context's vae; encoded_latent outputs the image encoded with it (empty_latent when no image or vae). Always outputs a context - without a context input it creates a new one with width, height and the empty latent.
 
-**Reference Latent (Context)** - faster flux2/klein referenes, rescale all to the `megapixels` target then to `scale` (0 = own size). With qwen image 2.1 the size is a multiple of 32 and the prompts are also re-encoded with the images so the latents splice at the vision slots.
+**Reference Latent (Context)** - faster flux2/klein referenes, rescale all to the `megapixels` target then to `scale` (0 = own size), floored to the VAE's downscale ratio (2x for qwen image 2.1, so the latents splice at the vision slots) and the prompts are also re-encoded with the images. `ref_ctx_img` additionally references the context's own image at its own size (always when no image is linked, otherwise only when enabled); with no context image the first image becomes the context image and is stored back on the output context.
 
 **Image Saver (Context)** - saves image with a1111 metadata (civit compatible) created from context values. Ripoff from [ImageSaver](https://github.com/alexopus/ComfyUI-Image-Saver) pack.
 

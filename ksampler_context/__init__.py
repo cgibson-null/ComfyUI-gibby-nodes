@@ -42,8 +42,7 @@ import comfy.lora
 import comfy.lora_convert
 import comfy.model_patcher
 import latent_preview
-import comfy.model_base
-from nodes import VAEDecode, CLIPTextEncode, ConditioningZeroOut
+from nodes import ConditioningZeroOut
 from comfy_api.latest import io
 
 try:
@@ -58,12 +57,15 @@ except ImportError:
     get_schedule = None
 
 import comfy.utils as _comfy_utils
-from nodes import VAEEncode, VAEDecode, VAEDecodeTiled, VAEEncodeTiled, SetLatentNoiseMask
+from nodes import SetLatentNoiseMask
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.nodes_post_processing import ColorTransfer
-from ..context import _CONTEXT_TYPE, GibbyContext, _recondition_text
+from ..context import (_CONTEXT_TYPE, GibbyContext, _recondition_text, _latent_downscale,
+                       _image_dims, _latent_dims, _is_flux2, ctx_from, ctx_size,
+                       ensure_conditioning, encode_image, decode_latent)
+from ..lora_loader import iter_lora_stack
 from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
-from ..resolution_latent import _resize_to_mp_scale
+from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox
 
 
 def _find_option(options_list, opt_type):
@@ -73,6 +75,15 @@ def _find_option(options_list, opt_type):
         if o.get("type") == opt_type:
             return o
     return None
+
+
+def _with_color_match(opt, color_opt):
+    """Copy of the option dict carrying the color match option's settings."""
+    o = dict(opt)
+    o["color_match"] = color_opt.get("color_match", True)
+    o["color_match_method"] = color_opt.get("color_match_method", "mkl_lab")
+    o["color_match_strength"] = color_opt.get("color_match_strength", 1.0)
+    return o
 
 
 def _clear_vram(event, verbose=False):
@@ -105,52 +116,18 @@ def _tiled_for(w, h, above_megapixels):
     return (w * h) / 1_000_000 >= above_megapixels
 
 
-def _image_dims(image):
-    """(w, h, length) from a channels-last image tensor; length is None for stills."""
-    if image is None:
-        return None, None, None
-    if image.dim() == 4:
-        return image.shape[2], image.shape[1], None
-    if image.dim() == 5:
-        return image.shape[3], image.shape[2], image.shape[1]
-    return None, None, None
-
-
-def _latent_downscale(vae, channels):
-    """(w, h) spatial downscale ratio of a VAE, guessed from latent channels when no VAE is given."""
-    r = getattr(vae, "downscale_ratio", None) if vae is not None else None
-    if r is not None:
-        if isinstance(r, (tuple, list)):
-            return int(r[2]), int(r[1])
-        return int(r), int(r)
-    if vae is not None and getattr(vae, "vae_ratio", None) is not None:
-        return int(vae.vae_ratio), int(vae.vae_ratio)
-    d = 16 if channels == 128 else 8
-    return d, d
-
-
-def _latent_dims(latent, vae=None):
-    """(w, h, length) in pixels from a latent dict's samples tensor; length is None for stills."""
-    if latent is None:
-        return None, None, None
-    s = latent["samples"]
-    if s.ndim == 4:
-        lw, lh, length = s.shape[3], s.shape[2], None
-    elif s.ndim == 5:
-        lw, lh, length = s.shape[4], s.shape[3], s.shape[2]
-    else:
-        return None, None, None
-    dw, dh = _latent_downscale(vae, s.shape[1])
-    return lw * dw, lh * dh, length
+def _resolve_step(steps_value, v):
+    """A step value resolved against the step count: abs < 1 is a fraction of the
+    steps, a negative value an offset from the total, otherwise an absolute step."""
+    val = round(steps_value * v) if abs(v) < 1 else int(round(v))
+    return steps_value + val if val < 0 else int(val)
 
 
 def _resolve_step_range(steps_value, start_step, end_step):
     """Actual (start, end) step indices per the start/end step rules, clamped to [0, steps_value]."""
-    def resolve(v):
-        val = round(steps_value * v) if abs(v) < 1 else int(round(v))
-        actual = steps_value + val if val < 0 else val
-        return max(0, min(steps_value, int(actual)))
-    return resolve(start_step), resolve(end_step)
+    def clamp(v):
+        return max(0, min(steps_value, _resolve_step(steps_value, v)))
+    return clamp(start_step), clamp(end_step)
 
 
 def _load_lora_state(lora_name):
@@ -218,10 +195,7 @@ def _prepare_lora_travels(model_obj, travel_opts, steps_value, iteration_steps=N
             continue
         start_str = opt.get("start_str", 0.6)
         end_str = opt.get("end_str", 1.0)
-        for item in opt.get("lora_stack") or []:
-            if not item or len(item) < 3 or item[0] in (None, "None"):
-                continue
-            name, strength = item[0], item[1]
+        for name, strength, _sc in iter_lora_stack(opt.get("lora_stack")):
             if strength is None:
                 continue
             lora = _load_lora_state(name)
@@ -783,10 +757,7 @@ def _apply_travel_clip_loras(ctx, travel_opts, steps_value):
         if end <= start:
             continue
         start_str = opt.get("start_str", 0.6)
-        for item in opt.get("lora_stack") or []:
-            if not item or len(item) < 3 or item[0] in (None, "None"):
-                continue
-            name, strength_clip = item[0], item[2]
+        for name, _sm, strength_clip in iter_lora_stack(opt.get("lora_stack")):
             if not strength_clip:
                 continue
             lora = _load_lora_state(name)
@@ -858,36 +829,6 @@ def _log_finish(verbose, image, latent, t_start, vae=None):
     print(f"Gibby KSampler (Context) finish: resolution={res}{length_s} total_time={time.time() - t_start:.2f}s")
 
 
-def _encode_image(vae, image, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose=False):
-    """VAE-encode an image, tiled when the tiled VAE settings are on."""
-    if verbose:
-        w, h, _ = _image_dims(image)
-        print(f"Gibby KSampler (Context): VAE encode starting {w}x{h}")
-    t0 = time.time()
-    if tiled_decode:
-        latent, = VAEEncodeTiled().encode(vae, image, tile_size, overlap, temporal_size, temporal_overlap)
-    else:
-        latent, = VAEEncode().encode(vae, image)
-    if verbose:
-        print(f"Gibby KSampler (Context): VAE encode took {time.time() - t0:.2f}s")
-    return latent
-
-
-def _decode_latent(vae, latent, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose=False):
-    """VAE-decode a latent, tiled when the tiled VAE settings are on."""
-    if verbose:
-        print("Gibby KSampler (Context): VAE decode starting")
-    t0 = time.time()
-    if tiled_decode:
-        image, = VAEDecodeTiled().decode(vae, latent, tile_size, overlap, temporal_size, temporal_overlap)
-    else:
-        image, = VAEDecode().decode(vae, latent)
-    if verbose:
-        w, h, _ = _image_dims(image)
-        print(f"Gibby KSampler (Context): VAE decode took {time.time() - t0:.2f}s {w}x{h}")
-    return image
-
-
 def _normalize_mask(mask):
     """Normalize the untrusted mask input to a (B,H,W) float mask. The mask input
     can receive non-mask tensors (e.g. an image bridged into it); anything that is
@@ -909,36 +850,13 @@ def _normalize_mask(mask):
     return mask
 
 
-def _get_mask_bbox(mask):
-    """Get bounding box of non-zero mask area. Returns (x, y, w, h) or None."""
-    m = mask.squeeze()
-    if m.dim() > 2:
-        m = m[0, 0]
-    rows = (m > 0.001).any(dim=1)
-    cols = (m > 0.001).any(dim=0)
-    if not rows.any() or not cols.any():
-        return None
-    top = rows.nonzero().squeeze(-1)[0].item()
-    bottom = rows.nonzero().squeeze(-1)[-1].item()
-    left = cols.nonzero().squeeze(-1)[0].item()
-    right = cols.nonzero().squeeze(-1)[-1].item()
-    return (left, top, right - left + 1, bottom - top + 1)
-
-
 def _resize_to_target(img, mask, megapixels, scale_factor, multiple, method):
     """Resize image and mask to target size. Returns (img, mask, new_w, new_h)."""
     w, h = _resize_to_mp_scale(img.shape[2], img.shape[1], megapixels, scale_factor, multiple)
     if (w, h) == (img.shape[2], img.shape[1]):
         return img, mask, w, h
-
-    import torch.nn.functional as F
-    mode = {"bilinear": "bilinear", "area": "area", "nearest": "nearest", "lanczos": "bilinear"}.get(method, "bilinear")
-    # F.interpolate expects (N, C, H, W) — permute channels-last to channels-first
-    img = F.interpolate(img.permute(0, 3, 1, 2), size=(h, w), mode=mode, align_corners=False).permute(0, 2, 3, 1)
-    if mask.dim() == 3:
-        mask = F.interpolate(mask.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=False).squeeze(1)
-    else:
-        mask = F.interpolate(mask, size=(h, w), mode="bilinear", align_corners=False)
+    img = _resize_image(img, w, h, method)
+    mask = _resize_mask(mask, w, h)
     return img, mask, w, h
 
 
@@ -960,14 +878,9 @@ def _scale_mask(mask, scale):
 def _inpaint_regions(image, mask, opts):
     """Resize the mask to the image and compute crop regions per the crop-inpaint
     options. Returns (mask, regions); regions is empty when there is nothing to inpaint."""
-    import torch.nn.functional as F
-
     # Resize mask to image size if mismatch
     if mask.shape[1] != image.shape[1] or mask.shape[2] != image.shape[2]:
-        if mask.dim() == 3:
-            mask = F.interpolate(mask.unsqueeze(1), size=(image.shape[1], image.shape[2]), mode="bilinear", align_corners=False).squeeze(1)
-        else:
-            mask = F.interpolate(mask, size=(image.shape[1], image.shape[2]), mode="bilinear", align_corners=False)
+        mask = _resize_mask(mask, image.shape[2], image.shape[1])
 
     # Get mask regions (single or split)
     mask_mode = opts.get("mask_mode", "single")
@@ -1016,7 +929,7 @@ def _inpaint_regions(image, mask, opts):
                 regions = []
     else:
         # Single region: use full mask bbox
-        bbox = _get_mask_bbox(mask)
+        bbox = _mask_bbox(mask)
         if bbox is not None:
             mx, my, mw, mh = bbox
             cw = int(mw * crop_factor)
@@ -1084,7 +997,7 @@ def _make_noise_mask(model_obj, crop_latent, crop_mask, inpaint_mode, mask_scale
 def _color_match(image, reference, opts):
     """Match the image's color back to the reference with Transfer Color per the
     option's color_match settings. Returns the image unchanged when it is off."""
-    if not opts.get("color_match", True):
+    if not opts.get("color_match", False):
         return image
     method = opts.get("color_match_method", "mkl_lab")
     strength = float(opts.get("color_match_strength", 1.0))
@@ -1112,7 +1025,7 @@ def _composite_region(full, crop, mask, y0, y1, x0, x1):
     if m.dim() == 3:
         m = m.unsqueeze(1)
     h, w = y1 - y0, x1 - x0
-    paste = F.interpolate(crop.permute(0, 3, 1, 2), size=(h, w), mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
+    paste = _resize_image(crop, w, h)
     pm = F.interpolate(m, size=(h, w), mode="bilinear", align_corners=False)
     pm = F.avg_pool2d(pm, kernel_size=5, stride=1, padding=2)
     pm = pm.clamp(0, 1).squeeze(1).unsqueeze(-1)
@@ -1133,7 +1046,7 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
         w, h, _ = _latent_dims(latent, vae)
         tiled = _tiled_for(w, h, tiled_above) if w else False
     if latent is None:
-        latent = _encode_image(vae, image.float(), tiled, tile_size, overlap, temporal_size, temporal_overlap, verbose)
+        latent = encode_image(vae, image.float(), tiled, tile_size, overlap, temporal_size, temporal_overlap, verbose)
     latent_samples = comfy.sample.fix_empty_latent_channels(
         model_obj, latent["samples"],
         latent.get("downscale_ratio_spacial", None),
@@ -1156,7 +1069,7 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
         _clear_vram("after model", clear_verbose)
     if not decode:
         return None, model_obj
-    image = _decode_latent(vae, {"samples": samples}, tiled, tile_size, overlap, temporal_size, temporal_overlap, verbose)
+    image = decode_latent(vae, {"samples": samples}, tiled, tile_size, overlap, temporal_size, temporal_overlap, verbose)
     if clear_after_vae:
         _clear_vram("after vae", clear_verbose)
     return image, model_obj
@@ -1230,8 +1143,6 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
                             travel_state=None, prompt_state=None, step_offset=0):
     """One iterative upscale step: scale image (and mask) to target size, encode, ksample, decode.
     With a mask, each step samples only the masked area (crop-inpaint options control the mask)."""
-    import torch.nn.functional as F
-
     if upscale_model is not None:
         # Upscale with the model until at/above the target width, then bring the
         # result back to the exact target size
@@ -1243,14 +1154,10 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
         method = "bilinear"
 
     if image.shape[2] != target_w or image.shape[1] != target_h:
-        mode = {"bilinear": "bilinear", "area": "area", "nearest": "nearest", "lanczos": "bilinear"}.get(method, "bilinear")
-        image = F.interpolate(image.permute(0, 3, 1, 2), size=(target_h, target_w), mode=mode, align_corners=False).permute(0, 2, 3, 1)
+        image = _resize_image(image, target_w, target_h, method)
 
     if mask is not None and (mask.shape[-2] != target_h or mask.shape[-1] != target_w):
-        if mask.dim() == 3:
-            mask = F.interpolate(mask.unsqueeze(1), size=(target_h, target_w), mode="bilinear", align_corners=False).squeeze(1)
-        else:
-            mask = F.interpolate(mask, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        mask = _resize_mask(mask, target_w, target_h)
 
     image, model_obj = _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_value, sampler_obj,
                                               sigmas_tensor, positive, negative, inpaint_opts,
@@ -1264,7 +1171,7 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
 def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                        cfg_value, sampler_obj, positive, negative,
                        start_step=0.0, end_step=10000.0, leftover_noise=False,
-                       inpaint_opts=None, skip_color_match=False,
+                       inpaint_opts=None,
                        clear_after_model=False, clear_after_vae=False, clear_verbose=False, verbose=False,
                        travel_state=None, prompt_state=None, steps=0):
     """Iterative pixel-space upscale along a linear scale path (simple step mode).
@@ -1281,19 +1188,14 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     (it becomes the color match reference) and the remaining steps ramp
     start_denoise -> target_denoise.
     In total mode, after the final planned step the result's color is matched
-    back to the original image (Transfer Color, mkl_lab).
+    back to the original image when a color match option is connected.
     """
     image = ctx.get("image")
     mask = ctx.get("mask")
     vae = ctx["vae"]
     # VAEs round-trip exactly only at multiples of their spatial downscale
     # ratio - align the per-step target sizes to it
-    vae_ratio = vae.downscale_ratio
-    if isinstance(vae_ratio, (tuple, list)):
-        # Video VAE: (temporal, h, w)
-        h_ratio, w_ratio = int(vae_ratio[1]), int(vae_ratio[2])
-    else:
-        h_ratio = w_ratio = int(vae_ratio)
+    w_ratio, h_ratio = _latent_downscale(vae, None)
     scheduler_name = ctx.get("scheduler", "normal")
     sampler_name = ctx.get("sampler", "euler")
     if sampler_name not in comfy.samplers.KSampler.SAMPLERS:
@@ -1428,7 +1330,7 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     # After the final planned step, match the result's color back to the
     # original image (the provided one, or the basic-gen 1st step's image
     # when none was)
-    if not skip_color_match and mode == "total" and next_step == total_steps and original_image is not None:
+    if mode == "total" and next_step == total_steps and original_image is not None:
         image = _color_match(image, original_image, opts)
 
     opts["next_step"] = next_step
@@ -1465,11 +1367,6 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
     if opt_verbose and inpaint_opts.get("mask_mode", "single") == "split":
         print(f"Gibby Crop-Inpaint: {len(regions)} masks")
 
-    # Both options may carry color match - the one earlier in the options list
-    # wins its settings: the crop is matched back to the original crop with
-    # the winning option's color match before compositing
-    inpaint_wins = options_list.index(inpaint_opts) < options_list.index(iterative_opts)
-
     # The result stays at the original resolution: each crop is refined by the
     # iterative upscale, then composited back into its original region (the
     # refined crop is downscaled to fit). The original image is not upscaled.
@@ -1492,15 +1389,10 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
         out = _iterative_upscale(crop_ctx, iterative_opts, options_list, model_obj, seed,
                                  steps_value, cfg_value, sampler_obj, positive, negative,
                                  start_step, end_step, leftover_noise, inpaint_opts=inpaint_opts,
-                                 skip_color_match=inpaint_wins,
                                  clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
                                  clear_verbose=clear_verbose, verbose=verbose, travel_state=travel_state, prompt_state=prompt_state)
         out_options = out[6]
-        # When the inpaint option's color match wins, match the crop back to
-        # the original crop (the iterative one already did it per its settings)
         refined = out[2]
-        if inpaint_wins:
-            refined = _color_match(refined, crop_img, inpaint_opts)
         # Composite the refined crop back into its original-resolution region
         if x1 > x0 and y1 > y0:
             if opt_verbose:
@@ -1549,10 +1441,8 @@ def _apply_start_end_steps(sigmas_tensor, steps_value, start_step, end_step, lef
     skip means the start step is at or beyond the available steps and sampling
     should not run.
     """
-    start_step_val = round(steps_value * start_step) if abs(start_step) < 1 else int(round(start_step))
-    end_step_val = round(steps_value * end_step) if abs(end_step) < 1 else int(round(end_step))
-    actual_start_step = steps_value + start_step_val if start_step_val < 0 else start_step_val
-    actual_end_step = steps_value + end_step_val if end_step_val < 0 else end_step_val
+    actual_start_step = _resolve_step(steps_value, start_step)
+    actual_end_step = _resolve_step(steps_value, end_step)
 
     if actual_end_step < (len(sigmas_tensor) - 1):
         sigmas_tensor = sigmas_tensor[:actual_end_step + 1]
@@ -1564,17 +1454,6 @@ def _apply_start_end_steps(sigmas_tensor, steps_value, start_step, end_step, lef
         sigmas_tensor = sigmas_tensor[actual_start_step:]
 
     return sigmas_tensor, skip
-
-
-def _ensure_conditioning(ctx):
-    """Encode positive/negative conditioning from clip if the context lacks it."""
-    if ctx.get("positive") is None and ctx.get("clip") is not None:
-        ctx["positive"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("positive_prompt", ""))
-    if ctx.get("negative") is None:
-        if ctx.get("cfg") == 1 and ctx.get("positive") is not None:
-            ctx["negative"], = ConditioningZeroOut().zero_out(ctx["positive"])
-        elif ctx.get("clip") is not None:
-            ctx["negative"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("negative_prompt", ""))
 
 
 def _resolve_early_params(ctx, steps):
@@ -1615,7 +1494,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                 io.Mask.Input("mask", optional=True),
                 io.Sampler.Input("sampler", optional=True),
                 io.Sigmas.Input("sigmas", optional=True),
-                _KSAMPLER_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect an options node (Crop-Inpaint, Iterative Options, Tiled VAE, Clear VRAM) or Merge KSampler Options"),
+                _KSAMPLER_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect an options node (Crop-Inpaint, Iterative Options, Color Match, Tiled VAE, Clear VRAM) or Merge KSampler Options"),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate="fixed"),
                 io.Int.Input("steps", default=0, min=0, max=10000),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
@@ -1654,8 +1533,8 @@ class GibbyKSamplerContext(io.ComfyNode):
         if clear_at_start:
             _clear_vram("at start", clear_verbose)
 
-        # Start with context dict and apply overrides
-        ctx = dict(context) if isinstance(context, dict) else {}
+        # Start with a copy of the context (never mutate the input) and apply overrides
+        ctx = ctx_from(context)
         # The raw prompts drive native prompt travel (Forge [before:after:step] groups)
         pos_prompt_text = ctx.get("positive_prompt") or ""
         neg_prompt_text = ctx.get("negative_prompt") or ""
@@ -1691,6 +1570,14 @@ class GibbyKSamplerContext(io.ComfyNode):
         # evaluate(), which would otherwise encode the image for nothing
         inpaint_opt = _find_option(options_list, "inpaint")
         iterative_opt = _find_option(options_list, "iterative_upscale")
+        # The color match option enables and tunes color matching for
+        # crop-inpaint and the iterative upscale; without it no matching runs
+        color_opt = _find_option(options_list, "color_match")
+        if color_opt is not None:
+            if inpaint_opt is not None:
+                inpaint_opt = _with_color_match(inpaint_opt, color_opt)
+            if iterative_opt is not None:
+                iterative_opt = _with_color_match(iterative_opt, color_opt)
         # The iteration count per_iteration travels ramp across
         iter_steps = max(int(iterative_opt.get("steps", 3)), 1) if iterative_opt is not None else None
         has_image = ctx.get("image") is not None
@@ -1703,7 +1590,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             model_obj = ctx.get("model")
             steps_value, cfg_value, sampler_name, sampler_obj = _resolve_early_params(ctx, steps)
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
-            _ensure_conditioning(ctx)
+            ensure_conditioning(ctx)
             travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value, iteration_steps=iter_steps)
             prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
@@ -1728,7 +1615,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             model_obj = ctx.get("model")
             steps_value, cfg_value, sampler_name, sampler_obj = _resolve_early_params(ctx, steps)
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
-            _ensure_conditioning(ctx)
+            ensure_conditioning(ctx)
             travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value, iteration_steps=iter_steps)
             prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
@@ -1745,7 +1632,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             model_obj = ctx.get("model")
             steps_value, cfg_value, sampler_name, sampler_obj = _resolve_early_params(ctx, steps)
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
-            _ensure_conditioning(ctx)
+            ensure_conditioning(ctx)
             travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value)
             prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
@@ -1789,8 +1676,22 @@ class GibbyKSamplerContext(io.ComfyNode):
         # The image->latent encode runs inside evaluate(), tiled per the threshold;
         # time that call when it will run.
         encode_will_run = ctx.get("latent") is None and ctx.get("image") is not None and ctx.get("vae") is not None
+        orig_size = None
         if encode_will_run:
             w, h, _ = _image_dims(ctx["image"])
+            # The VAE encode snaps the image to its downscale ratio; remember the
+            # original size to stretch the decode back to it
+            orig_size = (w, h)
+            # The VAE truncates to that snapped size instead of downsampling, so
+            # pre-scale first: the encode covers the whole scene and the post-decode
+            # stretch back to the original size is geometrically exact
+            dw, dh = _latent_downscale(ctx["vae"], None)
+            sw, sh = w // dw * dw, h // dh * dh
+            if (sw, sh) != (w, h):
+                if verbose:
+                    print(f"Gibby KSampler (Context): pre-scaled {w}x{h} -> {sw}x{sh} for VAE encode")
+                ctx["image"] = _resize_image(ctx["image"], sw, sh)
+                w, h = sw, sh
             encode_tiled = _tiled_for(w, h, tiled_above)
             if verbose:
                 print(f"Gibby KSampler (Context): VAE encode starting {w}x{h}")
@@ -1863,24 +1764,15 @@ class GibbyKSamplerContext(io.ComfyNode):
             use_start_end_steps = False
         else:
             # Check if model is Flux2 - if so, use Flux2Scheduler
-            is_flux2 = isinstance(model_obj.model, comfy.model_base.Flux2) if hasattr(model_obj, 'model') else False
-            
+            is_flux2 = _is_flux2(model_obj)
+
             if is_flux2 and get_schedule is not None:
                 # Use Flux2Scheduler logic
-                # Get width/height from context, latent, or image
-                width = ctx.get("width", 0)
-                height = ctx.get("height", 0)
-                
+                # Get width/height from the context (explicit, image, or latent)
+                width, height = ctx_size(ctx)
                 if width == 0 or height == 0:
-                    if ctx.get("image") is not None:
-                        img_h, img_w = ctx["image"].shape[1], ctx["image"].shape[2]
-                        width, height = img_w, img_h
-                    elif ctx.get("latent") is not None:
-                        lat_h, lat_w = ctx["latent"]["samples"].shape[2], ctx["latent"]["samples"].shape[3]
-                        width, height = lat_w * 16, lat_h * 16  # Flux2 uses 16x downscale
-                    else:
-                        width, height = 1024, 1024  # Default
-                
+                    width, height = 1024, 1024  # Default
+
                 seq_len = (width * height / (16 * 16))
                 sigmas_tensor = get_schedule(steps_value, round(seq_len)).to(comfy.model_management.get_torch_device())
                 
@@ -1970,7 +1862,15 @@ class GibbyKSamplerContext(io.ComfyNode):
         
         if decode:
             if ctx.get("vae") is not None:
-                decoded_image = _decode_latent(ctx["vae"], out_latent, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose)
+                decoded_image = decode_latent(ctx["vae"], out_latent, tiled_decode, tile_size, overlap, temporal_size, temporal_overlap, verbose)
+                # The VAE encode snapped the image to its downscale ratio; stretch
+                # the decoded result back to the original image size
+                if decoded_image is not None and orig_size is not None:
+                    dw, dh, _ = _image_dims(decoded_image)
+                    if (dw, dh) != orig_size:
+                        if verbose:
+                            print(f"Gibby KSampler (Context): stretched {dw}x{dh} -> {orig_size[0]}x{orig_size[1]}")
+                        decoded_image = _resize_image(decoded_image, *orig_size)
 
             # Decode to audio for context update and output (overrides any existing context.audio)
             if ctx.get("vae_audio") is not None and vae_decode_audio is not None:

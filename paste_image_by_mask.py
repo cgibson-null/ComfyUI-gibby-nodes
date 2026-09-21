@@ -1,10 +1,9 @@
-import comfy.utils
 import torch
-import torch.nn.functional as F
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE
+from .context import _CONTEXT_TYPE, ctx_from
 from .crop_image_by_mask import _CROP_INFO_TYPE
+from .resolution_latent import _resize_image, _resize_mask, _mask_bbox
 
 
 class GibbyPasteImageByMaskBatch(io.ComfyNode):
@@ -36,7 +35,7 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
 
     @classmethod
     def execute(cls, context=None, images_to_paste=None, crop_info=None, images_original=None, masks=None):
-        ctx = dict(context) if isinstance(context, dict) else {}
+        ctx = ctx_from(context)
         # Connected inputs win over the context's values
         crop_info = crop_info if crop_info is not None else ctx.get("crop_info")
         images_to_paste = images_to_paste if images_to_paste is not None else ctx.get("image")
@@ -54,7 +53,7 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
         # Soft masks (e.g. the crop mask expanded with blur) blend as-is
         B, H, W, C = original.shape
         if mask.shape[1:] != (H, W):
-            mask = F.interpolate(mask.unsqueeze(1), size=(H, W), mode="nearest-exact").squeeze(1)
+            mask = _resize_mask(mask, W, H, "nearest-exact")
         BM = mask.shape[0]
 
         if images_to_paste.shape[0] != B:
@@ -66,14 +65,8 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
         else:
             rects = []
             for i in range(B):
-                m = mask[min(i, BM - 1)]
-                rows = torch.any(m > 0, dim=1)
-                if rows.any():
-                    ys = torch.where(rows)[0]
-                    xs = torch.where(torch.any(m > 0, dim=0))[0]
-                    rects.append((int(xs[0]), int(ys[0]), int(xs[-1] - xs[0] + 1), int(ys[-1] - ys[0] + 1)))
-                else:
-                    rects.append((0, 0, W, H))
+                bbox = _mask_bbox(mask[min(i, BM - 1)])
+                rects.append(bbox if bbox is not None else (0, 0, W, H))
 
         out = original.clone()
         for i in range(B):
@@ -82,7 +75,7 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
             m = m.clamp(0, 1).unsqueeze(-1).to(original.dtype)
             pasted = images_to_paste[i:i + 1]
             if pasted.shape[2] != sh or pasted.shape[3] != sw:
-                pasted = comfy.utils.common_upscale(pasted.movedim(-1, 1), sw, sh, "lanczos", "disabled").movedim(1, -1)
+                pasted = _resize_image(pasted, sw, sh, "lanczos")
             region = out[i:i + 1, sy0:sy0 + sh, sx0:sx0 + sw, :]
             out[i, sy0:sy0 + sh, sx0:sx0 + sw] = (pasted * m + region * (1 - m)).squeeze(0)
 

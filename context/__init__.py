@@ -15,19 +15,103 @@ latent) from what a context already holds; it is shared with Context Loader
 and KSampler (Context).
 """
 
+import time
+
 import torch
 import comfy.samplers
 import comfy.model_management
 import comfy.model_base
-from nodes import CLIPTextEncode, ConditioningZeroOut, VAEEncode, VAEEncodeTiled, SetLatentNoiseMask
+from nodes import CLIPTextEncode, ConditioningZeroOut, VAEEncode, VAEEncodeTiled, VAEDecode, VAEDecodeTiled, SetLatentNoiseMask
 from comfy_extras.nodes_audio import VAEEncodeAudio
 from comfy_extras.nodes_lt import LTXVConcatAVLatent
 from comfy_api.latest import io
 
-from ..lora_loader import _apply_lora
+from ..lora_loader import _apply_lora, iter_lora_stack
 
 _CONTEXT_TYPE = io.Custom("CONTEXT")
 _lora_stack = io.Custom("LORA_STACK")
+
+
+def ctx_from(context):
+    """A fresh context dict: a copy when context is a dict, else an empty one.
+    Nodes always work on this copy, so the context they received is never
+    mutated (a mutated input would leak into earlier nodes on re-runs)."""
+    return dict(context) if isinstance(context, dict) else {}
+
+
+def _latent_downscale(vae, channels):
+    """(w, h) spatial downscale ratio of a VAE, guessed from latent channels when no VAE is given."""
+    r = getattr(vae, "downscale_ratio", None) if vae is not None else None
+    if r is not None:
+        if isinstance(r, (tuple, list)):
+            return int(r[2]), int(r[1])
+        return int(r), int(r)
+    if vae is not None and getattr(vae, "vae_ratio", None) is not None:
+        return int(vae.vae_ratio), int(vae.vae_ratio)
+    d = 16 if channels == 128 else 8
+    return d, d
+
+
+def _image_dims(image):
+    """(w, h, length) from a channels-last image tensor; length is None for stills."""
+    if image is None:
+        return None, None, None
+    if image.dim() == 4:
+        return image.shape[2], image.shape[1], None
+    if image.dim() == 5:
+        return image.shape[3], image.shape[2], image.shape[1]
+    return None, None, None
+
+
+def _latent_dims(latent, vae=None):
+    """(w, h, length) in pixels from a latent dict's samples tensor; length is None for stills."""
+    if latent is None:
+        return None, None, None
+    s = latent["samples"]
+    if s.ndim == 4:
+        lw, lh, length = s.shape[3], s.shape[2], None
+    elif s.ndim == 5:
+        lw, lh, length = s.shape[4], s.shape[3], s.shape[2]
+    else:
+        return None, None, None
+    dw, dh = _latent_downscale(vae, s.shape[1])
+    return lw * dw, lh * dh, length
+
+
+def _is_flux2(model_obj):
+    """Whether a model wrapper (ModelPatcher) wraps a Flux2 model."""
+    return model_obj is not None and hasattr(model_obj, "model") and isinstance(model_obj.model, comfy.model_base.Flux2)
+
+
+def empty_latent(width, height, batch_size=1, flux2=None, model_obj=None):
+    """An empty latent dict for width x height: Flux2's 128ch /16x one when flux2
+    (or model_obj is a Flux2 model), else the standard 4ch /8x one."""
+    if flux2 is None:
+        flux2 = _is_flux2(model_obj)
+    if flux2:
+        samples = torch.zeros([batch_size, 128, height // 16, width // 16],
+                              device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
+        return {"samples": samples}
+    samples = torch.zeros([batch_size, 4, height // 8, width // 8],
+                          device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
+    return {"samples": samples, "downscale_ratio_spacial": 8}
+
+
+def ctx_size(ctx):
+    """(width, height) from the context: the explicit width/height when both are
+    set, else the image's, else the latent's scaled by the VAE's downscale ratio.
+    (0, 0) when there is nothing to measure."""
+    width, height = ctx.get("width") or 0, ctx.get("height") or 0
+    if width > 0 and height > 0:
+        return int(width), int(height)
+    if ctx.get("image") is not None:
+        img_h, img_w = ctx["image"].shape[1], ctx["image"].shape[2]
+        return int(img_w), int(img_h)
+    if ctx.get("latent") is not None:
+        lat_h, lat_w = ctx["latent"]["samples"].shape[2], ctx["latent"]["samples"].shape[3]
+        dw, dh = _latent_downscale(ctx.get("vae"), ctx["latent"]["samples"].shape[1])
+        return lat_w * dw, lat_h * dh
+    return 0, 0
 
 
 def _stringify(value):
@@ -94,6 +178,48 @@ def recondition_prompts(ctx, positive_text, negative_text, images=None):
     else:
         negative = ctx.get("negative")
     return positive, negative
+
+
+def ensure_conditioning(ctx):
+    """Fill in the context's missing positive/negative conditioning from its clip,
+    zeroing the negative when cfg=1. Mutates ctx."""
+    if ctx.get("positive") is None and ctx.get("clip") is not None:
+        ctx["positive"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("positive_prompt", ""))
+    if ctx.get("negative") is None:
+        if ctx.get("cfg") == 1 and ctx.get("positive") is not None:
+            ctx["negative"], = ConditioningZeroOut().zero_out(ctx["positive"])
+        elif ctx.get("clip") is not None:
+            ctx["negative"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("negative_prompt", ""))
+
+
+def encode_image(vae, image, tiled=False, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8, verbose=False):
+    """VAE-encode an image, tiled when the tiled VAE settings are on."""
+    if verbose:
+        w, h, _ = _image_dims(image)
+        print(f"Gibby: VAE encode starting {w}x{h}")
+    t0 = time.time()
+    if tiled:
+        latent, = VAEEncodeTiled().encode(vae, image, tile_size, overlap, temporal_size, temporal_overlap)
+    else:
+        latent, = VAEEncode().encode(vae, image)
+    if verbose:
+        print(f"Gibby: VAE encode took {time.time() - t0:.2f}s")
+    return latent
+
+
+def decode_latent(vae, latent, tiled=False, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8, verbose=False):
+    """VAE-decode a latent, tiled when the tiled VAE settings are on."""
+    if verbose:
+        print("Gibby: VAE decode starting")
+    t0 = time.time()
+    if tiled:
+        image, = VAEDecodeTiled().decode(vae, latent, tile_size, overlap, temporal_size, temporal_overlap)
+    else:
+        image, = VAEDecode().decode(vae, latent)
+    if verbose:
+        w, h, _ = _image_dims(image)
+        print(f"Gibby: VAE decode took {time.time() - t0:.2f}s {w}x{h}")
+    return image
 
 
 class GibbyContext(io.ComfyNode):
@@ -216,12 +342,8 @@ class GibbyContext(io.ComfyNode):
         # Apply LoRAs from a directly-connected lora_stack to model/clip. A
         # stack inherited from the base context is already baked into that
         # context's model, so it must not be applied again here.
-        if isinstance(lora_stack, list):
-            for item in lora_stack:
-                if not item or len(item) < 3 or item[0] == "None":
-                    continue
-                name, sm, sc = item[0], item[1], item[2]
-                ctx["model"], ctx["clip"] = _apply_lora(ctx["model"], ctx["clip"], name, sm, sc)
+        for name, sm, sc in iter_lora_stack(lora_stack):
+            ctx["model"], ctx["clip"] = _apply_lora(ctx["model"], ctx["clip"], name, sm, sc)
 
         return io.NodeOutput(
             ctx,  # context
@@ -253,30 +375,20 @@ class GibbyContext(io.ComfyNode):
 
     @staticmethod
     def evaluate(ctx, tiled=False, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8):
-        """Fill missing context values on demand from available inputs."""
-        # Positive conditioning: encode positive_prompt if clip exists (even empty string).
-        if ctx.get("positive") is None and ctx.get("clip") is not None:
-            ctx["positive"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("positive_prompt", ""))
-
-        # Negative conditioning: zero out if cfg=1 and positive exists, else encode negative_prompt (even if empty).
-        if ctx.get("negative") is None:
-            if ctx.get("cfg") == 1 and ctx.get("positive") is not None:
-                ctx["negative"], = ConditioningZeroOut().zero_out(ctx["positive"])
-            elif ctx.get("clip") is not None:
-                ctx["negative"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("negative_prompt", ""))
+        """Fill missing context values on demand from available inputs.
+        Mutates ctx - pass it a copy (ctx_from) of any context you don't own."""
+        # Conditioning from the prompts, zeroing the negative when cfg=1.
+        ensure_conditioning(ctx)
 
         # Latent: only fill if missing - use existing latent if present.
         if ctx.get("latent") is None:
             # Image takes priority - encode it fresh with mask if available.
             if ctx.get("image") is not None and ctx.get("vae") is not None:
                 try:
-                    if tiled:
-                        ctx["latent"], = VAEEncodeTiled().encode(ctx["vae"], ctx["image"], tile_size, overlap, temporal_size, temporal_overlap)
-                    else:
-                        ctx["latent"], = VAEEncode().encode(ctx["vae"], ctx["image"])
+                    ctx["latent"] = encode_image(ctx["vae"], ctx["image"], tiled, tile_size, overlap, temporal_size, temporal_overlap)
                     if ctx.get("mask") is not None:
                         ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], ctx["mask"])
-                    
+
                     # If audio also available, combine into AV latent
                     if ctx.get("vae_audio") is not None and ctx.get("audio") is not None:
                         audio_latent, = VAEEncodeAudio().encode(ctx["vae_audio"], ctx["audio"])
@@ -288,33 +400,14 @@ class GibbyContext(io.ComfyNode):
             elif ctx.get("vae_audio") is not None and ctx.get("audio") is not None:
                 ctx["latent"], = VAEEncodeAudio().encode(ctx["vae_audio"], ctx["audio"])
 
-        # Resolve width/height from image or latent if they're 0.
-        if ctx.get("width", 0) == 0 or ctx.get("height", 0) == 0:
-            if ctx.get("image") is not None:
-                img_h, img_w = ctx["image"].shape[1], ctx["image"].shape[2]
-                ctx["width"] = img_w
-                ctx["height"] = img_h
-            elif ctx.get("latent") is not None:
-                lat_h, lat_w = ctx["latent"]["samples"].shape[2], ctx["latent"]["samples"].shape[3]
-                # Determine downscale ratio based on latent channels
-                channels = ctx["latent"]["samples"].shape[1]
-                downscale = 16 if channels == 128 else 8  # Flux2 uses 128 channels/16x, others use 4/8x
-                ctx["width"] = lat_w * downscale
-                ctx["height"] = lat_h * downscale
+        # Resolve width/height from image or latent if they're missing.
+        width, height = ctx_size(ctx)
+        if width > 0 and height > 0:
+            ctx["width"] = width
+            ctx["height"] = height
 
         # Empty latent: nothing to encode or sample from, but width/height were given.
         if ctx.get("latent") is None and ctx.get("width", 0) > 0 and ctx.get("height", 0) > 0:
-            # Check if model is Flux2 - use different latent format
-            model_obj = ctx.get("model")
-            is_flux2 = isinstance(model_obj.model, comfy.model_base.Flux2) if model_obj is not None and hasattr(model_obj, 'model') else False
-            
-            if is_flux2:
-                # Flux2: 128 channels, 16x downscale
-                samples = torch.zeros([1, 128, ctx["height"] // 16, ctx["width"] // 16], device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
-                ctx["latent"] = {"samples": samples}
-            else:
-                # Regular: 4 channels, 8x downscale
-                samples = torch.zeros([1, 4, ctx["height"] // 8, ctx["width"] // 8], device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
-                ctx["latent"] = {"samples": samples, "downscale_ratio_spacial": 8}
+            ctx["latent"] = empty_latent(ctx["width"], ctx["height"], model_obj=ctx.get("model"))
 
         return ctx

@@ -1,4 +1,4 @@
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
 from ..lora_loader import _lora_stack
 
@@ -39,12 +39,3 @@ class GibbyLoraTravelOptions(io.ComfyNode):
             "verbose": verbose,
         }
         return io.NodeOutput([option])
-
-
-class GibbyLoraTravelOptionsExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [GibbyLoraTravelOptions]
-
-
-async def comfy_entrypoint() -> GibbyLoraTravelOptionsExtension:
-    return GibbyLoraTravelOptionsExtension()

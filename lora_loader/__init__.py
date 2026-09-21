@@ -46,6 +46,17 @@ def _apply_lora(model, clip, name, strength_model, strength_clip):
         return model, c
     return model, clip
 
+
+def iter_lora_stack(stack):
+    """The valid (name, strength_model, strength_clip) entries of a lora stack;
+    empty rows, "None" entries and anything that is not a row are skipped."""
+    if not isinstance(stack, list):
+        return
+    for item in stack:
+        if not isinstance(item, (list, tuple)) or len(item) < 3 or item[0] in (None, "None"):
+            continue
+        yield item[0], item[1], item[2]
+
 # The info cache lives at the plugin root (shared runtime state, and where it
 # has always been so existing user edits keep working across upgrades).
 _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -562,24 +573,17 @@ class GibbyLoraLoader(io.ComfyNode):
         lora_tags = []
 
         if stack_already_applied:
-            for item in ctx["lora_stack"]:
-                if not item or len(item) < 3 or item[0] == "None":
-                    continue
-                stacked_loras.append(item)
-                lora_tags.append(_format_lora_tag(item[0], item[1]))
+            for name, sm, sc in iter_lora_stack(ctx["lora_stack"]):
+                stacked_loras.append((name, sm, sc))
+                lora_tags.append(_format_lora_tag(name, sm))
 
         # Apply the incoming lora_stack entries (not yet applied).
-        if isinstance(lora_stack, list):
-            for item in lora_stack:
-                if not item or len(item) < 3 or item[0] == "None":
-                    continue
-                name, sm, sc = item[0], item[1], item[2]
+        for name, sm, sc in iter_lora_stack(lora_stack):
+            work_model, work_clip = _apply_lora(work_model, work_clip, name, sm, sc)
+            stacked_loras.append((name, sm, sc))
 
-                work_model, work_clip = _apply_lora(work_model, work_clip, name, sm, sc)
-                stacked_loras.append(item)
-
-                # Add tag for incoming stack LoRAs too.
-                lora_tags.append(_format_lora_tag(name, sm))
+            # Add tag for incoming stack LoRAs too.
+            lora_tags.append(_format_lora_tag(name, sm))
 
         for row in rows:
             if not isinstance(row, dict):

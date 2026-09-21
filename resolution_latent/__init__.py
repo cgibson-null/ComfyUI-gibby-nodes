@@ -19,7 +19,8 @@ target size.
 Shared across all modes: swap_dimensions, scale_factor (resolution multiplier),
 multiple (round down to this multiple, advanced) and batch_size. The latent type
 toggle picks between the standard 4ch /8x image latent and Flux2's 128ch /16x one.
-Outputs LATENT plus the computed width/height for downstream sizing.
+Outputs the context, empty_latent, encoded_latent and the computed width/height
+for downstream sizing.
 
 With an image or mask connected: the mode's target size becomes a box that the
 media is fitted into using keep_proportion (Resize Image v2 semantics - stretch,
@@ -36,14 +37,13 @@ model's factor, sets the final size).
 import math
 
 import torch
-import comfy.model_management
-import comfy.model_base
 import comfy.utils
 from comfy_api.latest import io
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.color_util import hex_to_rgb
+from nodes import VAEEncode
 
-from ..context import _CONTEXT_TYPE
+from ..context import _CONTEXT_TYPE, _is_flux2, ctx_from, empty_latent
 
 
 # Same presets as core's Resolution Selector.
@@ -72,6 +72,47 @@ def _resize_to_mp_scale(w, h, megapixels, scale_factor, multiple):
     w *= scale_factor
     h *= scale_factor
     return max(multiple, int(w) // multiple * multiple), max(multiple, int(h) // multiple * multiple)
+
+
+def _resize_image(image, w, h, method="bilinear"):
+    """Resize a channels-last image (4D still or 5D frame batch) to an exact (w, h)."""
+    return comfy.utils.common_upscale(image.movedim(-1, 1), w, h, method, "disabled").movedim(1, -1)
+
+
+def _resize_image_to_mp(image, megapixels, scale_factor, multiple, method="bilinear"):
+    """Resize a channels-last image to the megapixels/scale target floored to a multiple; unchanged when already at it."""
+    w, h = image.shape[2], image.shape[1]
+    tw, th = _resize_to_mp_scale(w, h, megapixels, scale_factor, multiple)
+    if (tw, th) != (w, h):
+        image = _resize_image(image, tw, th, method)
+    return image
+
+
+def _resize_mask(mask, w, h, mode="bilinear"):
+    """Resize a (B,H,W) or (B,C,H,W) mask to an exact (w, h); nearest modes keep hard edges."""
+    import torch.nn.functional as F
+    m = mask.unsqueeze(1) if mask.dim() == 3 else mask
+    if mode in ("nearest", "nearest-exact"):
+        m = F.interpolate(m, size=(h, w), mode=mode)
+    else:
+        m = F.interpolate(m, size=(h, w), mode=mode, align_corners=False)
+    return m.squeeze(1) if mask.dim() == 3 else m
+
+
+def _mask_bbox(mask):
+    """(x, y, w, h) of a single mask's non-zero area, or None when it is empty."""
+    m = mask.squeeze()
+    if m.dim() > 2:
+        m = m[0, 0]
+    rows = (m > 0.001).any(dim=1)
+    cols = (m > 0.001).any(dim=0)
+    if not rows.any() or not cols.any():
+        return None
+    top = rows.nonzero().squeeze(-1)[0].item()
+    bottom = rows.nonzero().squeeze(-1)[-1].item()
+    left = cols.nonzero().squeeze(-1)[0].item()
+    right = cols.nonzero().squeeze(-1)[-1].item()
+    return (left, top, right - left + 1, bottom - top + 1)
 
 
 def _fit_size(sw, sh, box_w, box_h, keep_proportion, step):
@@ -152,7 +193,9 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 "defaults to 1 MP with no media linked. "
                 "Shared: swap dimensions, scale factor, multiple and batch size; latent type toggle for "
                 "standard 8x vs Flux2 16x latents. With an image or mask connected it is fitted into the "
-                "target box per keep_proportion (stretch/resize/pad/crop/total_pixels) and output resized."
+                "target box per keep_proportion (stretch/resize/pad/crop/total_pixels) and output resized. "
+                "An optional vae overrides the context's vae; encoded_latent outputs the resized image "
+                "encoded with it (the context's vae when unconnected), or empty_latent without an image or vae."
             ),
             inputs=[
                 # Optional context: width/height overridden with finalized size; latent or image+latent updated.
@@ -187,11 +230,16 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 # Optional Load Upscale Model: when linked and an image is present, upscale it
                 # (Upscale Image (using Model)) before the resize.
                 io.UpscaleModel.Input("upscale_model", optional=True),
+                # Optional: overrides the context's vae; with an image present it encodes it
+                # for the encoded_latent output (the context's vae is used when unconnected).
+                io.Vae.Input("vae", optional=True),
             ],
             outputs=[
                 # Updated context with finalized dimensions/latent/image (new context when none in).
                 _CONTEXT_TYPE.Output(display_name="context"),
-                io.Latent.Output(display_name="latent"),
+                io.Latent.Output(display_name="empty_latent"),
+                # The resized image encoded with the vae when both are present, else empty_latent.
+                io.Latent.Output(display_name="encoded_latent"),
                 io.Int.Output(display_name="width"),
                 io.Int.Output(display_name="height"),
                 # Resized input media (None when not connected).
@@ -204,10 +252,14 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
     def execute(cls, context=None, image=None, mask=None, upscale_model=None, mode="aspect_ratio", width=1024, height=1024, aspect_ratio="3:4 (Portrait Standard)", x=3.0, y=4.0,
                 megapixels=1.0, swap_dimensions=False, scale_factor=1.0,
                 multiple=8, batch_size=1, flux2_latent=False, upscale_method="lanczos",
-                keep_proportion="stretch", pad_color="#000000", crop_position="center") -> io.NodeOutput:
+                keep_proportion="stretch", pad_color="#000000", crop_position="center", vae=None) -> io.NodeOutput:
         # If no input image but context has one, use context's image
         if image is None and isinstance(context, dict):
             image = context.get("image")
+
+        # The connected vae overrides the context's.
+        if vae is None and isinstance(context, dict):
+            vae = context.get("vae")
 
         # Original media W/H before any model upscale; the size spec follows
         # this, and the upscaled image is fitted into the target box.
@@ -229,12 +281,9 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
             src = image if image is not None else mask
             SW, SH = src.shape[2], src.shape[1]
 
-        # Use model type from context if provided, else fall back to toggle
-        is_flux2 = flux2_latent
-        if isinstance(context, dict):
-            model_obj = context.get("model")
-            if model_obj is not None and hasattr(model_obj, 'model'):
-                is_flux2 = isinstance(model_obj.model, comfy.model_base.Flux2)
+        # The context's model decides the latent format when present, else the toggle
+        model_obj = context.get("model") if isinstance(context, dict) else None
+        is_flux2 = _is_flux2(model_obj) if model_obj is not None else flux2_latent
 
         # Latent grids must be divisible by 8 (image) or 16 (flux2), so round down to the lcm of multiple and that base.
         base = 16 if is_flux2 else 8
@@ -281,7 +330,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
 
             # Resize the connected media to match the final dimensions.
             if image is not None:
-                img = comfy.utils.common_upscale(image[:, y:y + ch, x:x + cw].movedim(-1, 1), out_w, out_h, upscale_method, "disabled").movedim(1, -1)
+                img = _resize_image(image[:, y:y + ch, x:x + cw], out_w, out_h, upscale_method)
                 if keep_proportion == "pad":
                     bg = _pad_color_tensor(pad_color, image.dtype, image.device)
                     img = _color_pad(img, pad_left, pad_right, pad_top, pad_bottom, bg)
@@ -298,21 +347,25 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         else:
             fw, fh = w, h
 
-        if is_flux2:
-            samples = torch.zeros([batch_size, 128, fh // 16, fw // 16], device=comfy.model_management.intermediate_device())
-            latent = {"samples": samples}
-        else:
-            samples = torch.zeros([batch_size, 4, fh // 8, fw // 8], device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
-            latent = {"samples": samples, "downscale_ratio_spacial": 8}
+        latent = empty_latent(fw, fh, batch_size=batch_size, flux2=is_flux2)
 
-        # Update context with finalized dimensions and media. This node never
-        # encodes: with an image present its stale latent is cleared, otherwise
-        # the empty latent of the resulting size is stored. Without a context
+        # encoded_latent: the resized image encoded with the vae when both are
+        # present, otherwise the empty latent.
+        encoded_latent = latent
+        if image is not None and vae is not None:
+            encoded_latent, = VAEEncode().encode(vae, img)
+
+        # Update context with finalized dimensions and media. The context keeps
+        # its own latent policy: with an image present its stale latent is
+        # cleared (the sampler encodes it, optionally tiled), otherwise the
+        # empty latent of the resulting size is stored. Without a context
         # input a new one is created, so the output is always a context with
         # width, height and the empty latent.
-        ctx = context.copy() if isinstance(context, dict) else {}
+        ctx = ctx_from(context)
         ctx["width"] = int(fw)
         ctx["height"] = int(fh)
+        if vae is not None:
+            ctx["vae"] = vae
 
         if image is not None:
             ctx["image"] = img
@@ -324,5 +377,5 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
 
         return io.NodeOutput(
             ctx,  # context (new context when none connected)
-            latent, int(fw), int(fh), img if image is not None else None, msk if mask is not None else None
+            latent, encoded_latent, int(fw), int(fh), img if image is not None else None, msk if mask is not None else None
         )

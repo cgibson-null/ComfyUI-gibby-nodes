@@ -1,4 +1,4 @@
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
 
 
@@ -34,12 +34,3 @@ class GibbyClearVramOptions(io.ComfyNode):
             "verbose": verbose,
         }
         return io.NodeOutput([option])
-
-
-class GibbyClearVramOptionsExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [GibbyClearVramOptions]
-
-
-async def comfy_entrypoint() -> GibbyClearVramOptionsExtension:
-    return GibbyClearVramOptionsExtension()

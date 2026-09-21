@@ -7,8 +7,10 @@
 // - "Add second pass upscale": 2x second pass to the right of the node -
 //   Resize Image / Empty Latent (Context) (Keep AR, 0 megapixels, scale factor 2)
 //   -> KSampler (Context) (denoise 0.6) -> Compare Images (resized vs second pass).
-// - "Add iterative upscale": Iterative Upscale options -> KSampler (Context),
-//   context straight from the original node, Compare Images at the end.
+// - "Add iterative upscale": Iterative Upscale options + Color Match options
+//   (below) into Merge KSampler Options (right of Iterative Options, near its
+//   bottom) -> KSampler (Context), context straight from the original node,
+//   Compare Images at the end.
 // - "Add iterative step": KSampler (Context) fed by the original node's options
 //   output (carries next_step), Compare Images at the end.
 // ---------------------------------------------------------------------------
@@ -77,16 +79,28 @@ function addSecondPassUpscale(node) {
 
     node.connect(0, resize, 0);  // context -> context
     resize.connect(0, sampler, 0);  // context -> context
-    resize.connect(4, compare, 0);  // resized image -> image_a
+    resize.connect(5, compare, 0);  // resized image -> image_a (image output: context, empty_latent, encoded_latent, width, height, image)
     sampler.connect(2, compare, 1);  // second pass image -> image_b
 }
 
 function addIterativeUpscale(node) {
-    const [options, sampler, compare] = createChain(node, ["GibbyIterativeUpscaleOptions", NODE_TYPE, "ImageCompare"]);
-    if (!options || !sampler || !compare) return;
+    const [options, colorMatch, merge, sampler, compare] = createChain(node,
+        ["GibbyIterativeUpscaleOptions", "GibbyColorMatchOptions", "GibbyMergeKSamplerOptions", NODE_TYPE, "ImageCompare"]);
+    if (!options || !colorMatch || !merge || !sampler || !compare) return;
+
+    const gap = 60;
+    const ox = options.pos[0], oy = options.pos[1];
+    // Color Match below Iterative Options; Merge to the right of Iterative
+    // Options, near its bottom; the chain continues in the source row.
+    colorMatch.setPos(ox, oy + options.size[1] * 1.2 + gap);
+    merge.setPos(ox + options.size[0] + gap, oy + options.size[1] - merge.size[1]);
+    sampler.setPos(merge.pos[0] + merge.size[0] + gap, oy);
+    compare.setPos(sampler.pos[0] + sampler.size[0] + gap, oy);
 
     node.connect(0, sampler, 0);  // context -> context
-    options.connect(0, sampler, 7);  // options -> options
+    options.connect(0, merge, 0);  // iterative options -> merge option1
+    colorMatch.connect(0, merge, 1);  // color match options -> merge option2
+    merge.connect(0, sampler, 7);  // merged options -> options
     node.connect(2, compare, 0);  // original image -> image_a
     sampler.connect(2, compare, 1);  // upscaled image -> image_b
 }

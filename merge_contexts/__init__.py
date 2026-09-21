@@ -1,4 +1,4 @@
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 from ..context import _CONTEXT_TYPE
 
 
@@ -50,12 +50,3 @@ class GibbyMergeContexts(io.ComfyNode):
                 if not _is_unset(item):
                     base[key] = item
         return io.NodeOutput(base)
-
-
-class GibbyMergeContextsExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [GibbyMergeContexts]
-
-
-async def comfy_entrypoint() -> GibbyMergeContextsExtension:
-    return GibbyMergeContextsExtension()

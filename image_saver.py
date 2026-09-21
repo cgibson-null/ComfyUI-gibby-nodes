@@ -46,8 +46,8 @@ import folder_paths
 from comfy.sd1_clip import escape_important, unescape_important, token_weights
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE
-from .lora_loader import _format_lora_tag, _get_or_fetch_lora_civitai_info, _hash_file_sync, _lora_hash_for
+from .context import _CONTEXT_TYPE, ctx_from, ctx_size
+from .lora_loader import _format_lora_tag, _get_or_fetch_lora_civitai_info, _hash_file_sync, _lora_hash_for, iter_lora_stack
 
 
 # --- File path matching (ComfyUI-Image-Saver/utils.py) -----------------------
@@ -917,8 +917,10 @@ class GibbyImageSaverContext(io.ComfyNode):
                 lossless_webp=True, quality_jpeg_or_webp=100, optimize_png=False, counter=0, denoise=1.0,
                 time_format="%Y-%m-%d-%H%M%S", save_workflow_as_json=False, embed_workflow=True, additional_hashes='',
                 download_civitai_data=False, append_lora_names=False, easy_remix=True, show_preview=True, custom='', save_image=True) -> io.NodeOutput:
-        # Generation settings from the context instead of widgets.
-        ctx = context if isinstance(context, dict) else {}
+        # Generation settings from the context instead of widgets. Copy before
+        # mutating: the engine's output cache can hand the same context object
+        # to other consumers and to repeated runs.
+        ctx = ctx_from(context)
         has_context = bool(ctx)
 
         modelname = str(ctx.get("model_name") or '')
@@ -927,8 +929,6 @@ class GibbyImageSaverContext(io.ComfyNode):
         cfg = float(ctx.get("cfg") or 7.0)
         sampler_name = str(ctx.get("sampler") or '')
         scheduler_name = str(ctx.get("scheduler") or 'normal')
-        width = int(ctx.get("width") or 512)
-        height = int(ctx.get("height") or 512)
         positive = str(ctx.get("positive_prompt") or '')
         negative = str(ctx.get("negative_prompt") or '')
         if cfg <= 1.0:
@@ -941,23 +941,17 @@ class GibbyImageSaverContext(io.ComfyNode):
             print("Gibby Image Saver: no images found in context or input, nothing to save.")
             return io.NodeOutput(ctx, '', '')
 
-        # Resolve size from the actual images when the context doesn't have it.
-        if width == 0 or height == 0:
-            img_h, img_w = images.shape[1], images.shape[2]
-            width = int(img_w)
-            height = int(img_h)
+        # Resolve size from the context (explicit, image, or latent); 512 where unknown.
+        width, height = ctx_size(ctx)
+        if width == 0:
+            width = 512
+        if height == 0:
+            height = 512
 
         # LoRA names converted from the context's lora_stack with Lora
         # Loader's tag format.
-        lora_names = ''
-        lora_stack = ctx.get("lora_stack")
-        if isinstance(lora_stack, list):
-            tags = []
-            for item in lora_stack:
-                if not item or len(item) < 3 or item[0] == "None":
-                    continue
-                tags.append(_format_lora_tag(item[0], item[1]))
-            lora_names = ", ".join(tags)
+        tags = [_format_lora_tag(name, sm) for name, sm, _sc in iter_lora_stack(ctx.get("lora_stack"))]
+        lora_names = ", ".join(tags)
 
         metadata = _make_metadata(modelname, positive, negative, width, height, seed_value, steps, cfg, sampler_name, scheduler_name, denoise, custom, additional_hashes, download_civitai_data, easy_remix, lora_names, append_lora_names)
 

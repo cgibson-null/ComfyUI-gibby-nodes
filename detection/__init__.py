@@ -49,7 +49,7 @@ from comfy_api.latest import io, ui, Types
 from comfy_extras.color_util import hex_to_rgb
 from comfy_extras.nodes_video import CreateVideo
 
-from ..context import _CONTEXT_TYPE
+from ..context import _CONTEXT_TYPE, ctx_from
 
 # Fixed confidence for the bbox detector and SAM prompts (the sam3 modes
 # have their own sam3_threshold widget)
@@ -392,7 +392,7 @@ class GibbyDetection(io.ComfyNode):
                 mode="sam3", bbox_detector="(no bbox models found)", segm_model="(no models found)",
                 sam3_model="(no models found)", sam3_threshold=0.5, sam3_refine_iterations=2,
                 sam3_prompt="", preview=True, preview_fps=30.0, mask_color="#FF00FF80") -> io.NodeOutput:
-        ctx = dict(context) if isinstance(context, dict) else {}
+        ctx = ctx_from(context)
         det_image = image if image is not None else ctx.get("image")
         if det_image is None:
             raise ValueError("No image to detect on: connect an image or a context carrying one")

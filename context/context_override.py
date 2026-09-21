@@ -10,7 +10,7 @@ conditionings from them).
 import comfy.samplers
 from comfy_api.latest import io
 
-from . import _CONTEXT_TYPE, recondition_prompts
+from . import _CONTEXT_TYPE, recondition_prompts, ctx_from
 
 
 class GibbyContextOverride(io.ComfyNode):
@@ -63,7 +63,7 @@ class GibbyContextOverride(io.ComfyNode):
                 audio=None, mask_audio=None, override_sampling=False, steps=20, step_refiner=0,
                 cfg=1.0, sampler="euler", scheduler="normal", override_prompts=False,
                 positive_prompt="", negative_prompt="") -> io.NodeOutput:
-        ctx = dict(context) if isinstance(context, dict) else {}
+        ctx = ctx_from(context)
 
         # Connected inputs replace their context values directly.
         if model is not None:

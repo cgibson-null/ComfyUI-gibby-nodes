@@ -13,7 +13,17 @@ from comfy_extras.nodes_minimax_h3 import (
     _empty_av_latent, _resize, adapt_canvas,
     CANVAS_MULTIPLE, REF_IMAGE_SHORT_EDGE, FPS,
 )
-from .context import _CONTEXT_TYPE
+from .context import _CONTEXT_TYPE, ctx_from
+
+
+def _snap_frames(n):
+    """Frame count snapped down to MiniMax H3's 17k+5 requirement."""
+    n = int(n)
+    while n % 17 != 5:
+        n -= 1
+    if n < 5:
+        raise ValueError("MiniMax H3 requires at least 5 frames")
+    return n
 
 
 def _encode_ref_audio(audio_vae, audio):
@@ -72,12 +82,9 @@ def _build_ref_blocks_and_items(vae, audio_vae, frame_count, width, height, ref_
         frames = _resize(video_frames, cw, ch, "disabled")
         if frames.shape[0] > frame_count:
             frames = frames[:frame_count]
-        n = frames.shape[0]
-        if n < 5:
+        if frames.shape[0] < 5:
             raise ValueError("MiniMax H3 reference videos need at least 5 frames")
-        while n % 17 != 5:
-            n -= 1
-        frames = frames[:n]
+        frames = frames[:_snap_frames(frames.shape[0])]
         audio_latent, ref_audio_t = None, 0
         if soundtrack is not None:
             audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
@@ -118,12 +125,7 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
     kf_height = target_height if target_height is not None else height
 
     # Compute frame count
-    n = length
-    while n % 17 != 5:
-        n -= 1
-    if n < 5:
-        raise ValueError("MiniMax H3 requires at least 5 frames")
-    frame_count = n
+    frame_count = _snap_frames(length)
 
     first_frame = pipe.get("first_frame")
     last_frame = pipe.get("last_frame")
@@ -238,7 +240,7 @@ class H3PipeCreate(io.ComfyNode):
             pipe["width"] = width
         if not "height" in pipe or height is not None and height != 768:
             pipe["height"] = height
-        if not "length" in pipe is None or length is not None and length != 124:
+        if not "length" in pipe or length is not None and length != 124:
             pipe["length"] = length
         if ref_image_size is not None and ref_image_size != "match":
             pipe["ref_image_size"] = ref_image_size
@@ -304,7 +306,7 @@ class H3PipeApply(io.ComfyNode):
 
     @classmethod
     def execute(cls, context=None, clip=None, vae=None, audio_vae=None, h3_pipe=None, target_width=0, target_height=0):
-        ctx = dict(context) if isinstance(context, dict) else {}
+        ctx = ctx_from(context)
 
         # Directly-connected clip/vae override context values
         clip = clip if clip is not None else ctx.get("clip")

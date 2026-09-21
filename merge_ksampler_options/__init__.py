@@ -1,4 +1,4 @@
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
 
 
@@ -31,12 +31,3 @@ class GibbyMergeKSamplerOptions(io.ComfyNode):
             if opt_list:
                 merged.extend(opt_list)
         return io.NodeOutput(merged)
-
-
-class GibbyMergeKSamplerOptionsExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [GibbyMergeKSamplerOptions]
-
-
-async def comfy_entrypoint() -> GibbyMergeKSamplerOptionsExtension:
-    return GibbyMergeKSamplerOptionsExtension()

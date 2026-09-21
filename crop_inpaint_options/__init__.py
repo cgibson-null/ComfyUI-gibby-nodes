@@ -1,4 +1,4 @@
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 
 # Shared by all options nodes feeding KSampler (Context); carries a list of
 # option dicts (may hold non-serializable values like an upscale model).
@@ -25,9 +25,6 @@ class GibbyCropInpaintOptions(io.ComfyNode):
                 io.Float.Input("mask_scale_start", default=1.0, min=0.0, max=3.0, step=0.05, tooltip="Mask size multiplier on first step. <1=smaller, >1=larger than actual mask."),
                 io.Float.Input("mask_scale_end", default=1.0, min=0.0, max=3.0, step=0.05, tooltip="Mask size multiplier on last step."),
                 io.String.Input("mask_indices", default="", tooltip="When mask_mode=split: which mask indices to process. Extracts integers from string, ignores indices >= mask count. Empty=all."),
-                io.Boolean.Input("color_match", default=True, tooltip="After inpainting, match each crop's color back to the original crop with Transfer Color"),
-                io.Combo.Input("color_match_method", default="mkl_lab", options=["reinhard_lab", "mkl_lab", "histogram"], tooltip="Transfer Color method for color_match"),
-                io.Float.Input("color_match_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Transfer Color strength for color_match (0=off)"),
                 io.Boolean.Input("verbose", default=False, tooltip="Print the mask count (split mode) and each cropped area size to the console"),
             ],
             outputs=[
@@ -39,7 +36,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
     def execute(cls, crop_factor=3.0, megapixels=0.0, scale_factor=1.0, multiple=8,
                 upscale_method="lanczos", inpaint_mode=True, mask_mode=True,
                 mask_scale_start=1.0, mask_scale_end=1.0, mask_indices="",
-                color_match=True, color_match_method="mkl_lab", color_match_strength=1.0, verbose=False):
+                verbose=False):
         option = {
             "type": "inpaint",
             "crop_factor": crop_factor,
@@ -52,18 +49,6 @@ class GibbyCropInpaintOptions(io.ComfyNode):
             "mask_scale_start": mask_scale_start,
             "mask_scale_end": mask_scale_end,
             "mask_indices": mask_indices,
-            "color_match": color_match,
-            "color_match_method": color_match_method,
-            "color_match_strength": color_match_strength,
             "verbose": verbose,
         }
         return io.NodeOutput([option])
-
-
-class GibbyCropInpaintOptionsExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [GibbyCropInpaintOptions]
-
-
-async def comfy_entrypoint() -> GibbyCropInpaintOptionsExtension:
-    return GibbyCropInpaintOptionsExtension()

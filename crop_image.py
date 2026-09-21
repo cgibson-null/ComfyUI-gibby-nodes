@@ -1,6 +1,6 @@
 import json
 import torch
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 
 
 class GibbyCropImage(io.ComfyNode):
@@ -61,12 +61,3 @@ class GibbyCropImage(io.ComfyNode):
         ])
 
         return io.NodeOutput(img, mask, bboxes, positive_coords, negative_coords)
-
-
-class GibbyCropImageExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [GibbyCropImage]
-
-
-async def comfy_entrypoint() -> GibbyCropImageExtension:
-    return GibbyCropImageExtension()

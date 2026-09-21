@@ -1,11 +1,8 @@
-import comfy.utils
 import torch
-import torch.nn.functional as F
-from comfy_extras.color_util import hex_to_rgb
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE
-from .resolution_latent import _resize_to_mp_scale
+from .context import _CONTEXT_TYPE, ctx_from
+from .resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox, _pad_color_tensor
 
 
 # Carries the originals, the mask and the paste rectangles to Image Paste By Mask (Batch) (Context)
@@ -121,7 +118,7 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
     def execute(cls, context=None, image=None, mask=None, crop_factor=1.5, megapixels=1.0, scale_factor=1.0, multiple=8, enable_smoothing=False,
                 center_smoothing=0.8, size_source="shot_max",
                 remove_bg=False, color="#000000"):
-        ctx = dict(context) if isinstance(context, dict) else {}
+        ctx = ctx_from(context)
         # Connected image/mask override the context's
         image = image if image is not None else ctx.get("image")
         mask = mask if mask is not None else ctx.get("mask")
@@ -131,27 +128,22 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
             raise ValueError("No mask to crop by: connect a mask or a context carrying one")
         B, H, W, C = image.shape
         if mask.shape[1:] != (H, W):
-            mask = F.interpolate(mask.unsqueeze(1), size=(H, W), mode="nearest-exact").squeeze(1)
+            mask = _resize_mask(mask, W, H, "nearest-exact")
         mask = mask.round()
         BM = mask.shape[0]
 
-        r, g, b = hex_to_rgb(color)
-        bg = torch.tensor([r, g, b], dtype=image.dtype, device=image.device) / 255.0
+        bg = _pad_color_tensor(color, image.dtype, image.device)
 
         # Bounding box per mask; None when the mask is empty. A mask that fills less than
         # _MIN_FILL of its bbox, or is smaller than _MIN_SIZE of a frame dimension, is noise.
         boxes = []
         failed = []
         for m in mask:
-            rows = torch.any(m > 0, dim=1)
-            if rows.any():
-                ys = torch.where(rows)[0]
-                xs = torch.where(torch.any(m > 0, dim=0))[0]
-                x_min, x_max, y_min, y_max = int(xs[0]), int(xs[-1]), int(ys[0]), int(ys[-1])
-                w = x_max - x_min + 1
-                h = y_max - y_min + 1
+            bbox = _mask_bbox(m)
+            if bbox is not None:
+                x_min, y_min, w, h = bbox
                 fill = float((m > 0).sum()) / (w * h)
-                boxes.append((x_min, x_max, y_min, y_max))
+                boxes.append((x_min, x_min + w - 1, y_min, y_min + h - 1))
                 failed.append(fill < _MIN_FILL or w < _MIN_SIZE * W or h < _MIN_SIZE * H)
             else:
                 boxes.append(None)
@@ -197,6 +189,7 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
         # shrink subjects by a per-frame aspect mismatch, so a far shot would end up with
         # a smaller subject than the close-ups it shares the canvas with.
         out = []
+        out_mask = []
         rects = []  # (sx0, sy0, src_w, src_h) per frame: where the crop came from
         for i, idx, cx, cy, x0, y0, w, h in regions:
             s = max(max_w / w, max_h / h)
@@ -207,18 +200,22 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
             rects.append((sx0, sy0, src_w, src_h))
 
             region = image[i:i + 1, sy0:sy0 + src_h, sx0:sx0 + src_w, :]
-            if remove_bg:
-                m = mask[idx][sy0:sy0 + src_h, sx0:sx0 + src_w]
-                m = m.clamp(0, 1).unsqueeze(-1).to(image.dtype)
-                region = region * m + bg * (1 - m)
+            m = mask[idx][sy0:sy0 + src_h, sx0:sx0 + src_w]
             if src_w != max_w or src_h != max_h:
-                region = comfy.utils.common_upscale(region.movedim(-1, 1), max_w, max_h, "lanczos", "disabled").movedim(1, -1)
+                region = _resize_image(region, max_w, max_h, "lanczos")
+                # Nearest keeps the rounded mask's hard edges
+                m = _resize_mask(m.unsqueeze(0), max_w, max_h, "nearest").squeeze(0)
+            if remove_bg:
+                mb = m.clamp(0, 1).unsqueeze(-1).to(image.dtype)
+                region = region * mb + bg * (1 - mb)
             out.append(region.squeeze(0))
+            out_mask.append(m)
 
         out_image = torch.stack(out)
+        out_mask = torch.stack(out_mask)
         info = {"image": image, "mask": mask, "rects": rects}
         # The context carries the node's cropped outputs; the originals live in crop_info
         ctx["image"] = out_image
-        ctx["mask"] = mask
+        ctx["mask"] = out_mask
         ctx["crop_info"] = info
-        return io.NodeOutput(ctx, out_image, mask, info)
+        return io.NodeOutput(ctx, out_image, out_mask, info)

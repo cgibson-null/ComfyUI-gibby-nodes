@@ -11,7 +11,7 @@ schema, each living in its own self-contained folder:
 - resolution_latent/: Resize Image / Empty Latent (Context) - empty latent from width/height or aspect ratio + megapixels, resizes linked image/mask to match.
 - image_saver/: Image Saver (Context) - saves images with civitai-compatible metadata; settings and lora names come from the context.
 - H3_pipe/: H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe (raw refs stored, encoded at apply time).
-- reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to the megapixels target, scaled, encoded with context VAE).
+- reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to the megapixels target, scaled, encoded with context VAE); optionally references the context's own image at its own size.
 - pipe_any/: Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe.
 - detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
 
@@ -41,6 +41,7 @@ from .crop_image import GibbyCropImage
 from .crop_image_by_mask import GibbyCropImageByMaskBatch
 from .paste_image_by_mask import GibbyPasteImageByMaskBatch
 from .pause_execution import GibbyPauseExecution
+from .color_match_options import GibbyColorMatchOptions
 from .crop_inpaint_options import GibbyCropInpaintOptions
 from .iterative_upscale_options import GibbyIterativeUpscaleOptions
 from .lora_travel_options import GibbyLoraTravelOptions
@@ -103,7 +104,7 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyIterativeUpscaleOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
+        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyIterativeUpscaleOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

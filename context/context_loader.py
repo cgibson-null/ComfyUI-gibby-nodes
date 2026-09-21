@@ -30,7 +30,7 @@ except ImportError:
     ModelAttentionBackend = None
     print("Gibby Context Loader: ModelAttentionBackend is missing - ck_attn is disabled (update ComfyUI)")
 
-from ..lora_loader import _apply_lora
+from ..lora_loader import _apply_lora, iter_lora_stack
 from . import _CONTEXT_TYPE, _lora_stack, GibbyContext
 
 def _clip_name_inputs(count):
@@ -234,12 +234,8 @@ class GibbyContextLoader(io.ComfyNode):
         }
 
         # Apply LoRAs from a directly-connected lora_stack to the freshly-loaded model/clip.
-        if isinstance(lora_stack, list):
-            for item in lora_stack:
-                if not item or len(item) < 3 or item[0] == "None":
-                    continue
-                name, sm, sc = item[0], item[1], item[2]
-                ctx["model"], ctx["clip"] = _apply_lora(ctx["model"], ctx["clip"], name, sm, sc)
+        for name, sm, sc in iter_lora_stack(lora_stack):
+            ctx["model"], ctx["clip"] = _apply_lora(ctx["model"], ctx["clip"], name, sm, sc)
 
         if ctx["model"] is not None and ck_attn and ModelAttentionBackend is not None:
             ctx["model"], = ModelAttentionBackend.execute(ctx["model"], "comfy kitchen attention")

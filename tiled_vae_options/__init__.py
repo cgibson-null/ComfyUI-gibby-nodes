@@ -1,4 +1,4 @@
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import io
 from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
 
 
@@ -34,12 +34,3 @@ class GibbyTiledVaeOptions(io.ComfyNode):
             "temporal_overlap": temporal_overlap,
         }
         return io.NodeOutput([option])
-
-
-class GibbyTiledVaeOptionsExtension(ComfyExtension):
-    async def get_node_list(self):
-        return [GibbyTiledVaeOptions]
-
-
-async def comfy_entrypoint() -> GibbyTiledVaeOptionsExtension:
-    return GibbyTiledVaeOptionsExtension()
