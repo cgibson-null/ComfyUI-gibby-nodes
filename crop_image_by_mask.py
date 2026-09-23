@@ -1,8 +1,10 @@
 import torch
+import nodes
 from comfy_api.latest import io
+from comfy_extras.nodes_mask import GrowMask, InvertMask
 
 from .context import _CONTEXT_TYPE, ctx_from
-from .resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox, _pad_color_tensor
+from .resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox, _pad_color_tensor, _color_alpha
 
 
 # Carries the originals, the mask and the paste rectangles to Image Paste By Mask (Batch) (Context)
@@ -16,6 +18,17 @@ _SIZE_JUMP = 2.0
 _MIN_FILL = 0.25
 # A mask smaller than this fraction of a frame dimension is noise
 _MIN_SIZE = 0.05
+
+
+def _process_mask(mask, mask_grow, mask_invert):
+    """Grow first, then invert: growing before inverting leaves a margin of
+    unmasked pixels around the region (inverting first would grow the
+    complement into it)."""
+    if mask_grow:
+        mask, = GrowMask.execute(mask, mask_grow, True)
+    if mask_invert:
+        mask, = InvertMask.execute(mask)
+    return mask
 
 
 def _bbox_iou(a, b):
@@ -73,6 +86,41 @@ def _stabilize_regions(regions, W, H, center_smoothing, size_source):
     return out
 
 
+def _mask_box(bbox, W, H, crop_factor):
+    """(cx, cy, x0, y0, w, h): the crop box from a mask's bbox (x, y, w, h) scaled by
+    crop_factor and clamped to the image; the full frame when the bbox is None.
+    The center is the pixel range's center, so crop_factor=1.0 reproduces the bbox."""
+    x_min, y_min, bw, bh = bbox if bbox is not None else (0, 0, W, H)
+    cx = (x_min + x_min + bw) / 2
+    cy = (y_min + y_min + bh) / 2
+    w = bw * crop_factor
+    h = bh * crop_factor
+    x0 = max(0, min(int(cx - w / 2), W - 1))
+    y0 = max(0, min(int(cy - h / 2), H - 1))
+    x1 = max(x0 + 1, min(int(cx + w / 2), W))
+    y1 = max(y0 + 1, min(int(cy + h / 2), H))
+    return (cx, cy, x0, y0, x1 - x0, y1 - y0)
+
+
+def _cover_crop(image, mask, cx, cy, w, h, target_w, target_h, method="lanczos"):
+    """Fit the crop box (centered on cx, cy, size w x h) to the target size: the crop
+    stays centered and is scaled up until it fills the target (cover-fit), so a shape
+    mismatch trims the crop's edges. Returns (crop, crop_mask, rect); rect (sx0, sy0,
+    src_w, src_h) is where the crop came from. image is (B, H, W, C), mask (B, H, W)."""
+    s = max(target_w / w, target_h / h)
+    src_w = max(1, int(target_w / s))
+    src_h = max(1, int(target_h / s))
+    sx0 = max(0, min(int(cx - src_w / 2), image.shape[2] - src_w))
+    sy0 = max(0, min(int(cy - src_h / 2), image.shape[1] - src_h))
+    crop = image[:, sy0:sy0 + src_h, sx0:sx0 + src_w, :]
+    crop_mask = mask[:, sy0:sy0 + src_h, sx0:sx0 + src_w]
+    if src_w != target_w or src_h != target_h:
+        crop = _resize_image(crop, target_w, target_h, method)
+        # Nearest keeps the rounded mask's hard edges
+        crop_mask = _resize_mask(crop_mask, target_w, target_h, "nearest")
+    return crop, crop_mask, (sx0, sy0, src_w, src_h)
+
+
 class GibbyCropImageByMaskBatch(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -93,8 +141,12 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
                                tooltip="Target megapixels for the cropped area (0=off, just rescale). Applied after crop_factor."),
                 io.Float.Input("scale_factor", default=1.0, min=0.1, max=10.0, step=0.1,
                                tooltip="Resolution multiplier for the cropped area (1.0=off). Applied after crop_factor."),
-                io.Int.Input("multiple", default=8, min=1, max=256, step=1,
+                io.Int.Input("multiple", default=32, min=1, max=256, step=1,
                              tooltip="Round the cropped size down to this multiple so sampling won't re-adjust it"),
+                io.Int.Input("mask_grow", default=0, min=-nodes.MAX_RESOLUTION, max=nodes.MAX_RESOLUTION, step=1,
+                             tooltip="Grows the mask by this many pixels before cropping (negative shrinks it), like the native Grow Mask with tapered corners"),
+                io.Boolean.Input("mask_invert", default=False,
+                                 tooltip="Inverts the mask after growing and before cropping, like the native Invert Mask"),
                 io.Boolean.Input("enable_smoothing", default=False,
                                  tooltip="Stabilize the crop across the batch: constant size per shot, smoothed center, cuts from mask jumps; empty and noise masks hold the previous crop"),
                 io.Float.Input("center_smoothing", default=0.8, min=0.0, max=1.0, step=0.05,
@@ -104,7 +156,7 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
                 io.Boolean.Input("remove_bg", default=False,
                                  tooltip="Replaces the unmasked area with the color"),
                 io.Color.Input("color", optional=True, socketless=False, default="#000000",
-                               tooltip="Background color for remove_bg; connect the hex output of a Color Picker"),
+                               tooltip="Background color for remove_bg; connect the hex output of a Color Picker. Alpha 0 makes the background transparent instead (RGBA output)"),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output("context"),
@@ -115,7 +167,8 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, context=None, image=None, mask=None, crop_factor=1.5, megapixels=1.0, scale_factor=1.0, multiple=8, enable_smoothing=False,
+    def execute(cls, context=None, image=None, mask=None, crop_factor=1.5, megapixels=1.0, scale_factor=1.0, multiple=32,
+                mask_grow=0, mask_invert=False, enable_smoothing=False,
                 center_smoothing=0.8, size_source="shot_max",
                 remove_bg=False, color="#000000"):
         ctx = ctx_from(context)
@@ -130,9 +183,13 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
         if mask.shape[1:] != (H, W):
             mask = _resize_mask(mask, W, H, "nearest-exact")
         mask = mask.round()
+        # Grow first, then invert: the crop region and the output mask follow the processed mask
+        mask = _process_mask(mask, mask_grow, mask_invert)
         BM = mask.shape[0]
 
         bg = _pad_color_tensor(color, image.dtype, image.device)
+        # A fully transparent color makes the unmasked area transparent instead of colored
+        transparent = remove_bg and _color_alpha(color) == 0.0
 
         # Bounding box per mask; None when the mask is empty. A mask that fills less than
         # _MIN_FILL of its bbox, or is smaller than _MIN_SIZE of a frame dimension, is noise.
@@ -143,7 +200,7 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
             if bbox is not None:
                 x_min, y_min, w, h = bbox
                 fill = float((m > 0).sum()) / (w * h)
-                boxes.append((x_min, x_min + w - 1, y_min, y_min + h - 1))
+                boxes.append(bbox)
                 failed.append(fill < _MIN_FILL or w < _MIN_SIZE * W or h < _MIN_SIZE * H)
             else:
                 boxes.append(None)
@@ -159,21 +216,8 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
                     if boxes[j] is not None and not failed[j]:
                         idx = j
                         break
-            if boxes[idx] is None:
-                x_min, x_max, y_min, y_max = 0, W - 1, 0, H - 1
-            else:
-                x_min, x_max, y_min, y_max = boxes[idx]
-
-            # Center of the pixel range, so crop_factor=1.0 reproduces the bbox exactly
-            cx = (x_min + x_max + 1) / 2
-            cy = (y_min + y_max + 1) / 2
-            w = (x_max - x_min + 1) * crop_factor
-            h = (y_max - y_min + 1) * crop_factor
-            x0 = max(0, min(int(cx - w / 2), W - 1))
-            y0 = max(0, min(int(cy - h / 2), H - 1))
-            x1 = max(x0 + 1, min(int(cx + w / 2), W))
-            y1 = max(y0 + 1, min(int(cy + h / 2), H))
-            regions.append((i, idx, cx, cy, x0, y0, x1 - x0, y1 - y0))
+            cx, cy, x0, y0, w, h = _mask_box(boxes[idx], W, H, crop_factor)
+            regions.append((i, idx, cx, cy, x0, y0, w, h))
 
         if enable_smoothing:
             regions = _stabilize_regions(regions, W, H, center_smoothing, size_source)
@@ -192,24 +236,17 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
         out_mask = []
         rects = []  # (sx0, sy0, src_w, src_h) per frame: where the crop came from
         for i, idx, cx, cy, x0, y0, w, h in regions:
-            s = max(max_w / w, max_h / h)
-            src_w = max(1, int(max_w / s))
-            src_h = max(1, int(max_h / s))
-            sx0 = max(0, min(int(cx - src_w / 2), W - src_w))
-            sy0 = max(0, min(int(cy - src_h / 2), H - src_h))
-            rects.append((sx0, sy0, src_w, src_h))
-
-            region = image[i:i + 1, sy0:sy0 + src_h, sx0:sx0 + src_w, :]
-            m = mask[idx][sy0:sy0 + src_h, sx0:sx0 + src_w]
-            if src_w != max_w or src_h != max_h:
-                region = _resize_image(region, max_w, max_h, "lanczos")
-                # Nearest keeps the rounded mask's hard edges
-                m = _resize_mask(m.unsqueeze(0), max_w, max_h, "nearest").squeeze(0)
+            region, m, rect = _cover_crop(image[i:i + 1], mask[idx:idx + 1], cx, cy, w, h, max_w, max_h)
+            rects.append(rect)
             if remove_bg:
                 mb = m.clamp(0, 1).unsqueeze(-1).to(image.dtype)
-                region = region * mb + bg * (1 - mb)
+                if transparent:
+                    # Join Image with Alpha's method: keep the RGB, the mask becomes the alpha
+                    region = torch.cat((region[..., :3], mb), dim=-1)
+                else:
+                    region = region * mb + bg * (1 - mb)
             out.append(region.squeeze(0))
-            out_mask.append(m)
+            out_mask.append(m.squeeze(0))
 
         out_image = torch.stack(out)
         out_mask = torch.stack(out_mask)

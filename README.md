@@ -82,7 +82,7 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 **Resize Image / Empty Latent (Context)** - creates empty latent or resizes connectd image/mask allowing to keep proportions. Optional vae overrides the context's vae; encoded_latent outputs the image encoded with it (empty_latent when no image or vae). Always outputs a context - without a context input it creates a new one with width, height and the empty latent.
 
-**Reference Latent (Context)** - faster flux2/klein referenes, rescale all to the `megapixels` target then to `scale` (0 = own size), floored to the VAE's downscale ratio (2x for qwen image 2.1, so the latents splice at the vision slots) and the prompts are also re-encoded with the images. `ref_ctx_img` additionally references the context's own image at its own size (always when no image is linked, otherwise only when enabled); with no context image the first image becomes the context image and is stored back on the output context.
+**Reference Latent (Context)** - faster flux2/klein referenes, rescale all to the `megapixels` target then to `scale` (0 = own size), floored to the VAE's downscale ratio (2x for qwen image 2.1, so the latents splice at the vision slots) and the prompts are also re-encoded with the images. `ref_ctx_img` additionally references the context's own image at its own size (always when no image is linked, otherwise only when enabled); with no context image the first image becomes the context image and is stored back on the output context. A media pipe's reference images are referenced too - the wired images append to them in the output pipe.
 
 **Image Saver (Context)** - saves image with a1111 metadata (civit compatible) created from context values. Ripoff from [ImageSaver](https://github.com/alexopus/ComfyUI-Image-Saver) pack.
 
@@ -94,6 +94,18 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 Idea of it is to use single reference list for any amount of passes. if you for example decide to 2nd pass upscale with h3, you have to recondition to avoid errors, which would mean duplicating conditioning node and potentially reattaching references. H3 Pipe approach resolves that issue, establishing single source of truth.
 
-**H3 Pipe Create** - builds a config dict (H3 Pipe) from reference images/videos/audios, prompt, and dimensions. Stores raw tensors, no encoding yet. Shamelessly stolen from [H3-Hybrid-Cond](https://github.com/kitsune123150/minimax-h3-hybrid-cond).
+**H3 Pipe Create** - builds a config dict (H3 Pipe) from reference images/videos/audios, keyframes, prompt, and dimensions. Stores raw tensors, no encoding yet. The H3 Pipe is a media pipe - `ref_images`, `keyframes` with their positions, `ref_videos` (+ soundtracks), `ref_audios` - plus the h3 params, so the same dict feeds Reference Latent (Context) and Generate as well. Keyframes anchor the video at given positions: `indices` takes a comma-separated list - an integer is a frame index (negative counts from the end, -1 = last), a decimal is a percentage of the video (0.5 = middle); `even_distribution` spreads the full batch (first/last frame included) evenly from 0 to the last frame; `loop` anchors a duplicate of the first keyframe at the last frame. first/last frame join the batch at its start/end. Shamelessly stolen from [H3-Hybrid-Cond](https://github.com/kitsune123150/minimax-h3-hybrid-cond).
 
-**H3 Pipe Apply** - encodes pipe. target_width and target_height allow to override initial settings for first/last frame, which is required for i2v 2nd pass upscale.
+**H3 Pipe Apply** - encodes pipe. target_width and target_height allow to override initial settings for keyframes, which is required for i2v 2nd pass upscale. `drop_ref_images` / `drop_keyframes` / `drop_ref_videos` / `drop_ref_video_audios` / `drop_ref_audios` prune the pipe before applying; without clip/vae (wired or from the context) it just outputs the pruned h3_pipe.
+
+## LLM Connect
+
+Nodes for talking to a llama.cpp server / llama-swap proxy (OpenAI-compatible API); Unsloth Studio works too.
+
+**Connectivity** - server URL + model dropdown (auto-fetched from the server's /v1/models, cached per URL, Reconnect button) + optional API key. `keep_alive` 0 unloads the model right after each response; other values are the server's idle policy.
+
+**Sampling Options** - per-request sampler settings (temperature, top_k/top_p/min_p, mirostat, repeat penalty, stop, n_predict, seed, reasoning budget/effort), each field gated by an enable toggle - only enabled fields are sent.
+
+**Unsloth Load Options** - per-load parameters (context size, speculative/MTP, KV-cache quant, extra server flags); Generate applies them via Unsloth's /load API (local copy first, else the Hub repo); ignored on llama-swap, where those flags are fixed at server start (config.yaml cmd, one entry per variant).
+
+**Generate** - single-shot text generation with auto-growing image/video reference slots (videos sampled to still frames, first + last always included); prints a tokens/sec line with the time it took for every run. Can take a media pipe - its refs and keyframes are sent to the model, labeled as such - and outputs a media pipe carrying the wired refs and the generated text as its prompt.

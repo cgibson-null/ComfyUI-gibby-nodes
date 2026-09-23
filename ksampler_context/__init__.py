@@ -65,6 +65,8 @@ from ..context import (_CONTEXT_TYPE, GibbyContext, _recondition_text, _latent_d
                        ensure_conditioning, encode_image, decode_latent)
 from ..lora_loader import iter_lora_stack
 from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
+from ..crop_image_by_mask import _process_mask, _mask_box, _cover_crop
+from ..paste_image_by_mask import _paste_back
 from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox
 
 
@@ -850,16 +852,6 @@ def _normalize_mask(mask):
     return mask
 
 
-def _resize_to_target(img, mask, megapixels, scale_factor, multiple, method):
-    """Resize image and mask to target size. Returns (img, mask, new_w, new_h)."""
-    w, h = _resize_to_mp_scale(img.shape[2], img.shape[1], megapixels, scale_factor, multiple)
-    if (w, h) == (img.shape[2], img.shape[1]):
-        return img, mask, w, h
-    img = _resize_image(img, w, h, method)
-    mask = _resize_mask(mask, w, h)
-    return img, mask, w, h
-
-
 def _scale_mask(mask, scale):
     """Rescale mask: scale<1 shrinks white area, scale>1 expands. scale=1 is no-op."""
     if scale == 1.0:
@@ -876,11 +868,17 @@ def _scale_mask(mask, scale):
 
 
 def _inpaint_regions(image, mask, opts):
-    """Resize the mask to the image and compute crop regions per the crop-inpaint
-    options. Returns (mask, regions); regions is empty when there is nothing to inpaint."""
+    """Resize the mask to the image, process it (grow, invert) and compute crop
+    regions per the crop-inpaint options with the crop node's methods (Image Crop
+    By Mask (Batch)). Returns (mask, regions); regions is empty when there is
+    nothing to inpaint. A region is (x0, y0, x1, y1, cx, cy, w, h, seg_mask)."""
     # Resize mask to image size if mismatch
     if mask.shape[1] != image.shape[1] or mask.shape[2] != image.shape[2]:
         mask = _resize_mask(mask, image.shape[2], image.shape[1])
+
+    # Grow first, then invert (the crop node's method): the crop regions and
+    # the inpaint mask both follow the processed mask
+    mask = _process_mask(mask, opts.get("mask_grow", 0), opts.get("mask_invert", False))
 
     # Get mask regions (single or split)
     mask_mode = opts.get("mask_mode", "single")
@@ -902,21 +900,13 @@ def _inpaint_regions(image, mask, opts):
                 x, y, w, h = cv2.boundingRect(contour)
                 if w < 4 or h < 4:
                     continue
-                # Expand by crop_factor
-                cw = int(w * crop_factor)
-                ch = int(h * crop_factor)
-                cx = x + w // 2
-                cy = y + h // 2
-                x0 = max(0, cx - cw // 2)
-                y0 = max(0, cy - ch // 2)
-                x1 = min(img_w, x0 + cw)
-                y1 = min(img_h, y0 + ch)
+                cx, cy, x0, y0, cw, ch = _mask_box((x, y, w, h), img_w, img_h, crop_factor)
                 # Isolate this segment so other segments inside the crop
                 # window are not inpainted together with it
                 seg = np.zeros((img_h, img_w), dtype=np.uint8)
                 cv2.drawContours(seg, [contour], -1, 1, -1)
                 seg_mask = mask_2d_float * torch.from_numpy(seg > 0).to(mask.device)
-                regions.append((x0, y0, x1, y1, seg_mask))
+                regions.append((x0, y0, x0 + cw, y0 + ch, cx, cy, cw, ch, seg_mask))
         # Filter by mask_indices if provided
         mask_indices_str = opts.get("mask_indices", "")
         if mask_indices_str:
@@ -928,19 +918,11 @@ def _inpaint_regions(image, mask, opts):
             else:
                 regions = []
     else:
-        # Single region: use full mask bbox
+        # Single region: the crop node's box for the full mask
         bbox = _mask_bbox(mask)
         if bbox is not None:
-            mx, my, mw, mh = bbox
-            cw = int(mw * crop_factor)
-            ch = int(mh * crop_factor)
-            cx = mx + mw // 2
-            cy = my + mh // 2
-            x0 = max(0, cx - cw // 2)
-            y0 = max(0, cy - ch // 2)
-            x1 = min(img_w, x0 + cw)
-            y1 = min(img_h, y0 + ch)
-            regions.append((x0, y0, x1, y1, None))
+            cx, cy, x0, y0, w, h = _mask_box(bbox, img_w, img_h, crop_factor)
+            regions.append((x0, y0, x0 + w, y0 + h, cx, cy, w, h, None))
 
     return mask, regions
 
@@ -1003,33 +985,6 @@ def _color_match(image, reference, opts):
     strength = float(opts.get("color_match_strength", 1.0))
     matched, = ColorTransfer.execute(image, reference, method, {"source_stats": "per_frame"}, strength)
     return matched
-
-
-def _crop_region(image, mask, seg_mask, x0, y0, x1, y1):
-    """Crop the image and its mask to a region; in split mode only this
-    segment's mask pixels are kept."""
-    crop_img = image[:, y0:y1, x0:x1, :]
-    if seg_mask is not None:
-        crop_mask = seg_mask[y0:y1, x0:x1].unsqueeze(0)
-    else:
-        crop_mask = mask[:, y0:y1, x0:x1]
-    return crop_img, crop_mask
-
-
-def _composite_region(full, crop, mask, y0, y1, x0, x1):
-    """Blend a processed crop back into the full image's region, feathered by the mask."""
-    import torch.nn.functional as F
-    if crop.dim() == 3:
-        crop = crop.unsqueeze(0)
-    m = mask.float()
-    if m.dim() == 3:
-        m = m.unsqueeze(1)
-    h, w = y1 - y0, x1 - x0
-    paste = _resize_image(crop, w, h)
-    pm = F.interpolate(m, size=(h, w), mode="bilinear", align_corners=False)
-    pm = F.avg_pool2d(pm, kernel_size=5, stride=1, padding=2)
-    pm = pm.clamp(0, 1).squeeze(1).unsqueeze(-1)
-    full[:, y0:y1, x0:x1, :3] = paste[:, :, :, :3] * pm + full[:, y0:y1, x0:x1, :3] * (1 - pm)
 
 
 def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_value, sampler_obj,
@@ -1096,19 +1051,19 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
     # Process each region
     megapixels = opts.get("megapixels", 0.0)
     scale_factor = opts.get("scale_factor", 1.0)
-    multiple = opts.get("multiple", 8)
+    multiple = opts.get("multiple", 32)
     method = opts.get("upscale_method", "bilinear")
     tiled_above, tile_size, overlap, temporal_size, temporal_overlap = _tiled_settings(options_list)
 
     result_image = image.clone()
 
-    for idx, (x0, y0, x1, y1, seg_mask) in enumerate(regions):
-        cw = x1 - x0
-        ch = y1 - y0
-        crop_img, crop_mask = _crop_region(result_image, mask, seg_mask, x0, y0, x1, y1)
-        crop_img, crop_mask, new_w, new_h = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, method)
+    for idx, (x0, y0, x1, y1, cx, cy, w, h, seg_mask) in enumerate(regions):
+        target_w, target_h = _resize_to_mp_scale(w, h, megapixels, scale_factor, multiple)
+        region_mask = seg_mask.unsqueeze(0) if seg_mask is not None else mask
+        crop_img, crop_mask, (sx0, sy0, src_w, src_h) = _cover_crop(
+            result_image, region_mask, cx, cy, w, h, target_w, target_h, method)
         if opt_verbose:
-            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={cw}x{ch} -> {new_w}x{new_h}")
+            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
         refined_crop, model_obj = _encode_sample_decode(crop_img, crop_mask, vae, model_obj, seed, steps_value,
                                                         cfg_value, sampler_obj, sigmas_tensor, positive, negative, opts,
                                                         tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
@@ -1120,8 +1075,8 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
             # so the match is anchored to this region, not the whole image
             refined_crop = _color_match(refined_crop, crop_img, opts)
             if opt_verbose:
-                print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined_crop.shape[2]}x{refined_crop.shape[1]} -> {cw}x{ch}")
-            _composite_region(result_image, refined_crop, crop_mask, y0, y1, x0, x1)
+                print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined_crop.shape[2]}x{refined_crop.shape[1]} -> {src_w}x{src_h}")
+            _paste_back(result_image, refined_crop, crop_mask, sx0, sy0, src_w, src_h)
 
     # Without a decode the VAE is done after the last region's encode: free it.
     if clear_after_vae and not (decode and vae is not None):
@@ -1374,15 +1329,17 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
 
     megapixels = inpaint_opts.get("megapixels", 0.0)
     scale_factor = inpaint_opts.get("scale_factor", 1.0)
-    multiple = inpaint_opts.get("multiple", 8)
+    multiple = inpaint_opts.get("multiple", 32)
     crop_method = inpaint_opts.get("upscale_method", "bilinear")
 
     out_options = options_list
-    for idx, (x0, y0, x1, y1, seg_mask) in enumerate(regions):
-        crop_img, crop_mask = _crop_region(image, mask, seg_mask, x0, y0, x1, y1)
-        crop_img, crop_mask, new_w, new_h = _resize_to_target(crop_img, crop_mask, megapixels, scale_factor, multiple, crop_method)
+    for idx, (x0, y0, x1, y1, cx, cy, w, h, seg_mask) in enumerate(regions):
+        target_w, target_h = _resize_to_mp_scale(w, h, megapixels, scale_factor, multiple)
+        region_mask = seg_mask.unsqueeze(0) if seg_mask is not None else mask
+        crop_img, crop_mask, (sx0, sy0, src_w, src_h) = _cover_crop(
+            image, region_mask, cx, cy, w, h, target_w, target_h, crop_method)
         if opt_verbose:
-            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {new_w}x{new_h}")
+            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
         crop_ctx = {"image": crop_img, "mask": crop_mask, "vae": vae,
                     "scheduler": ctx.get("scheduler", "normal"), "sampler": ctx.get("sampler", "euler")}
         # Pass the crop (image + mask) to the iterative upscale
@@ -1394,10 +1351,9 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
         out_options = out[6]
         refined = out[2]
         # Composite the refined crop back into its original-resolution region
-        if x1 > x0 and y1 > y0:
-            if opt_verbose:
-                print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined.shape[2]}x{refined.shape[1]} -> {x1 - x0}x{y1 - y0}")
-            _composite_region(full, refined, crop_ctx.get("mask"), y0, y1, x0, x1)
+        if opt_verbose:
+            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined.shape[2]}x{refined.shape[1]} -> {src_w}x{src_h}")
+        _paste_back(full, refined, crop_ctx.get("mask"), sx0, sy0, src_w, src_h)
 
     if opt_verbose:
         print(f"Gibby Crop-Inpaint: composited {len(regions)} region(s) into {full.shape[2]}x{full.shape[1]} (final image)")

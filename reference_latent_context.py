@@ -18,6 +18,9 @@ when no image input is connected (at its own size, no rescale), and with image
 inputs connected only when the toggle is on - then it leads the reference list
 at its own size, and when the context has no image the first image input becomes
 the context image and is stored back on the output context.
+
+A media pipe's reference images are referenced too - the wired images append
+to them in the output pipe; keyframes/videos/audios pass through untouched.
 """
 
 import comfy.model_base
@@ -25,6 +28,7 @@ import node_helpers
 from comfy_api.latest import io
 
 from .context import _CONTEXT_TYPE, recondition_prompts, _latent_downscale, ctx_from
+from .media_pipe import slot_order, pipe_add_images
 from .resolution_latent import _resize_image_to_mp
 
 
@@ -45,10 +49,15 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                 "With Qwen Image 2.1 the prompts are also re-encoded with the images. "
                 "ref_ctx_img also references the context's own image: always when "
                 "no image is connected, otherwise only when enabled - it leads at its own size, "
-                "and with no context image the first image becomes the context image and is stored back."
+                "and with no context image the first image becomes the context image and is stored back. "
+                "A media pipe's reference images are referenced too - the wired images "
+                "append to them in the output pipe."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context"),
+                io.Dict.Input("media_pipe", optional=True, tooltip=(
+                    "Media pipe - its reference images are referenced too (the wired images "
+                    "append to them in the output pipe); keyframes/videos/audios pass through untouched.")),
                 io.Autogrow.Input(
                     "images",
                     template=io.Autogrow.TemplateNames(
@@ -83,14 +92,19 @@ class GibbyReferenceLatentContext(io.ComfyNode):
             ],
             outputs=[
                 _CONTEXT_TYPE.Output(display_name="context"),
+                io.Dict.Output(display_name="media_pipe"),
             ],
         )
 
     @classmethod
-    def execute(cls, context, images: io.Autogrow.Type = None, megapixels=1.0, scale=1.0, ref_ctx_img=False) -> io.NodeOutput:
+    def execute(cls, context, media_pipe=None, images: io.Autogrow.Type = None, megapixels=1.0, scale=1.0, ref_ctx_img=False) -> io.NodeOutput:
         # The wired image_N, in order (None slots dropped).
         images = images or {}
         explicit = [images[name] for name in sorted(images, key=lambda n: int(n.rsplit("_", 1)[-1])) if images[name] is not None]
+
+        # Pipe refs lead the reference list, the wired images append to them.
+        pipe_refs = [v for k, v in sorted(((media_pipe or {}).get("ref_images") or {}).items(),
+                                           key=lambda kv: slot_order(kv[0])) if v is not None]
 
         # The context image takes the main slot: always when no image_N is wired
         # (toggle irrelevant), otherwise only with ref_ctx_img on - then it leads
@@ -107,8 +121,8 @@ class GibbyReferenceLatentContext(io.ComfyNode):
             main, extras = None, explicit
 
         vae = context.get("vae")
-        if (main is None and not extras) or vae is None:
-            return io.NodeOutput(ctx_from(context))
+        if (main is None and not extras and not pipe_refs) or vae is None:
+            return io.NodeOutput(ctx_from(context), pipe_add_images(media_pipe, explicit))
 
         model = context.get("model")
         is_qwen21 = model is not None and hasattr(model, "model") and isinstance(model.model, comfy.model_base.QwenImage21)
@@ -134,10 +148,13 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                 return vae.encode(resized)
             return vae.encode(resized[:, :, :, :3])
 
-        # The context image is referenced at its own size; the wired image_N to the target.
+        # The context image is referenced at its own size; the pipe refs and
+        # the wired image_N to the target.
         if main is not None:
             main_resized = _resize_image_to_mp(main, 0.0, 1.0, multiple)
             ref_latents.append(encode_ref(main_resized))
+        for image in pipe_refs:
+            ref_latents.append(encode_ref(_resize_image_to_mp(image, megapixels, scale, multiple)))
         for image in extras:
             ref_latents.append(encode_ref(_resize_image_to_mp(image, megapixels, scale, multiple)))
 
@@ -159,4 +176,4 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         if negative is not None and cfg != 1.0 and ref_latents:
             ctx["negative"] = node_helpers.conditioning_set_values(negative, {"reference_latents": ref_latents})
 
-        return io.NodeOutput(ctx)
+        return io.NodeOutput(ctx, pipe_add_images(media_pipe, explicit))

@@ -178,6 +178,14 @@ def _pad_color_tensor(pad_color, dtype, device):
     return torch.tensor([v / 255.0 for v in rgb], dtype=dtype, device=device)
 
 
+def _color_alpha(pad_color):
+    # The color's alpha channel (1.0 when absent): #RRGGBBAA or "R, G, B[, A]" 0-255
+    if pad_color.startswith("#"):
+        return int(pad_color[7:9], 16) / 255.0 if len(pad_color) == 9 else 1.0
+    parts = pad_color.split(",")
+    return float(parts[3]) / 255.0 if len(parts) >= 4 else 1.0
+
+
 def _color_pad(img, left, right, top, bottom, bg):
     # img [B,H,W,C]; canvas filled with the background color, content at (top, left).
     B, H, W, C = img.shape
@@ -232,7 +240,8 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 # media resize (only used when an image or mask is connected).
                 io.Combo.Input("upscale_method", options=["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], default="lanczos"),
                 io.Combo.Input("keep_proportion", options=KEEP_PROPORTIONS, default="stretch", advanced=True),
-                io.Color.Input("pad_color", default="#000000", advanced=True),
+                io.Color.Input("pad_color", default="#000000", advanced=True,
+                               tooltip="Pad border color for the pad fit mode; alpha 0 makes the border transparent instead (RGBA output)"),
                 io.Combo.Input("crop_position", options=CROP_POSITIONS, default="center", advanced=True),
                 # shared settings (plain booleans render as pill toggles).
                 io.Boolean.Input("swap_dimensions", display_name="Swap dimensions", default=False),
@@ -355,7 +364,14 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 img = _resize_image(image[:, y:y + ch, x:x + cw], out_w, out_h, upscale_method)
                 if keep_proportion == "pad":
                     bg = _pad_color_tensor(pad_color, image.dtype, image.device)
-                    img = _color_pad(img, pad_left, pad_right, pad_top, pad_bottom, bg)
+                    if _color_alpha(pad_color) == 0.0:
+                        # Transparent pad: the content is opaque, the border is alpha 0
+                        img = _color_pad(img[..., :3], pad_left, pad_right, pad_top, pad_bottom, bg)
+                        alpha = torch.ones(img.shape[0], out_h, out_w, dtype=img.dtype, device=img.device)
+                        alpha = torch.nn.functional.pad(alpha, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0)
+                        img = torch.cat((img, alpha.unsqueeze(-1)), dim=-1)
+                    else:
+                        img = _color_pad(img, pad_left, pad_right, pad_top, pad_bottom, bg)
 
             # Masks are [B,H,W]; bilinear keeps them smooth like core resize paths.
             if mask is not None:

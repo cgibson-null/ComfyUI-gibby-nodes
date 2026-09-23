@@ -10,15 +10,18 @@ schema, each living in its own self-contained folder:
 - context/: the CONTEXT object family - Context (bundler), Context Loader (models + params into a full context), Context Override, Sampling Parameters (Context).
 - resolution_latent/: Resize Image / Empty Latent (Context) - empty latent from width/height or aspect ratio + megapixels, resizes linked image/mask to match.
 - image_saver/: Image Saver (Context) - saves images with civitai-compatible metadata; settings and lora names come from the context.
-- H3_pipe/: H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe (raw refs stored, encoded at apply time).
-- reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to the megapixels target, scaled, encoded with context VAE); optionally references the context's own image at its own size.
+- media_pipe.py: the media pipe dict shared between nodes (ref images, keyframes with positions, videos, audios) - h3_pipe is it plus the h3 params.
+- H3_pipe/: H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe (raw refs + keyframes stored, encoded at apply time).
+- reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to the megapixels target, scaled, encoded with context VAE); optionally references the context's own image at its own size; references a media pipe's images and passes the pipe through, appending the wired images to it.
 - pipe_any/: Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe.
 - detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
+- llm/: LLM Connect - Connectivity, Sampling Options, Unsloth Load Options and Generate for a llama.cpp / llama-swap / Unsloth server (OpenAI-compatible API), with auto-growing image/video references; Generate also takes a media pipe (refs + keyframes, labeled) and outputs one.
 
 INSTALL:
 Put this whole folder in ComfyUI/custom_nodes/, then restart ComfyUI.
 """
 
+import asyncio
 import logging
 import os
 
@@ -49,6 +52,8 @@ from .tiled_vae_options import GibbyTiledVaeOptions
 from .merge_ksampler_options import GibbyMergeKSamplerOptions
 from .merge_contexts import GibbyMergeContexts
 from .detection import GibbyDetection
+from .llm import GibbyConnectivity, GibbySamplingOptions, GibbyLoadOptions, GibbyGenerate
+from .llm.llamacpp_client import list_models as _llm_list_models
 
 # WEB_DIRECTORY points at the plugin root so ComfyUI discovers every node's
 # JS file (it globs recursively) and serves them under /extensions/<this>.
@@ -90,12 +95,27 @@ try:
         "context/context_loader.js",
         "resolution_latent/resolution_latent.js",
         "ksampler_context/ksampler_context.js",
+        "llm/llm.js",
         "node_runtime.js",
         "pause_execution/pause_execution.js",
     ):
         PromptServer.instance.routes.get(
             f"/extensions/{_FOLDER_NAME}/{_rel}"
         )(_serve_js_file(os.path.join(_NODE_DIR, *_rel.split("/"))))
+
+    # Model-list route for the LLM Connect subpack's Connectivity dropdown.
+    @PromptServer.instance.routes.post("/gibby_llm/get_models")
+    async def _llm_get_models(request):
+        data = await request.json()
+        url = data.get("url", "")
+        api_key = data.get("api_key", "") or None
+        try:
+            loop = asyncio.get_running_loop()
+            models = await loop.run_in_executor(None, lambda: _llm_list_models(url, api_key=api_key))
+        except Exception as exc:
+            logging.warning(f"[Gibby Nodes] Could not list models from {url!r}: {exc}")
+            return web.json_response([])
+        return web.json_response(models)
 
     logging.info("[Gibby Nodes] Registered dedicated routes for JS files")
 except Exception as e:
@@ -104,7 +124,7 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyIterativeUpscaleOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
+        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyConnectivity, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:
