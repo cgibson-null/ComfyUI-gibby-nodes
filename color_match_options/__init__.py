@@ -10,11 +10,10 @@ class GibbyColorMatchOptions(io.ComfyNode):
             display_name="Color Match options",
             category="gibby/flow",
             search_aliases=["color", "match", "transfer", "options", "config"],
-            description="Outputs color match options. Feed into KSampler (Context) options input to enable color matching (off when not connected): after crop-inpainting or the final iterative step (total mode), the result's color is matched back to the original with Transfer Color.",
+            description="Outputs color match options. Feed into KSampler (Context) options input: after sampling (a run from a provided image, crop-inpainting, or the final iterative step) the result's color is matched back to the original with Transfer Color (0 strength = no match).",
             inputs=[
-                io.Boolean.Input("color_match", default=True, tooltip="After crop-inpainting or the final iterative step (total mode), match the result's color back to the original with Transfer Color"),
-                io.Combo.Input("color_match_method", default="mkl_lab", options=["reinhard_lab", "mkl_lab", "histogram"], tooltip="Transfer Color method for color_match"),
-                io.Float.Input("color_match_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Transfer Color strength for color_match (0=off)"),
+                io.Combo.Input("color_match_method", default="mkl_lab", options=["reinhard_lab", "mkl_lab", "histogram"], tooltip="Transfer Color method"),
+                io.Float.Input("color_match_strength", default=1.0, min=0.0, max=10.0, step=0.01, tooltip="Transfer Color strength (0 = no match)"),
             ],
             outputs=[
                 _KSAMPLER_OPTIONS_TYPE.Output("options"),
@@ -22,10 +21,9 @@ class GibbyColorMatchOptions(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, color_match=True, color_match_method="mkl_lab", color_match_strength=1.0):
+    def execute(cls, color_match_method="mkl_lab", color_match_strength=1.0):
         option = {
             "type": "color_match",
-            "color_match": color_match,
             "color_match_method": color_match_method,
             "color_match_strength": color_match_strength,
         }

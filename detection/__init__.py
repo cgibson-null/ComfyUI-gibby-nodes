@@ -420,17 +420,16 @@ class GibbyDetection(io.ComfyNode):
             io.String.Input("sam3_prompt", default="", multiline=True,
                              tooltip="Text prompt, encoded by the checkpoint's SAM3 clip like CLIP Text Encode"),
         ])
-        # bbox/segm need the Impact pack + subpack; offer them only when installed
+        # bbox/segm need the Impact pack + subpack; offer them only when installed.
+        # sam3 is first so it is the default mode
+        options = [sam3_option]
         if _impact_available():
             bbox_models = _bbox_detector_models()
             segm_models = _segm_models()
-            options = [
+            options += [
                 io.DynamicCombo.Option("bbox", _bbox_inputs(bbox_models)),
                 io.DynamicCombo.Option("segm", _bbox_inputs(bbox_models) + _sam_inputs(segm_models)),
-                sam3_option,
             ]
-        else:
-            options = [sam3_option]
 
         return io.Schema(
             node_id="Gibby_Detection",

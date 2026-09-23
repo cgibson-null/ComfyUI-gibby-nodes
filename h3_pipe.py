@@ -193,7 +193,8 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
     """Shared helper: take clip + vaes + h3_pipe → conditioning + latent.
 
     Encodes all refs from raw media stored in pipe at apply time.
-    If target_width/target_height provided, keyframes are resized to match.
+    If target_width/target_height provided, the keyframes and the latent
+    are created at that resolution instead of the pipe's.
     """
     prompt = pipe["prompt"]
     width = pipe["width"]
@@ -244,7 +245,7 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
     if values:
         cond = node_helpers.conditioning_set_values(cond, values)
 
-    latent, _ = _empty_av_latent(width, height, length)
+    latent, _ = _empty_av_latent(kf_width, kf_height, length)
     return cond, latent, ref_items, kf_imgs
 
 
@@ -377,10 +378,10 @@ class H3PipeApply(io.ComfyNode):
                 io.Vae.Input("audio_vae", optional=True),
                 io.Int.Input("target_width", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
                              optional=True,
-                             tooltip="Optional target width in pixels for keyframes (for dual-pass upscale workflows)"),
+                             tooltip="Optional target width in pixels for the keyframes and the latent (for dual-pass upscale workflows)"),
                 io.Int.Input("target_height", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
                              optional=True,
-                             tooltip="Optional target height in pixels for keyframes (for dual-pass upscale workflows)"),
+                             tooltip="Optional target height in pixels for the keyframes and the latent (for dual-pass upscale workflows)"),
                 io.Boolean.Input("drop_ref_images", default=False, optional=True,
                                  tooltip="Drop the pipe's reference images before applying"),
                 io.Boolean.Input("drop_keyframes", default=False, optional=True,

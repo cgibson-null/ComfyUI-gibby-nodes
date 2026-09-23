@@ -82,7 +82,6 @@ def _find_option(options_list, opt_type):
 def _with_color_match(opt, color_opt):
     """Copy of the option dict carrying the color match option's settings."""
     o = dict(opt)
-    o["color_match"] = color_opt.get("color_match", True)
     o["color_match_method"] = color_opt.get("color_match_method", "mkl_lab")
     o["color_match_strength"] = color_opt.get("color_match_strength", 1.0)
     return o
@@ -978,12 +977,27 @@ def _make_noise_mask(model_obj, crop_latent, crop_mask, inpaint_mode, mask_scale
 
 def _color_match(image, reference, opts):
     """Match the image's color back to the reference with Transfer Color per the
-    option's color_match settings. Returns the image unchanged when it is off."""
-    if not opts.get("color_match", False):
+    option's color match settings. Returns the image unchanged when the strength is 0
+    (no color match option connected, or its strength is off)."""
+    strength = float(opts.get("color_match_strength", 0.0))
+    if strength <= 0:
         return image
     method = opts.get("color_match_method", "mkl_lab")
-    strength = float(opts.get("color_match_strength", 1.0))
-    matched, = ColorTransfer.execute(image, reference, method, {"source_stats": "per_frame"}, strength)
+    # Transfer Color's Lab methods only handle RGB: match on the color channels
+    # and carry any alpha through
+    alpha = image[..., 3:4] if image.shape[-1] > 3 else None
+    # ColorTransfer iterates its batch dim, so flatten a video's (B, F, H, W, C)
+    # to (B*F, H, W, C) and repeat the still reference so every frame matches it
+    if image.dim() == 5:
+        b, f, h, w = image.shape[:4]
+        target = image[..., :3].reshape(b * f, h, w, 3)
+        reference = reference[..., :3].repeat_interleave(f, dim=0)
+        matched, = ColorTransfer.execute(target, reference, method, {"source_stats": "per_frame"}, strength)
+        matched = matched.reshape(b, f, h, w, 3)
+    else:
+        matched, = ColorTransfer.execute(image[..., :3], reference[..., :3], method, {"source_stats": "per_frame"}, strength)
+    if alpha is not None:
+        matched = torch.cat([matched, alpha.to(matched.device, matched.dtype)], dim=-1)
     return matched
 
 
@@ -1612,6 +1626,8 @@ class GibbyKSamplerContext(io.ComfyNode):
         # Denoise: use widget value only if image exists, otherwise force 1.0
         has_image = ctx.get("image") is not None
         denoise_value = denoise if has_image else 1.0
+        # The provided image is the color match reference for the final decode
+        original_image = ctx.get("image") if color_opt is not None else None
 
         # Steps: widget wins; with an image present, prefer refiner steps from context -
         # unless a sub-range of the base steps was explicitly requested via start/end step.
@@ -1827,6 +1843,10 @@ class GibbyKSamplerContext(io.ComfyNode):
                         if verbose:
                             print(f"Gibby KSampler (Context): stretched {dw}x{dh} -> {orig_size[0]}x{orig_size[1]}")
                         decoded_image = _resize_image(decoded_image, *orig_size)
+
+                # Match the decoded result's color back to the original image
+                if decoded_image is not None and original_image is not None:
+                    decoded_image = _color_match(decoded_image, original_image, color_opt)
 
             # Decode to audio for context update and output (overrides any existing context.audio)
             if ctx.get("vae_audio") is not None and vae_decode_audio is not None:

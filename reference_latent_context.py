@@ -21,6 +21,9 @@ the context image and is stored back on the output context.
 
 A media pipe's reference images are referenced too - the wired images append
 to them in the output pipe; keyframes/videos/audios pass through untouched.
+
+Without a context the node is just a media pipe creator: the wired images
+append to the pipe and the context passes through empty.
 """
 
 import comfy.model_base
@@ -51,20 +54,26 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                 "no image is connected, otherwise only when enabled - it leads at its own size, "
                 "and with no context image the first image becomes the context image and is stored back. "
                 "A media pipe's reference images are referenced too - the wired images "
-                "append to them in the output pipe."
+                "append to them in the output pipe. Without a context the node is just "
+                "a media pipe creator: the wired images append to the pipe."
             ),
             inputs=[
-                _CONTEXT_TYPE.Input("context"),
+                # All inputs optional, so the frontend renders them in declaration
+                # order and media_pipe lands right under context
+                _CONTEXT_TYPE.Input("context", optional=True, tooltip=(
+                    "Base context; without it the node just builds a media pipe "
+                    "from the connected images")),
                 io.Dict.Input("media_pipe", optional=True, tooltip=(
                     "Media pipe - its reference images are referenced too (the wired images "
                     "append to them in the output pipe); keyframes/videos/audios pass through untouched.")),
                 io.Autogrow.Input(
                     "images",
                     template=io.Autogrow.TemplateNames(
-                        io.Image.Input("image"),
+                        io.Image.Input("image", optional=True),
                         names=[f"image_{i}" for i in range(1, 26)],  # Up to 25 images
                         min=0,
                     ),
+                    optional=True,
                     tooltip="Reference images to encode as reference latents",
                 ),
                 io.Float.Input(
@@ -73,20 +82,23 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                     min=0.0,
                     max=20.0,
                     step=0.01,
+                    optional=True,
                     tooltip="Target size in megapixels before the scale factor; 0 keeps each image's own size"
                 ),
                 io.Float.Input(
-                    "scale", 
-                    default=1.0, 
-                    min=0.0, 
-                    max=100.0, 
+                    "scale",
+                    default=1.0,
+                    min=0.0,
+                    max=100.0,
                     step=0.01,
+                    optional=True,
                     tooltip="Scale factor applied after resizing to the megapixels target"
                 ),
                 io.Boolean.Input(
                     "ref_ctx_img",
                     display_name="ref_ctx_img",
                     default=False,
+                    optional=True,
                     tooltip="Also reference the context's own image at its own size (no rescale): always when no image is connected, otherwise only when enabled. With no context image the first image becomes the context image and is stored back on the output context."
                 ),
             ],
@@ -97,7 +109,10 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, context, media_pipe=None, images: io.Autogrow.Type = None, megapixels=1.0, scale=1.0, ref_ctx_img=False) -> io.NodeOutput:
+    def execute(cls, context=None, media_pipe=None, images: io.Autogrow.Type = None, megapixels=1.0, scale=1.0, ref_ctx_img=False) -> io.NodeOutput:
+        # Without a context there is no VAE to encode with: the node just builds
+        # the media pipe from the connected images
+        context = context or {}
         # The wired image_N, in order (None slots dropped).
         images = images or {}
         explicit = [images[name] for name in sorted(images, key=lambda n: int(n.rsplit("_", 1)[-1])) if images[name] is not None]
