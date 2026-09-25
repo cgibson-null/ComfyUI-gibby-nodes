@@ -462,6 +462,7 @@ function createSearchableLoraSelect(loraOptions, initialLora, onCommit, getGloba
     return {
         wrapper,
         getValue: () => currentValue,
+        isMissing: () => currentValue !== "None" && !loraOptions.includes(currentValue),
         setValue: (value) => {
             // Always allow setting the value, even if it's not in the options list
             // (this allows showing missing loras with a red highlight)
@@ -1031,12 +1032,6 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
     row.style.boxSizing = "border-box";
     row.style.height = `${ROW_HEIGHT}px`;
 
-    // Highlight missing loras with a red background
-    if (initialValue?.missing && initialValue.lora !== "None") {
-        row.style.background = "rgba(255, 0, 0, 0.2)";
-        row.style.borderRadius = "4px";
-    }
-
     const toggle = makeTogglePill(initialValue?.on !== false, () => {
         callbacks.onChange?.(controller);
     });
@@ -1107,9 +1102,18 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
         toggle.element.style.display = isNone ? "none" : "flex";
     }
 
+    // Highlight missing loras with a red background - re-painted whenever
+    // the lora or the options list changes (model refresh, selection).
+    function paintMissing() {
+        row.style.background = combo.isMissing() ? "rgba(255, 0, 0, 0.2)" : "";
+        row.style.borderRadius = combo.isMissing() ? "4px" : "";
+    }
+
     // Now create the combo with visibility callback
-    combo = createSearchableLoraSelect(loraOptions, initialValue?.lora, (newValue) =>
-        callbacks.onCommitted(controller, newValue), getGlobalFilter, updateRowVisibility, initialValue?.missing);
+    combo = createSearchableLoraSelect(loraOptions, initialValue?.lora, (newValue) => {
+        callbacks.onCommitted(controller, newValue);
+        paintMissing();
+    }, getGlobalFilter, updateRowVisibility, initialValue?.missing);
     comboWrapper = combo.wrapper;
 
     infoBtn.addEventListener("click", () => openLoraInfoModal(combo.getValue()));
@@ -1120,9 +1124,11 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
     // Drag-to-reorder: the row itself follows the cursor (a transform, so the
     // container's layout stays put) and a sticky line marks the gap it will
     // land in. The drop position is decided by row TOPS: the row lands after
-    // every row whose top edge the cursor has crossed.
+    // every row whose top edge the cursor has crossed. Dropping onto a
+    // DIFFERENT Gibby Lora Loader moves the row there instead.
     dragBtn.addEventListener("mousedown", (e) => {
         e.preventDefault();
+        const startX = e.clientX;
         const startY = e.clientY;
         const parent = row.parentNode;
         const originalBackground = row.style.background;
@@ -1180,14 +1186,30 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
             dropLine.style.top = `${top - 1}px`;
         }
 
+        // Cross-node move: the same drop line, tracking the gap the lora
+        // will land in on the other Gibby Lora Loader.
+        function paintTarget(target, ev) {
+            const api = target?._gibbyLoraAPI;
+            if (!api) return;
+            const r = api.getDropGapRect(api.getDropIndex(ev.clientY));
+            dropLine.style.left = `${r.left}px`;
+            dropLine.style.width = `${r.width}px`;
+            dropLine.style.top = `${r.top - 1}px`;
+        }
+
         function onMove(ev) {
             // The DOM overlay is scaled by the canvas zoom, so the
             // screen-pixel cursor delta has to be divided by it to become
             // DOM pixels. The row's rendered height gives that zoom (its
             // layout height is fixed, and the transform doesn't scale it).
+            // The row follows the cursor on both axes - within the node it
+            // only looks like a vertical shuffle, over another node it
+            // visibly travels there.
             const scale = row.getBoundingClientRect().height / ROW_HEIGHT;
-            row.style.transform = `translateY(${(ev.clientY - startY) / scale}px)`;
-            moveDropLine(dropIndexAt(ev.clientY));
+            row.style.transform = `translate(${(ev.clientX - startX) / scale}px, ${(ev.clientY - startY) / scale}px)`;
+            const target = callbacks.findTransferTarget?.(ev);
+            if (target) paintTarget(target, ev);
+            else moveDropLine(dropIndexAt(ev.clientY));
         }
         function onUp(ev) {
             window.removeEventListener("mousemove", onMove);
@@ -1199,7 +1221,9 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
             row.style.background = originalBackground;
             dragBtn.style.cursor = "grab";
             document.body.style.userSelect = "";
-            callbacks.onReorder?.(controller, dropIndexAt(ev.clientY));
+            const target = callbacks.findTransferTarget?.(ev);
+            if (target) callbacks.onTransfer?.(controller, target, ev);
+            else callbacks.onReorder?.(controller, dropIndexAt(ev.clientY));
         }
         moveDropLine(dropIndexAt(e.clientY));
         window.addEventListener("mousemove", onMove);
@@ -1217,6 +1241,7 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
 
     // Initial visibility check
     updateRowVisibility();
+    paintMissing();
 
     const controller = {
         element: row,
@@ -1231,6 +1256,7 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
             else combo.setValue("None");
             if (typeof value?.strength === "number") strength.value = value.strength;
             updateRowVisibility();
+            paintMissing();
         },
         setMoveEnabled(upOk, downOk) {
             paintMoveBtn(upBtn, upOk);
@@ -1239,6 +1265,7 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
         // Update lora options for this row's dropdown (called on model refresh).
         updateOptions: (newOptions) => {
             combo.updateOptions(newOptions);
+            paintMissing();
         },
         destroy: () => {
             combo.destroy();
@@ -1404,22 +1431,36 @@ function setupDynamicLoraRows(node) {
         node.graph?.setDirtyCanvas(true, true);
     };
 
+    const makeCallbacks = () => ({
+        onCommitted: handleLoraCommitted,
+        onRemove: handleRemoveRow,
+        onMove: handleMoveRow,
+        onReorder: handleReorderRow,
+        findTransferTarget,
+        onTransfer: handleTransferRow,
+        getReorderLimit,
+        onChange: () => {
+            syncWidgetValues();
+        },
+    });
+
     const addRows = (n, valuesToRestore) => {
         for (let k = 0; k < n; k++) {
             const initial = valuesToRestore?.[rowControllers.length] || null;
-            const controller = createRowController(loraOptions, initial, {
-                onCommitted: handleLoraCommitted,
-                onRemove: handleRemoveRow,
-                onMove: handleMoveRow,
-                onReorder: handleReorderRow,
-                getReorderLimit,
-                onChange: () => {
-                    syncWidgetValues();
-                },
-            }, getGlobalFilter);
+            const controller = createRowController(loraOptions, initial, makeCallbacks(), getGlobalFilter);
             container.appendChild(controller.element);
             rowControllers.push(controller);
         }
+        refreshMoveButtons();
+        syncWidgetValues();
+    };
+
+    // Insert a filled row at an absolute position (a cross-node drop).
+    const insertRowAt = (index, value) => {
+        const controller = createRowController(loraOptions, value, makeCallbacks(), getGlobalFilter);
+        const ref = rowControllers[index];
+        container.insertBefore(controller.element, ref ? ref.element : null);
+        rowControllers.splice(index, 0, controller);
         refreshMoveButtons();
         syncWidgetValues();
     };
@@ -1483,6 +1524,33 @@ function setupDynamicLoraRows(node) {
         for (const c of rowControllers) container.appendChild(c.element);
         refreshMoveButtons();
         syncWidgetValues();
+    }
+
+    // Cross-node move: another Gibby Lora Loader under the cursor, if any.
+    // The cursor is converted to graph space with the canvas's own
+    // DragAndScale helpers, and compared against each node's hitbox.
+    function findTransferTarget(ev) {
+        const ds = app.canvas.ds;
+        const rect = app.canvas.canvas.getBoundingClientRect();
+        const p = ds.convertCanvasToOffset([ev.clientX - rect.left, ev.clientY - rect.top]);
+        for (const n of app.graph._nodes || []) {
+            if (n === node || n.type !== NODE_NAME) continue;
+            const b = n.boundingRect || n.bbox;
+            if (p[0] >= b[0] && p[0] <= b[0] + b[2] && p[1] >= b[1] && p[1] <= b[1] + b[3]) return n;
+        }
+        return null;
+    }
+
+    // A row dropped on another node moves there at the gap the cursor is
+    // over, and the source row is deleted (a fresh empty row appears if it
+    // was the last one, the normal removal rule).
+    function handleTransferRow(controller, targetNode, ev) {
+        const value = controller.getValue();
+        if (value.lora === "None") return;
+        const api = targetNode._gibbyLoraAPI;
+        if (api?.insertLoraRow(value, api.getDropIndex(ev.clientY))) {
+            handleRemoveRow(controller);
+        }
     }
 
     // Auto-grow: filling in the LAST row's lora adds a fresh empty row
@@ -1590,6 +1658,40 @@ function setupDynamicLoraRows(node) {
             resizeNode();
         }
     });
+
+    // API for other Gibby Lora Loaders dragging a row onto this node.
+    node._gibbyLoraAPI = {
+        // The gap the cursor is over: after every row whose top the cursor
+        // has crossed, clamped so a lora never lands below the first empty
+        // row (the "empty rows stay at the bottom" rule, as in reordering).
+        getDropIndex: (clientY) => {
+            let idx = 0;
+            for (const c of rowControllers) {
+                if (clientY >= c.element.getBoundingClientRect().top) idx++;
+            }
+            const emptyIdx = rowControllers.findIndex((c) => c.getValue().lora === "None");
+            return emptyIdx === -1 ? idx : Math.min(idx, emptyIdx);
+        },
+        // The screen rect of that gap, for the drop line.
+        getDropGapRect: (index) => {
+            const c = rowControllers[index] || rowControllers[rowControllers.length - 1];
+            const r = c.element.getBoundingClientRect();
+            return index < rowControllers.length
+                ? { left: r.left, top: r.top, width: r.width }
+                : { left: r.left, top: r.bottom, width: r.width };
+        },
+        // Insert the dragged lora at the gap. Keeps a trailing empty row
+        // the same way typing into the last row does.
+        insertLoraRow: (value, index) => {
+            if (rowControllers.length >= MAX_SLOTS) return false;
+            insertRowAt(index, value);
+            const hasEmpty = rowControllers.some((c) => c.getValue().lora === "None");
+            if (!hasEmpty && rowControllers.length < MAX_SLOTS) addRows(1);
+            resizeNode();
+            syncWidgetValues();
+            return true;
+        },
+    };
 
     // Store a refresh function on the node instance so refreshComboInNode can call it.
     // This is called when ComfyUI's model refresh button is pressed.

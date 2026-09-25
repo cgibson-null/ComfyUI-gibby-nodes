@@ -110,12 +110,16 @@ def _sam3_models():
     return opts or all_models or ["(no models found)"]
 
 
+_yolo_detectors = {}  # model_name -> detector (the subpack's doit reloads the weights each call)
+
+
 def _bbox_detector(model_name):
     provider = nodes.NODE_CLASS_MAPPINGS.get("UltralyticsDetectorProvider")
     if provider is None:
         raise ValueError("bbox/segm detection needs ComfyUI-Impact-Subpack (UltralyticsDetectorProvider)")
-    detector, _ = provider().doit(model_name)
-    return detector
+    if model_name not in _yolo_detectors:
+        _yolo_detectors[model_name] = provider().doit(model_name)[0]
+    return _yolo_detectors[model_name]
 
 
 def _parse_points(coords):
@@ -241,6 +245,12 @@ def _sam_predict_points(core, sam_model, frame, pos_pts, neg_pts, threshold, dil
     return torch.from_numpy(out).float()
 
 
+def _sort_segs_by_size(segs):
+    # SEGSOrderedFilterDetailerHook (Impact Pack): segs sorted by size (area) descending
+    from impact import hooks
+    return hooks.SEGSOrderedFilterDetailerHook("area(=w*h)", True, 0, len(segs[1])).post_detection(segs)
+
+
 def _detect_bbox(image, model_name, threshold, dilation, drop_size, override_boxes=None):
     B, H, W, _ = image.shape
     if override_boxes is not None and any(override_boxes):
@@ -251,7 +261,7 @@ def _detect_bbox(image, model_name, threshold, dilation, drop_size, override_box
     masks = []
     pbar = comfy.utils.ProgressBar(B)
     for b in range(B):
-        segs = detector.detect(image[b].unsqueeze(0), threshold, dilation, 1.0, drop_size)
+        segs = _sort_segs_by_size(detector.detect(image[b].unsqueeze(0), threshold, dilation, 1.0, drop_size))
         masks.append(core.segs_to_combined_mask(segs))
         pbar.update(1)
     return torch.stack(masks)
@@ -259,19 +269,17 @@ def _detect_bbox(image, model_name, threshold, dilation, drop_size, override_box
 
 def _detect_segm(image, m, pos_pts, neg_pts, per_frame_boxes):
     core = _impact_core()
-    loader = nodes.NODE_CLASS_MAPPINGS.get("SAMLoader")
-    if loader is None:
-        raise ValueError("segm mode needs ComfyUI-Impact-Pack (SAMLoader)")
-    (sam_model,) = loader().load_model(m["segm_model"], "AUTO")
 
     B, H, W, _ = image.shape
     # No manual prompt: run the bbox detector as the SAM prompt source
     if not any(per_frame_boxes) and not pos_pts:
         detector = _bbox_detector(m["bbox_detector"])
         thr, dil, drop = m.get("bbox_threshold", 0.5), m.get("bbox_dilation", 0), m.get("drop_size", 1)
-        per_frame_boxes = [[tuple(s.bbox) for s in detector.detect(image[b].unsqueeze(0), thr, dil, 1.0, drop)[1]] for b in range(B)]
-    if not any(per_frame_boxes) and not pos_pts:
-        raise ValueError("segm mode needs a prompt: bboxes or pos/neg coords, or a bbox detector that finds something")
+        per_frame_boxes = [[tuple(s.bbox) for s in _sort_segs_by_size(detector.detect(image[b].unsqueeze(0), thr, dil, 1.0, drop))[1]] for b in range(B)]
+    # Nothing to prompt SAM with: an empty mask, so a paste by it keeps the image untouched
+    if not any(per_frame_boxes) and not pos_pts and not neg_pts:
+        return torch.zeros(B, H, W, dtype=torch.float32)
+    sam_model = _load_sam(m["segm_model"])
 
     hint = m.get("sam_detection_hint", "center-1")
     sdil = m.get("sam_dilation", 0)
@@ -288,11 +296,29 @@ def _detect_segm(image, m, pos_pts, neg_pts, per_frame_boxes):
             segs = _boxes_to_segs(core, fb, H, W)
             sam_mask = core.make_sam_mask(sam_model, segs, image[b], hint, sdil, sthr, sexp, mhint, use_neg)
             mask = core.segs_to_combined_mask(core.segs_bitwise_and_mask(segs, sam_mask))
-        else:
+        elif pos_pts or neg_pts:
             mask = _sam_predict_points(core, sam_model, image[b], pos_pts, neg_pts, sthr, sdil)
+        else:
+            mask = torch.zeros(H, W, dtype=torch.float32)
         masks.append(mask)
         pbar.update(1)
     return torch.stack(masks)
+
+
+_last_sam = None  # (model_name, sam_model)
+
+
+def _load_sam(model_name):
+    # SAMLoader.load_model has no cache of its own (a graph node runs once per
+    # prompt); this node calls it internally, so keep the loaded model like _load_sam3
+    global _last_sam
+    if _last_sam is None or _last_sam[0] != model_name:
+        loader = nodes.NODE_CLASS_MAPPINGS.get("SAMLoader")
+        if loader is None:
+            raise ValueError("segm mode needs ComfyUI-Impact-Pack (SAMLoader)")
+        (sam_model,) = loader().load_model(model_name, "AUTO")
+        _last_sam = (model_name, sam_model)
+    return _last_sam[1]
 
 
 _last_sam3 = None  # (model_name, (model, clip))
@@ -463,7 +489,7 @@ class GibbyDetection(io.ComfyNode):
                              tooltip="Opening kernel that drops isolated mask specks (0 = off)"),
                 io.Boolean.Input("fill_holes", default=False, tooltip="Close the holes the mask encloses"),
 
-                io.Boolean.Input("preview", default=True, tooltip="Show the mask tinted in the mask color over the image (video) output"),
+                io.Boolean.Input("preview", default=True, tooltip="Show the mask tinted in the mask color over the image (video if the input is a batch of frames)"),
                 io.Float.Input("preview_fps", default=30.0, min=1.0, max=120.0, step=1.0,
                                tooltip="Frame rate of the preview when the input is a batch of frames (video)"),
                 io.Color.Input("mask_color", default="#FF00FF80", tooltip="Mask tint color, #RRGGBB or #RRGGBBAA (the alpha is the opacity)"),
@@ -472,7 +498,6 @@ class GibbyDetection(io.ComfyNode):
                 _CONTEXT_TYPE.Output("context"),
                 io.Image.Output("image"),
                 io.Mask.Output("mask"),
-                io.Image.Output("image_masked", tooltip="The image with the mask tinted in the mask color"),
                 _CROP_INFO_TYPE.Output("crop_info",
                                        tooltip="For Image Paste By Mask (Batch) (Context): the image, the mask and each mask's bbox as the paste rect"),
             ],
@@ -527,10 +552,10 @@ class GibbyDetection(io.ComfyNode):
         ctx["image"] = det_image
         ctx["mask"] = mask
         ctx["crop_info"] = info
-        masked = _overlay(det_image, mask, mask_color)
         # The preview is display-only; the image output stays plain
         if preview:
+            masked = _overlay(det_image, mask, mask_color)
             if det_image.shape[0] > 1:
-                return io.NodeOutput(ctx, det_image, mask, masked, info, ui=_preview_video(masked, preview_fps))
-            return io.NodeOutput(ctx, det_image, mask, masked, info, ui=ui.PreviewImage(masked))
-        return io.NodeOutput(ctx, det_image, mask, masked, info)
+                return io.NodeOutput(ctx, det_image, mask, info, ui=_preview_video(masked, preview_fps))
+            return io.NodeOutput(ctx, det_image, mask, info, ui=ui.PreviewImage(masked))
+        return io.NodeOutput(ctx, det_image, mask, info)

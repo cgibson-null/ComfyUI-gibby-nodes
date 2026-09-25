@@ -29,7 +29,7 @@ class GibbyCropInpaintOptions(io.ComfyNode):
                 io.Boolean.Input("mask_mode", default=True, label_on="single", label_off="split", tooltip="single: treat mask as one region. split: split disconnected mask areas into separate crops."),
                 io.Float.Input("mask_scale_start", default=1.0, min=0.0, max=3.0, step=0.05, tooltip="Mask size multiplier on first step. <1=smaller, >1=larger than actual mask."),
                 io.Float.Input("mask_scale_end", default=1.0, min=0.0, max=3.0, step=0.05, tooltip="Mask size multiplier on last step."),
-                io.String.Input("mask_indices", default="", tooltip="When mask_mode=split: which mask indices to process. Extracts integers from string, ignores indices >= mask count. Empty=all."),
+                io.String.Input("mask_indices", default="", tooltip="When mask_mode=split: which mask indices to process, e.g. 0-2, 5, 7 (a range includes both ends). Ignores indices >= mask count. Empty=all."),
                 io.Boolean.Input("verbose", default=False, tooltip="Print the mask count (split mode) and each cropped area size to the console"),
             ],
             outputs=[

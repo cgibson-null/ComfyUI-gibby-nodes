@@ -12,7 +12,7 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
             search_aliases=["upscale", "iterative", "hires", "options", "config"],
             description="Outputs iterative upscale options. Feed into KSampler (Context) options input; the upscale model travels inside the options.",
             inputs=[
-                io.Float.Input("upscale_factor", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Total resolution multiplier across all steps"),
+                io.Float.Input("upscale_factor", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Total resolution multiplier across all steps; overridden when target_size_image is connected"),
                 io.Int.Input("steps", default=2, min=1, max=100, step=1, tooltip="Number of iterative upscale steps; with no image in the context the 1st step is the basic generation (denoise 1.0)"),
                 io.Float.Input("start_denoise", default=0.6, min=0.0, max=1.0, step=0.01, tooltip="Denoise of the first step; ramps down to target_denoise by the last step"),
                 io.Float.Input("target_denoise", default=0.3, min=0.0, max=1.0, step=0.01, tooltip="Denoise of the last step; kept for steps beyond 'steps'"),
@@ -20,6 +20,7 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
                 io.Boolean.Input("mode", default=True, label_on="total", label_off="single", tooltip="total: run all remaining steps at once. single: run one step per KSampler (Context) run."),
                 io.Boolean.Input("verbose", default=False, tooltip="Print each step's index, scale, image size and denoise to the console"),
                 io.UpscaleModel.Input("upscale_model", optional=True, tooltip="Optional upscale model (Load Upscale Model) used on each step"),
+                io.Image.Input("target_size_image", optional=True, tooltip="Optional image defining the final size: the per-step scale path runs to this image's size instead of upscale_factor"),
             ],
             outputs=[
                 _KSAMPLER_OPTIONS_TYPE.Output("options"),
@@ -28,7 +29,9 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
 
     @classmethod
     def execute(cls, upscale_factor=2.0, steps=2, start_denoise=0.6, target_denoise=0.3,
-                upscale_method="lanczos", mode=True, verbose=False, upscale_model=None):
+                upscale_method="lanczos", mode=True, verbose=False, upscale_model=None,
+                target_size_image=None):
+        target_h, target_w = (target_size_image.shape[1], target_size_image.shape[2]) if target_size_image is not None else (None, None)
         option = {
             "type": "iterative_upscale",
             "upscale_factor": upscale_factor,
@@ -39,5 +42,7 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
             "mode": "total" if mode else "single",
             "verbose": verbose,
             "upscale_model": upscale_model,
+            "target_w": target_w,
+            "target_h": target_h,
         }
         return io.NodeOutput([option])

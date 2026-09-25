@@ -49,7 +49,7 @@ Use **inputs** to override context values (override happens first, so output con
 
 **Crop-Inpaint options** - allows crop area per mask, configure boundaries and resolution, and inpaint it at proper size, then paste back onto original.
 
-**Iterative Options** - sample for set amount iterations, can upscale.
+**Iterative Options** - sample for set amount iterations, can upscale; an optional target size image overrides the upscale factor and sets the final size.
 
 Crop-Inpaint options and Iterative Options are inclusive, meaning can be used together. Both ideas from [Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)
 **Lora Travel options** - dynamically change loras strength per step; str values in node are multipliers for value set in lora loader, unless it's 0 - then they are applied as actual str; can be used per iteration.

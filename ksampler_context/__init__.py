@@ -12,6 +12,8 @@ Key behaviors:
 - Iterative Options with no image in the context: the 1st step is the basic
   generation (denoise 1.0, base steps, no mask), and the image it generates
   is treated as if it had been provided (color match reference)
+- Crop-inpaint with an empty mask has no regions to inpaint: sampling is
+  skipped entirely and the image passes through
 - Handles start_step/end_step as offsets from total steps when negative
 - Automatically uses Flux2Scheduler for Flux2 models
 - Updates context after sampling (removes latent/mask, stores decoded image)
@@ -906,11 +908,17 @@ def _inpaint_regions(image, mask, opts):
                 cv2.drawContours(seg, [contour], -1, 1, -1)
                 seg_mask = mask_2d_float * torch.from_numpy(seg > 0).to(mask.device)
                 regions.append((x0, y0, x0 + cw, y0 + ch, cx, cy, cw, ch, seg_mask))
-        # Filter by mask_indices if provided
+        # Filter by mask_indices if provided: "0-2, 5, 7" -> 0, 1, 2, 5, 7
         mask_indices_str = opts.get("mask_indices", "")
         if mask_indices_str:
             import re as _re
-            indices = [int(s) for s in _re.findall(r'\d+', mask_indices_str)]
+            indices = []
+            for m in _re.finditer(r'(\d+)\s*-\s*(\d+)|(\d+)', mask_indices_str):
+                if m.group(3) is not None:
+                    indices.append(int(m.group(3)))
+                else:
+                    a, b = int(m.group(1)), int(m.group(2))
+                    indices.extend(range(min(a, b), max(a, b) + 1))
             valid = [i for i in indices if i < len(regions)]
             if valid:
                 regions = [regions[i] for i in valid]
@@ -1045,18 +1053,15 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
 
 
 def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
-                  sampler_obj, sigmas_tensor, cfg_value, positive, negative, decode, options_list=None,
+                  sampler_obj, denoise, cfg_value, positive, negative, decode, options_list=None,
                   clear_after_model=False, clear_after_vae=False, clear_verbose=False, verbose=False,
                   travel_state=None, prompt_state=None):
-    """Crop image by mask bbox, resize, sample each crop, composite back.
-    Returns None when there is nothing to inpaint, so the caller samples the whole image."""
+    """Crop image by mask bbox, resize, sample each crop, composite back."""
     image = ctx["image"]
     mask = ctx["mask"]
     vae = ctx.get("vae")
 
     mask, regions = _inpaint_regions(image, mask, opts)
-    if not regions:
-        return None
 
     opt_verbose = opts.get("verbose", False)
     if opt_verbose and opts.get("mask_mode", "single") == "split":
@@ -1078,6 +1083,10 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
             result_image, region_mask, cx, cy, w, h, target_w, target_h, method)
         if opt_verbose:
             print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
+        # The sigmas are sized to this crop: a Flux2 model gets its schedule
+        # (get_schedule) from it
+        sigmas_tensor = _calculate_sigmas(model_obj, ctx.get("scheduler", "normal"), steps_value, ctx.get("sampler", "euler"),
+                                          denoise, target_w, target_h)
         refined_crop, model_obj = _encode_sample_decode(crop_img, crop_mask, vae, model_obj, seed, steps_value,
                                                         cfg_value, sampler_obj, sigmas_tensor, positive, negative, opts,
                                                         tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
@@ -1145,6 +1154,9 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                        travel_state=None, prompt_state=None, steps=0):
     """Iterative pixel-space upscale along a linear scale path (simple step mode).
 
+    A target size (target_size_image in the options) overrides the upscale
+    factor: the final resolution is the provided size, and the per-step scale
+    path runs to it.
     State (next_step, base size) lives in the options dict; on first run it is
     initialized from the current image and the options returned with the
     updated next_step, so the output can be fed back in for further steps.
@@ -1171,6 +1183,14 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
         sampler_name = comfy.samplers.KSampler.SAMPLERS[0]
 
     factor = float(opts.get("upscale_factor", 2.0))
+    # The target size image overrides the upscale factor: the final
+    # resolution is the provided size (aligned to the VAE downscale ratio),
+    # bypassing the base * factor calculation
+    final_w = int(opts["target_w"]) if opts.get("target_w") is not None else None
+    final_h = int(opts["target_h"]) if opts.get("target_h") is not None else None
+    if final_w is not None:
+        final_w = max(1, int(round(final_w / w_ratio)) * w_ratio)
+        final_h = max(1, int(round(final_h / h_ratio)) * h_ratio)
     total_steps = max(int(opts.get("steps", 3)), 1)
     start_denoise = float(opts.get("start_denoise", 1.0))
     target_denoise = float(opts.get("target_denoise", 0.6))
@@ -1230,9 +1250,11 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     gen_first = opts.get("gen_first", False)
 
     for i in step_indices:
-        # With upscale_factor 1 every pass runs at the same size and would
-        # sample identical noise - vary the seed per iteration
-        step_seed = seed + i if factor == 1.0 else seed
+        # Every pass at the same size (upscale_factor 1, or a target size
+        # equal to the base) would sample identical noise - vary the seed per
+        # iteration
+        same_size = factor == 1.0 or (final_w is not None and final_w == base_w and final_h == base_h)
+        step_seed = seed + i if same_size else seed
         if no_image and i == 1:
             # Basic generation: sample the context's latent as-is (no mask -
             # it only applies once an image exists), full denoise, no upscale
@@ -1243,9 +1265,17 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
             run_steps = gen_steps
         else:
             gen_step = False
-            scale = 1.0 + (factor - 1.0) * i / total_steps
-            target_w = max(1, int(round(base_w * scale / w_ratio)) * w_ratio)
-            target_h = max(1, int(round(base_h * scale / h_ratio)) * h_ratio)
+            if final_w is not None:
+                # Target size: the linear scale path runs to the provided size
+                scale_w = 1.0 + (final_w / base_w - 1.0) * i / total_steps
+                scale_h = 1.0 + (final_h / base_h - 1.0) * i / total_steps
+                target_w = max(1, int(round(base_w * scale_w / w_ratio)) * w_ratio)
+                target_h = max(1, int(round(base_h * scale_h / h_ratio)) * h_ratio)
+                scale = scale_w
+            else:
+                scale = 1.0 + (factor - 1.0) * i / total_steps
+                target_w = max(1, int(round(base_w * scale / w_ratio)) * w_ratio)
+                target_h = max(1, int(round(base_h * scale / h_ratio)) * h_ratio)
             # Denoise ramps from start to target across the planned steps, then
             # holds at target; the basic-gen 1st step (no image) is 1.0, so the
             # ramp covers the rest
@@ -1258,7 +1288,9 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
             else:
                 denoise_step = start_denoise + (target_denoise - start_denoise) * (i - 1) / (total_steps - 1)
             run_steps = steps_value
-        sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, run_steps, sampler_name, denoise_step)
+        # The sigmas are sized to the step's image: a Flux2 model gets its
+        # schedule (get_schedule) from it
+        sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, run_steps, sampler_name, denoise_step, target_w, target_h)
         sigmas_tensor, skip = _apply_start_end_steps(sigmas_tensor, run_steps, start_step, end_step, leftover_noise)
         if skip:
             # Start step beyond the available steps: keep the image, advance the
@@ -1329,8 +1361,6 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
     image = ctx["image"]
     vae = ctx["vae"]
     mask, regions = _inpaint_regions(image, ctx["mask"], inpaint_opts)
-    if not regions:
-        return None
 
     opt_verbose = inpaint_opts.get("verbose", False)
     if opt_verbose and inpaint_opts.get("mask_mode", "single") == "split":
@@ -1380,8 +1410,20 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
     return io.NodeOutput(ctx, None, full, None, vae, ctx.get("vae_audio"), out_options)
 
 
-def _calculate_sigmas(model, scheduler_name, steps, sampler_name="euler", denoise=1.0):
-    """Calculate sigmas from scheduler name and step count, respecting denoise level."""
+def _calculate_sigmas(model, scheduler_name, steps, sampler_name="euler", denoise=1.0, width=None, height=None):
+    """Calculate sigmas from scheduler name and step count, respecting denoise level.
+    A Flux2 model with a size uses the Flux2 schedule (get_schedule) for that size
+    instead, with denoise taking the schedule's tail."""
+    if _is_flux2(model) and get_schedule is not None and width and height:
+        seq_len = (width * height) / (16 * 16)
+        sigmas = get_schedule(steps, round(seq_len)).to(comfy.model_management.get_torch_device())
+        if denoise is not None and denoise <= 0.0:
+            sigmas = torch.FloatTensor([])
+        elif denoise is not None and denoise < 0.9999:
+            total_steps = round(steps * denoise)
+            sigmas = sigmas[-(total_steps + 1):]
+        return sigmas
+
     if scheduler_name not in comfy.samplers.KSampler.SCHEDULERS:
         scheduler_name = comfy.samplers.KSampler.SCHEDULERS[0]
     
@@ -1553,6 +1595,16 @@ class GibbyKSamplerContext(io.ComfyNode):
         has_image = ctx.get("image") is not None
         has_mask = ctx.get("mask") is not None
         has_vae = ctx.get("vae") is not None
+        # Crop-inpaint with an empty mask: no regions to inpaint, skip sampling
+        # entirely and pass the image through
+        if inpaint_opt is not None and has_image and has_mask and not _inpaint_regions(ctx["image"], ctx["mask"], inpaint_opt)[1]:
+            ctx.pop("latent", None)
+            ctx.pop("mask", None)
+            if clear_after_finish:
+                _clear_vram("after finish", clear_verbose)
+            if verbose:
+                print("Gibby KSampler (Context): crop-inpaint skipped: the mask is empty")
+            return io.NodeOutput(ctx, None, ctx["image"], None, ctx.get("vae"), ctx.get("vae_audio"), options_list)
         result = None
         if inpaint_opt is not None and iterative_opt is not None and has_image and has_mask and has_vae:
             # Crop first, then pass each crop (image + mask) to the iterative
@@ -1569,14 +1621,6 @@ class GibbyKSamplerContext(io.ComfyNode):
                                                  start_step, end_step, leftover_noise,
                                                  clear_after_model, clear_after_vae, clear_verbose, verbose=verbose,
                                                  travel_state=travel_state, prompt_state=prompt_state)
-            if result is None:
-                # No mask regions: iteratively upscale the whole image
-                result = _iterative_upscale(ctx, iterative_opt, options_list, model_obj, seed,
-                                             steps_value, cfg_value, sampler_obj, ctx.get("positive"), ctx.get("negative"),
-                                             start_step, end_step, leftover_noise,
-                                             clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
-                                             clear_verbose=clear_verbose, verbose=verbose,
-                                             travel_state=travel_state, prompt_state=prompt_state)
         elif iterative_opt is not None and has_vae:
             # No crop-inpaint (or no mask for it): iterative on the existing image,
             # masked on every step when a mask is present. With no image in the
@@ -1596,9 +1640,8 @@ class GibbyKSamplerContext(io.ComfyNode):
                                          clear_verbose=clear_verbose, verbose=verbose,
                                          travel_state=travel_state, prompt_state=prompt_state, steps=steps)
         elif inpaint_opt is not None and has_image and has_mask:
-            # Crop-inpaint only: crop, sample each crop, composite back. With an
-            # empty mask there are no regions and the normal path below samples
-            # the whole image/latent
+            # Crop-inpaint only: crop, sample each crop, composite back (an empty
+            # mask has no regions and is skipped above)
             model_obj = ctx.get("model")
             steps_value, cfg_value, sampler_name, sampler_obj = _resolve_early_params(ctx, steps)
             _apply_travel_clip_loras(ctx, travel_opts, steps_value)
@@ -1606,10 +1649,8 @@ class GibbyKSamplerContext(io.ComfyNode):
             travel_state = _prepare_lora_travels(model_obj, travel_opts, steps_value)
             prompt_state = _prepare_prompt_travels(ctx, pos_prompt_text, neg_prompt_text, steps_value, verbose)
             _log_start(verbose, ctx, seed, steps_value, denoise, start_step, end_step)
-            scheduler_name = ctx.get("scheduler", "normal")
-            sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name, denoise)
             result = _crop_inpaint(ctx, inpaint_opt, model_obj, seed, steps_value,
-                                   sampler_obj, sigmas_tensor, cfg_value, ctx.get("positive"), ctx.get("negative"), decode,
+                                   sampler_obj, denoise, cfg_value, ctx.get("positive"), ctx.get("negative"), decode,
                                    options_list, clear_after_model, clear_after_vae, clear_verbose, verbose,
                                    travel_state=travel_state, prompt_state=prompt_state)
         if result is not None:
