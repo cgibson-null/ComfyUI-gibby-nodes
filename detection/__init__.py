@@ -51,7 +51,7 @@ from comfy_extras.color_util import hex_to_rgb
 from comfy_extras.nodes_video import CreateVideo
 
 from ..context import _CONTEXT_TYPE, ctx_from
-from ..crop_image_by_mask import _CROP_INFO_TYPE
+from ..crop_image_by_mask import _CROP_INFO_TYPE, _store_crop_info
 from ..resolution_latent import _mask_bbox
 
 def _impact_core():
@@ -546,12 +546,10 @@ class GibbyDetection(io.ComfyNode):
         for m in mask:
             bbox = _mask_bbox(m)
             rects.append(bbox if bbox is not None else (0, 0, W, H))
-        info = {"image": det_image, "mask": mask, "rects": rects}
-
-        # The context keeps its model and clip (and the plain image) untouched
-        ctx["image"] = det_image
-        ctx["mask"] = mask
-        ctx["crop_info"] = info
+        # The context keeps its model and clip untouched. A connected image
+        # replaces the context's, so the latent (and cached sample) built from
+        # it are stale.
+        info = _store_crop_info(ctx, det_image, mask, rects, drop_stale=image is not None)
         # The preview is display-only; the image output stays plain
         if preview:
             masked = _overlay(det_image, mask, mask_color)

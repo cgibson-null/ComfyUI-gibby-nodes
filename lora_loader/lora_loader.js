@@ -1069,19 +1069,6 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
         }
     });
 
-    // Move arrows - reorder this row within the stack (position = apply order).
-    const upBtn = makeSmallButton("\u2191", "#8c8");
-    upBtn.title = "Move this lora slot up";
-
-    const downBtn = makeSmallButton("\u2193", "#8c8");
-    downBtn.title = "Move this lora slot down";
-
-    function paintMoveBtn(btn, ok) {
-        btn.disabled = !ok;
-        btn.style.color = ok ? "#8c8" : "#555";
-        btn.style.cursor = ok ? "pointer" : "default";
-    }
-
     // Drag handle - press and hold to drag this row to a new position.
     const dragBtn = makeSmallButton("\u283f", "#8c8");
     dragBtn.title = "Press and hold to drag this lora slot to a new position";
@@ -1091,7 +1078,7 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
     removeBtn.title = "Remove this lora slot";
 
     // When lora is "None", hide everything except the dropdown.
-    const extraFields = [infoBtn, strength, dragBtn, upBtn, downBtn, removeBtn];
+    const extraFields = [infoBtn, strength, dragBtn, removeBtn];
     function updateRowVisibility() {
         const isNone = combo?.getValue() === "None";
         for (const el of extraFields) {
@@ -1117,8 +1104,6 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
     comboWrapper = combo.wrapper;
 
     infoBtn.addEventListener("click", () => openLoraInfoModal(combo.getValue()));
-    upBtn.addEventListener("click", () => callbacks.onMove?.(controller, -1));
-    downBtn.addEventListener("click", () => callbacks.onMove?.(controller, 1));
     removeBtn.addEventListener("click", () => callbacks.onRemove(controller));
 
     // Drag-to-reorder: the row itself follows the cursor (a transform, so the
@@ -1156,8 +1141,8 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
                 if (y >= rect.top) idx++;
             }
             // Empty rows stay at the bottom: a row starting above the first
-            // empty one can't be dropped below it (the same crossing the
-            // down-arrow refuses). A row already below it is unconstrained.
+            // empty one can't be dropped below it. A row already below it is
+            // unconstrained.
             const limit = callbacks.getReorderLimit?.() ?? parent.children.length;
             if (limit < parent.children.length) {
                 const myIdx = Array.prototype.indexOf.call(parent.children, row);
@@ -1235,8 +1220,6 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
     row.appendChild(strength);
     row.appendChild(infoBtn);
     row.appendChild(dragBtn);
-    row.appendChild(upBtn);
-    row.appendChild(downBtn);
     row.appendChild(removeBtn);
 
     // Initial visibility check
@@ -1257,10 +1240,6 @@ function createRowController(loraOptions, initialValue, callbacks, getGlobalFilt
             if (typeof value?.strength === "number") strength.value = value.strength;
             updateRowVisibility();
             paintMissing();
-        },
-        setMoveEnabled(upOk, downOk) {
-            paintMoveBtn(upBtn, upOk);
-            paintMoveBtn(downBtn, downOk);
         },
         // Update lora options for this row's dropdown (called on model refresh).
         updateOptions: (newOptions) => {
@@ -1405,7 +1384,6 @@ function setupDynamicLoraRows(node) {
         if (!rowControllers.length) return;
         const first = rowControllers[0];
         first.setValue({ ...first.getValue(), lora: "None" });
-        refreshMoveButtons();
         resizeNode();
         syncWidgetValues();
     });
@@ -1434,7 +1412,6 @@ function setupDynamicLoraRows(node) {
     const makeCallbacks = () => ({
         onCommitted: handleLoraCommitted,
         onRemove: handleRemoveRow,
-        onMove: handleMoveRow,
         onReorder: handleReorderRow,
         findTransferTarget,
         onTransfer: handleTransferRow,
@@ -1451,7 +1428,6 @@ function setupDynamicLoraRows(node) {
             container.appendChild(controller.element);
             rowControllers.push(controller);
         }
-        refreshMoveButtons();
         syncWidgetValues();
     };
 
@@ -1461,7 +1437,6 @@ function setupDynamicLoraRows(node) {
         const ref = rowControllers[index];
         container.insertBefore(controller.element, ref ? ref.element : null);
         rowControllers.splice(index, 0, controller);
-        refreshMoveButtons();
         syncWidgetValues();
     };
 
@@ -1471,43 +1446,14 @@ function setupDynamicLoraRows(node) {
         controller.destroy();
         controller.element.remove();
         rowControllers.splice(idx, 1);
-        if (rowControllers.length === 0) {
-            addRows(1);
-        } else {
-            refreshMoveButtons();
-        }
+        if (rowControllers.length === 0) addRows(1);
         resizeNode();
-        syncWidgetValues();
-    }
-
-    // Gray out move arrows that can't do anything: up on the first row, down
-    // on a row with no next row or whose next row is empty.
-    function refreshMoveButtons() {
-        for (let i = 0; i < rowControllers.length; i++) {
-            const next = rowControllers[i + 1];
-            rowControllers[i].setMoveEnabled(i > 0, !!next && next.getValue().lora !== "None");
-        }
-    }
-
-    // Swap this row with its neighbor (dir -1 = up, +1 = down). Row order IS
-    // the lora apply order, so this changes which lora blends on top of which.
-    function handleMoveRow(controller, dir) {
-        const idx = rowControllers.indexOf(controller);
-        const target = idx + dir;
-        if (idx === -1 || target < 0 || target >= rowControllers.length) return;
-        // Empty slots always stay at the bottom - don't let a row sink below one.
-        if (dir > 0 && rowControllers[target].getValue().lora === "None") return;
-        [rowControllers[idx], rowControllers[target]] = [rowControllers[target], rowControllers[idx]];
-        // Re-append in array order so the DOM matches (appendChild moves an
-        // existing child rather than duplicating it).
-        for (const c of rowControllers) container.appendChild(c.element);
-        refreshMoveButtons();
         syncWidgetValues();
     }
 
     // Index of the first empty row in the full list (or the list length when
     // there is none) - the drag's drop line and drop position clamp to it,
-    // the same "empty slots stay at the bottom" rule as the move arrows.
+    // keeping empty slots at the bottom.
     function getReorderLimit() {
         for (let i = 0; i < rowControllers.length; i++) {
             if (rowControllers[i].getValue().lora === "None") return i;
@@ -1522,7 +1468,6 @@ function setupDynamicLoraRows(node) {
         rowControllers.splice(idx, 1);
         rowControllers.splice(Math.max(0, Math.min(targetIndex, rowControllers.length)), 0, controller);
         for (const c of rowControllers) container.appendChild(c.element);
-        refreshMoveButtons();
         syncWidgetValues();
     }
 
@@ -1557,8 +1502,6 @@ function setupDynamicLoraRows(node) {
     // after it, the same way rgthree's "Any Switch" grows once its last
     // socket is connected.
     function handleLoraCommitted(controller, newValue) {
-        // A slot going empty/filled changes which arrows are usable.
-        refreshMoveButtons();
         if (newValue === "None") return;
         const isLast = rowControllers[rowControllers.length - 1] === controller;
         if (!isLast) return;

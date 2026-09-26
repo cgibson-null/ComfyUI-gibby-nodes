@@ -10,7 +10,7 @@ conditionings from them).
 import comfy.samplers
 from comfy_api.latest import io
 
-from . import _CONTEXT_TYPE, recondition_prompts, ctx_from
+from . import _CONTEXT_TYPE, recondition_prompts, ctx_from, ctx_set_image
 
 
 class GibbyContextOverride(io.ComfyNode):
@@ -73,7 +73,7 @@ class GibbyContextOverride(io.ComfyNode):
         if negative is not None:
             ctx["negative"] = negative
         if image is not None:
-            ctx["image"] = image
+            ctx_set_image(ctx, image)
         if mask is not None:
             ctx["mask"] = mask
         if audio is not None:

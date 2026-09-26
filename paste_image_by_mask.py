@@ -1,7 +1,7 @@
 import torch
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE, ctx_from
+from .context import _CONTEXT_TYPE, ctx_from, ctx_set_image
 from .crop_image_by_mask import _CROP_INFO_TYPE
 from .resolution_latent import _resize_image, _resize_mask, _mask_bbox
 
@@ -119,8 +119,10 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
                 m = mask[min(i, BM - 1)][sy0:sy0 + sh, sx0:sx0 + sw].unsqueeze(0)
                 _paste_back(out[i:i + 1], images_to_paste[i:i + 1], m, sx0, sy0, sw, sh)
 
-        # The context carries the pasted-back images; the mask and crop info are discarded
-        ctx["image"] = out
+        # The context carries the pasted-back images; the mask and crop info are
+        # discarded. The pasted image replaces the crop, so the latent (and
+        # cached sample) built from it are stale.
+        ctx_set_image(ctx, out)
         ctx.pop("mask", None)
         ctx.pop("crop_info", None)
         return io.NodeOutput(ctx, out)

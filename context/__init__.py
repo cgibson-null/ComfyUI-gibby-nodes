@@ -39,6 +39,23 @@ def ctx_from(context):
     return dict(context) if isinstance(context, dict) else {}
 
 
+def drop_image_derived(ctx):
+    """Drop the latent and the cached sample after the context's image changes:
+    both were built from the image it carried before, so they're now stale -
+    the sampler would otherwise reuse the old latent or return the cached
+    result instead of encoding/sampling the new image."""
+    ctx.pop("latent", None)
+    ctx.pop("_kctx_sampled", None)
+
+
+def ctx_set_image(ctx, image):
+    """Override the context's image and drop the latent and cached sample built
+    from the old one, so the sampler re-encodes the new image instead of reusing
+    them."""
+    ctx["image"] = image
+    drop_image_derived(ctx)
+
+
 def _latent_downscale(vae, channels):
     """(w, h) spatial downscale ratio of a VAE, guessed from latent channels when no VAE is given."""
     r = getattr(vae, "downscale_ratio", None) if vae is not None else None

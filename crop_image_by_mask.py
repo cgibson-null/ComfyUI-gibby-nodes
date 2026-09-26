@@ -3,7 +3,7 @@ import nodes
 from comfy_api.latest import io
 from comfy_extras.nodes_mask import GrowMask, InvertMask
 
-from .context import _CONTEXT_TYPE, ctx_from
+from .context import _CONTEXT_TYPE, ctx_from, ctx_set_image
 from .resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox, _pad_color_tensor, _color_alpha
 
 
@@ -119,6 +119,22 @@ def _cover_crop(image, mask, cx, cy, w, h, target_w, target_h, method="lanczos")
         # Nearest keeps the rounded mask's hard edges
         crop_mask = _resize_mask(crop_mask, target_w, target_h, "nearest")
     return crop, crop_mask, (sx0, sy0, src_w, src_h)
+
+
+def _store_crop_info(ctx, image, mask, rects, out_image=None, out_mask=None, drop_stale=True):
+    """Build the crop info (the original image, mask and each crop's paste rect) and
+    store it in the context, replacing the context's image/mask with the node's
+    outputs (out_image/out_mask, or the given image/mask when not passed). When
+    drop_stale, the latent and cached sample built from the old image are dropped.
+    Returns the crop info."""
+    new_image = out_image if out_image is not None else image
+    if drop_stale:
+        ctx_set_image(ctx, new_image)
+    else:
+        ctx["image"] = new_image
+    ctx["mask"] = out_mask if out_mask is not None else mask
+    ctx["crop_info"] = {"image": image, "mask": mask, "rects": rects}
+    return ctx["crop_info"]
 
 
 class GibbyCropImageByMaskBatch(io.ComfyNode):
@@ -250,9 +266,8 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
 
         out_image = torch.stack(out)
         out_mask = torch.stack(out_mask)
-        info = {"image": image, "mask": mask, "rects": rects}
-        # The context carries the node's cropped outputs; the originals live in crop_info
-        ctx["image"] = out_image
-        ctx["mask"] = out_mask
-        ctx["crop_info"] = info
+        # The context carries the node's cropped outputs; the originals live in
+        # crop_info. The crop replaces the image, so the latent (and cached
+        # sample) built from it are stale.
+        info = _store_crop_info(ctx, image, mask, rects, out_image, out_mask)
         return io.NodeOutput(ctx, out_image, out_mask, info)

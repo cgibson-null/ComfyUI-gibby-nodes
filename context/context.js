@@ -15,7 +15,7 @@ import { app } from "../../../scripts/app.js";
 // on suggestion-count changes, which wipes a one-time patch - so the append is
 // re-applied after each rebuild by hooking the core extension's setDefaults.
 
-const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO", "LORA_STACK", "LLAMACPP_CONNECTIVITY", "LLAMACPP_OPTIONS"];
+const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO", "GIBBY_TILING_INFO", "LORA_STACK", "LLAMACPP_CONNECTIVITY", "LLAMACPP_OPTIONS"];
 
 // Autogrow inputs (COMFY_AUTOGROW_V3) hide their real type inside
 // spec.template.input - e.g. Merge KSampler Options' option1...option10.

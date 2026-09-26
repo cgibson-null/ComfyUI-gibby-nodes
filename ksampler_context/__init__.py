@@ -32,6 +32,7 @@ Key behaviors:
 
 import gc
 import os
+import re
 import time
 
 import folder_paths
@@ -868,11 +869,30 @@ def _scale_mask(mask, scale):
     return m4.squeeze(1).to(mask.dtype)
 
 
+def _parse_mask_indices(mask_indices, count):
+    """Parse a mask_indices string ("0-2, 5, 7" - a range includes both ends)
+    into the valid 0-based indices, in order and without duplicates; None when
+    the string is empty."""
+    if not mask_indices:
+        return None
+    indices = []
+    for m in re.finditer(r'(\d+)\s*-\s*(\d+)|(\d+)', mask_indices):
+        if m.group(3) is not None:
+            indices.append(int(m.group(3)))
+        else:
+            a, b = int(m.group(1)), int(m.group(2))
+            indices.extend(range(min(a, b), max(a, b) + 1))
+    return list(dict.fromkeys(i for i in indices if i < count))
+
+
 def _inpaint_regions(image, mask, opts):
     """Resize the mask to the image, process it (grow, invert) and compute crop
     regions per the crop-inpaint options with the crop node's methods (Image Crop
     By Mask (Batch)). Returns (mask, regions); regions is empty when there is
-    nothing to inpaint. A region is (x0, y0, x1, y1, cx, cy, w, h, seg_mask)."""
+    nothing to inpaint. A region is (x0, y0, x1, y1, cx, cy, w, h, seg_mask,
+    item): item is the batch item the region belongs to (None = the whole
+    batch) - single mode with a batch mask and mask_indices makes each
+    selected item its own region."""
     # Resize mask to image size if mismatch
     if mask.shape[1] != image.shape[1] or mask.shape[2] != image.shape[2]:
         mask = _resize_mask(mask, image.shape[2], image.shape[1])
@@ -907,29 +927,28 @@ def _inpaint_regions(image, mask, opts):
                 seg = np.zeros((img_h, img_w), dtype=np.uint8)
                 cv2.drawContours(seg, [contour], -1, 1, -1)
                 seg_mask = mask_2d_float * torch.from_numpy(seg > 0).to(mask.device)
-                regions.append((x0, y0, x0 + cw, y0 + ch, cx, cy, cw, ch, seg_mask))
+                regions.append((x0, y0, x0 + cw, y0 + ch, cx, cy, cw, ch, seg_mask, None))
         # Filter by mask_indices if provided: "0-2, 5, 7" -> 0, 1, 2, 5, 7
-        mask_indices_str = opts.get("mask_indices", "")
-        if mask_indices_str:
-            import re as _re
-            indices = []
-            for m in _re.finditer(r'(\d+)\s*-\s*(\d+)|(\d+)', mask_indices_str):
-                if m.group(3) is not None:
-                    indices.append(int(m.group(3)))
-                else:
-                    a, b = int(m.group(1)), int(m.group(2))
-                    indices.extend(range(min(a, b), max(a, b) + 1))
-            valid = [i for i in indices if i < len(regions)]
-            if valid:
-                regions = [regions[i] for i in valid]
-            else:
-                regions = []
+        selected = _parse_mask_indices(opts.get("mask_indices", ""), len(regions))
+        if selected is not None:
+            regions = [regions[i] for i in selected]
     else:
         # Single region: the crop node's box for the full mask
         bbox = _mask_bbox(mask)
         if bbox is not None:
             cx, cy, x0, y0, w, h = _mask_box(bbox, img_w, img_h, crop_factor)
-            regions.append((x0, y0, x0 + w, y0 + h, cx, cy, w, h, None))
+            regions.append((x0, y0, x0 + w, y0 + h, cx, cy, w, h, None, None))
+        # A batch mask with mask_indices: each selected item is its own region
+        # (its own mask's box) instead of the whole batch
+        selected = _parse_mask_indices(opts.get("mask_indices", ""), mask.shape[0])
+        if mask.shape[0] > 1 and selected:
+            regions = []
+            for k in selected:
+                bbox = _mask_bbox(mask[k:k + 1])
+                if bbox is None:
+                    continue
+                cx, cy, x0, y0, w, h = _mask_box(bbox, img_w, img_h, crop_factor)
+                regions.append((x0, y0, x0 + w, y0 + h, cx, cy, w, h, None, k))
 
     return mask, regions
 
@@ -1076,11 +1095,12 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
 
     result_image = image.clone()
 
-    for idx, (x0, y0, x1, y1, cx, cy, w, h, seg_mask) in enumerate(regions):
+    for idx, (x0, y0, x1, y1, cx, cy, w, h, seg_mask, item) in enumerate(regions):
         target_w, target_h = _resize_to_mp_scale(w, h, megapixels, scale_factor, multiple)
-        region_mask = seg_mask.unsqueeze(0) if seg_mask is not None else mask
+        src = result_image[item:item + 1] if item is not None else result_image
+        region_mask = seg_mask.unsqueeze(0) if seg_mask is not None else (mask[item:item + 1] if item is not None else mask)
         crop_img, crop_mask, (sx0, sy0, src_w, src_h) = _cover_crop(
-            result_image, region_mask, cx, cy, w, h, target_w, target_h, method)
+            src, region_mask, cx, cy, w, h, target_w, target_h, method)
         if opt_verbose:
             print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
         # The sigmas are sized to this crop: a Flux2 model gets its schedule
@@ -1099,16 +1119,18 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
             refined_crop = _color_match(refined_crop, crop_img, opts)
             if opt_verbose:
                 print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined_crop.shape[2]}x{refined_crop.shape[1]} -> {src_w}x{src_h}")
-            _paste_back(result_image, refined_crop, crop_mask, sx0, sy0, src_w, src_h)
+            _paste_back(src, refined_crop, crop_mask, sx0, sy0, src_w, src_h)
 
     # Without a decode the VAE is done after the last region's encode: free it.
     if clear_after_vae and not (decode and vae is not None):
         _clear_vram("after vae", clear_verbose)
 
-    # Update context
+    # Update context: the image was replaced, so the tiling info of the old
+    # one (if any) is stale
     ctx["image"] = result_image
     ctx.pop("latent", None)
     ctx.pop("mask", None)
+    ctx.pop("tiling_info", None)
 
     return io.NodeOutput(ctx, None, result_image, None, vae, ctx.get("vae_audio"), options_list)
 
@@ -1346,6 +1368,9 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
         ctx["mask"] = mask
     if image is not None:
         ctx.pop("latent", None)
+        # The image was replaced, so the tiling info of the old one (if any)
+        # is stale
+        ctx.pop("tiling_info", None)
 
     return io.NodeOutput(ctx, None, image, None, vae, ctx.get("vae_audio"), options_list)
 
@@ -1377,11 +1402,13 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
     crop_method = inpaint_opts.get("upscale_method", "bilinear")
 
     out_options = options_list
-    for idx, (x0, y0, x1, y1, cx, cy, w, h, seg_mask) in enumerate(regions):
+    for idx, (x0, y0, x1, y1, cx, cy, w, h, seg_mask, item) in enumerate(regions):
         target_w, target_h = _resize_to_mp_scale(w, h, megapixels, scale_factor, multiple)
-        region_mask = seg_mask.unsqueeze(0) if seg_mask is not None else mask
+        src = image[item:item + 1] if item is not None else image
+        full_src = full[item:item + 1] if item is not None else full
+        region_mask = seg_mask.unsqueeze(0) if seg_mask is not None else (mask[item:item + 1] if item is not None else mask)
         crop_img, crop_mask, (sx0, sy0, src_w, src_h) = _cover_crop(
-            image, region_mask, cx, cy, w, h, target_w, target_h, crop_method)
+            src, region_mask, cx, cy, w, h, target_w, target_h, crop_method)
         if opt_verbose:
             print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
         crop_ctx = {"image": crop_img, "mask": crop_mask, "vae": vae,
@@ -1397,15 +1424,17 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
         # Composite the refined crop back into its original-resolution region
         if opt_verbose:
             print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined.shape[2]}x{refined.shape[1]} -> {src_w}x{src_h}")
-        _paste_back(full, refined, crop_ctx.get("mask"), sx0, sy0, src_w, src_h)
+        _paste_back(full_src, refined, crop_ctx.get("mask"), sx0, sy0, src_w, src_h)
 
     if opt_verbose:
         print(f"Gibby Crop-Inpaint: composited {len(regions)} region(s) into {full.shape[2]}x{full.shape[1]} (final image)")
 
-    # Update context
+    # Update context: the image was replaced, so the tiling info of the old
+    # one (if any) is stale
     ctx["image"] = full
     ctx.pop("latent", None)
     ctx.pop("mask", None)
+    ctx.pop("tiling_info", None)
 
     return io.NodeOutput(ctx, None, full, None, vae, ctx.get("vae_audio"), out_options)
 
@@ -1905,9 +1934,11 @@ class GibbyKSamplerContext(io.ComfyNode):
             # are free to go.
             _clear_vram("after model and vae", clear_verbose)
 
-        # Update context after sampling
+        # Update context after sampling: the image is replaced, so the tiling
+        # info of the old one (if any) is stale
         ctx.pop("mask", None)    # Remove mask
-        
+        ctx.pop("tiling_info", None)
+
         if decode:
             # When decoding, remove latent and store decoded image/audio
             ctx.pop("latent", None)

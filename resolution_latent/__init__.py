@@ -43,7 +43,7 @@ from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.color_util import hex_to_rgb
 from nodes import VAEEncode
 
-from ..context import _CONTEXT_TYPE, _is_flux2, ctx_from, empty_latent
+from ..context import _CONTEXT_TYPE, _is_flux2, ctx_from, ctx_set_image, empty_latent
 
 
 # Same presets as core's Resolution Selector.
@@ -415,8 +415,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
             ctx["vae"] = vae
 
         if image is not None:
-            ctx["image"] = img
-            ctx["latent"] = None
+            ctx_set_image(ctx, img)
         else:
             ctx["latent"] = latent
         if mask is not None:

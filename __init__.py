@@ -16,6 +16,7 @@ schema, each living in its own self-contained folder:
 - pipe_any/: Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe.
 - detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
 - llm/: LLM Connect - Connectivity, Sampling Options, Unsloth Load Options and Generate for a llama.cpp / llama-swap / Unsloth server (OpenAI-compatible API), with auto-growing image/video references; Generate also takes a media pipe (refs + keyframes, labeled) and outputs one.
+- tiling.py: Split Tiles (Context) / Combine Tiles (Context) - splits the context image into a batch of uniform overlapping tiles with crop-inpaint masks; recombines the tile batch (at the upscaled size) with a crossfade across the overlaps.
 
 INSTALL:
 Put this whole folder in ComfyUI/custom_nodes/, then restart ComfyUI.
@@ -49,6 +50,7 @@ from .crop_inpaint_options import GibbyCropInpaintOptions
 from .iterative_upscale_options import GibbyIterativeUpscaleOptions
 from .lora_travel_options import GibbyLoraTravelOptions
 from .tiled_vae_options import GibbyTiledVaeOptions
+from .tiling import GibbySplitTiles, GibbyCombineTiles
 from .merge_ksampler_options import GibbyMergeKSamplerOptions
 from .merge_contexts import GibbyMergeContexts
 from .detection import GibbyDetection
@@ -124,7 +126,7 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyConnectivity, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbyTiledVaeOptions]
+        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySplitTiles, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

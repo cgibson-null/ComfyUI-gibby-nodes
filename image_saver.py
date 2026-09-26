@@ -46,7 +46,7 @@ import folder_paths
 from comfy.sd1_clip import escape_important, unescape_important, token_weights
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE, ctx_from, ctx_size
+from .context import _CONTEXT_TYPE, ctx_from, ctx_size, ctx_set_image
 from .lora_loader import _format_lora_tag, _get_or_fetch_lora_civitai_info, _hash_file_sync, _lora_hash_for, iter_lora_stack
 
 
@@ -935,7 +935,7 @@ class GibbyImageSaverContext(io.ComfyNode):
             negative = ''
 
         if image is not None:
-            ctx["image"] = image
+            ctx_set_image(ctx, image)
         images = ctx.get("image")
         if images is None:
             print("Gibby Image Saver: no images found in context or input, nothing to save.")
