@@ -1,9 +1,8 @@
 import torch
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE, ctx_from, ctx_set_image
-from .crop_image_by_mask import _CROP_INFO_TYPE
-from .resolution_latent import _resize_image, _resize_mask, _mask_bbox
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from, ctx_set_image
+from ..resolution_latent import _resize_image, _resize_mask, _mask_bbox
 
 
 def _paste_back(full, pasted, mask, x0, y0, w, h):

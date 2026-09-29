@@ -50,8 +50,8 @@ from comfy_api.latest import io, ui, Types
 from comfy_extras.color_util import hex_to_rgb
 from comfy_extras.nodes_video import CreateVideo
 
-from ..context import _CONTEXT_TYPE, ctx_from
-from ..crop_image_by_mask import _CROP_INFO_TYPE, _store_crop_info
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from
+from ..crop_paste.crop_image_by_mask import _store_crop_info
 from ..resolution_latent import _mask_bbox
 
 def _impact_core():

@@ -32,18 +32,33 @@ linked, the image is first upscaled with it (Upscale Image (using Model))
 before the resize. The size spec follows the original image's size, so the
 upscaled result is fitted back into the target box (scale factor, not the
 model's factor, sets the final size).
+
+Load image (Load Image node functionality): loads a file from the input folder
+by path (upload + preview + mask drawing on the preview, like the core Load
+Image - the drawn mask is the file's alpha). The loaded image replaces the
+connected one, and the created mask (the alpha, or the crop box mask with Crop
+image on) replaces the connected or context mask when non-empty. Crop image
+crops the loaded image to the drawn box (the crop preview's AR follows the
+size mode when set to selected) and outputs/stores the crop info (the original
+image, the box mask and the box as the paste rect) for pasting back with Image
+Paste By Mask (Batch) (Context).
 """
 
 import math
+import os
 
+import numpy as np
 import torch
+import folder_paths
+import comfy.model_management
 import comfy.utils
+from PIL import Image, ImageOps, ImageSequence
 from comfy_api.latest import io
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.color_util import hex_to_rgb
 from nodes import VAEEncode
 
-from ..context import _CONTEXT_TYPE, _is_flux2, ctx_from, ctx_set_image, empty_latent
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, _is_flux2, ctx_from, ctx_set_image, empty_latent
 
 
 # Same presets as core's Resolution Selector.
@@ -196,11 +211,69 @@ def _color_pad(img, left, right, top, bottom, bg):
     return out
 
 
+def _load_image_file(image_path):
+    """(image, mask) from an input folder file like the core Load Image:
+    channels-last float 0-1 frames, and 1.0 over the file's transparent areas
+    (None when it has no alpha or the alpha is fully opaque)."""
+    img = Image.open(image_path)
+    frames, masks = [], []
+    for i in ImageSequence.Iterator(img):
+        i = ImageOps.exif_transpose(i)
+        image = i.convert("RGB")
+        if frames and image.size != (frames[-1].shape[2], frames[-1].shape[1]):
+            continue
+        frames.append(torch.from_numpy(np.array(image).astype(np.float32) / 255.0)[None])
+        if "A" in i.getbands():
+            masks.append(1.0 - torch.from_numpy(np.array(i.getchannel("A")).astype(np.float32) / 255.0)[None])
+        else:
+            masks.append(None)
+    if not frames:
+        raise ValueError(f"Invalid image file: {image_path}")
+    image = torch.cat(frames)
+    mask = None
+    if any(m is not None for m in masks):
+        mask = torch.cat([m if m is not None else torch.zeros(1, image.shape[1], image.shape[2]) for m in masks])
+        if not bool(mask.any()):
+            mask = None
+    device = comfy.model_management.intermediate_device()
+    dtype = comfy.model_management.intermediate_dtype()
+    return image.to(device=device, dtype=dtype), mask.to(device=device, dtype=dtype) if mask is not None else None
+
+
+def _load_media(image, crop_image, crop_region):
+    """(media, created mask, crop info) for the Load image toggle: the file is
+    loaded like the core Load Image and its alpha is the created mask. With
+    Crop image on the media is the drawn box, the created mask the box area
+    (all 1.0 over the crop) and the crop info the originals for pasting back
+    with Image Paste By Mask (Batch) (Context)."""
+    image_path = folder_paths.get_annotated_filepath(image)
+    if not os.path.isfile(image_path):
+        raise ValueError(f"Invalid image file: {image}")
+    img, mask = _load_image_file(image_path)
+    if not crop_image:
+        return img, mask, None
+    B, H, W, _ = img.shape
+    region = crop_region or {}
+    x1 = int(min(max(region.get("x", 0), 0), W - 1))
+    y1 = int(min(max(region.get("y", 0), 0), H - 1))
+    x2 = int(min(max(region.get("x", 0) + region.get("width", 512), 1), W))
+    y2 = int(min(max(region.get("y", 0) + region.get("height", 512), 1), H))
+    # Mask: 1.0 in the crop area (foreground), 0.0 outside (background)
+    box_mask = torch.zeros(B, H, W, dtype=img.dtype, device=img.device)
+    box_mask[:, y1:y2, x1:x2] = 1.0
+    rect = (x1, y1, x2 - x1, y2 - y1)
+    return img[:, y1:y2, x1:x2, :], box_mask[:, y1:y2, x1:x2], {"image": img, "mask": box_mask, "rects": [rect] * B}
+
+
 class GibbyEmptyLatentResolution(io.ComfyNode):
     """Create an empty latent from a resolution spec instead of raw width/height."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
+        # The input folder's image files, like the core Load Image's combo.
+        input_dir = folder_paths.get_input_directory()
+        files = sorted(folder_paths.filter_files_content_types(
+            [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))], ["image"]))
         return io.Schema(
             node_id="Gibby_EmptyLatent_Resolution",
             display_name="Resize Image / Empty Latent (Context)",
@@ -214,6 +287,10 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 "Shared: swap dimensions, scale factor, multiple and batch size; latent type toggle for "
                 "standard 8x vs Flux2 16x latents. With an image or mask connected it is fitted into the "
                 "target box per keep_proportion (stretch/resize/pad/crop/total_pixels) and output resized. "
+                "Load image loads a file from the input folder (upload, preview and mask drawing like the core "
+                "Load Image) instead of the connected image; its alpha, or the crop box mask with Crop image on, "
+                "replaces the connected or context mask when non-empty. Crop image crops the loaded image to the "
+                "drawn box and outputs/stores the crop info for pasting back with Image Paste By Mask (Batch) (Context). "
                 "An optional vae overrides the context's vae; encoded_latent outputs the resized image "
                 "encoded with it (the context's vae when unconnected), or empty_latent without an image or vae. "
                 "mask_padded marks the pad border (1 = padding), empty for the other fit modes."
@@ -222,7 +299,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 # Optional context: width/height overridden with finalized size; latent or image+latent updated.
                 _CONTEXT_TYPE.Input("context", optional=True),
                 # Optional: when linked, it is resized per keep_proportion and the size follows.
-                io.Image.Input("image", optional=True),
+                io.Image.Input("connected_image", optional=True),
                 io.Mask.Input("mask", optional=True),
                 # Mode switcher (rendered as a horizontal toggle by resolution_latent.js).
                 io.Combo.Input("mode", options=["keep_ar", "custom", "aspect_ratio", "custom_aspect_ratio"], default="aspect_ratio"),
@@ -249,6 +326,20 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
                 # latent format: on = Flux 2's 128ch /16x latent, off = standard 4ch /8x.
                 io.Boolean.Input("flux2_latent", display_name="Flux 2 latent (16x)", default=False),
+                # Load image: the core Load Image's path combo (upload, preview, mask
+                # drawing) replaces the connected image with the file's. All five are
+                # optional: a prompt without them (pre-feature workflows, API users)
+                # runs exactly like before the feature.
+                io.Boolean.Input("load_image", display_name="Load image", default=False, optional=True,
+                                 tooltip="Load an image from the input folder instead of the connected one; its alpha (the mask drawn on the preview) replaces the connected or context mask when non-empty"),
+                io.Combo.Input("image", options=files, default=files[0] if files else "", upload=io.UploadType.image, optional=True,
+                               tooltip="The file in the input folder to load (upload a file, or draw a mask on the preview - it is saved as the file's alpha)"),
+                io.Boolean.Input("crop_image", display_name="Crop image", default=False, optional=True,
+                                 tooltip="Crop the loaded image to the drawn box before the resize; the box mask becomes the mask and the crop info is output and stored in the context"),
+                io.Combo.Input("crop_ar", options=["custom", "selected"], default="custom", optional=True,
+                               tooltip="The crop box's aspect ratio: custom is a free box, selected follows the size mode (the image's AR for keep AR, width x height for custom, the preset or manual ratio for the AR modes)"),
+                io.BoundingBox.Input("crop_region", default={"x": 0, "y": 0, "width": 512, "height": 512}, optional=True,
+                                     tooltip="The crop box in the loaded image's pixels (drawn on the preview)"),
                 # Optional Load Upscale Model: when linked and an image is present, upscale it
                 # (Upscale Image (using Model)) before the resize.
                 io.UpscaleModel.Input("upscale_model", optional=True),
@@ -269,17 +360,48 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Mask.Output(display_name="mask"),
                 # 1 where the pad border was filled in, 0 over the content; empty for the other fit modes.
                 io.Mask.Output(display_name="mask_padded"),
+                # Crop image on only: for Image Paste By Mask (Batch) (Context) - the loaded
+                # image, the box mask and the box as the paste rect; also stored in the context.
+                _CROP_INFO_TYPE.Output(display_name="crop_info"),
             ],
         )
 
     @classmethod
-    def execute(cls, context=None, image=None, mask=None, upscale_model=None, mode="aspect_ratio", width=1024, height=1024, aspect_ratio="3:4 (Portrait Standard)", x=3.0, y=4.0,
+    def validate_inputs(cls, load_image=False, image=None):
+        # The file is only read while the load image toggle is on, so a
+        # prompt without it (or with a non-file value) is no failure then.
+        # Like the core Load Image: the file list is a registration-time
+        # snapshot, so check the disk instead (clip-space mask files and
+        # fresh uploads are not in the list).
+        if not load_image:
+            return True
+        if not isinstance(image, str) or not folder_paths.exists_annotated_filepath(image):
+            return "Invalid image file: {}".format(image)
+
+        return True
+
+    @classmethod
+    def execute(cls, context=None, connected_image=None, mask=None, load_image=False, image=None,
+                crop_image=False, crop_ar="custom", crop_region=None, upscale_model=None, mode="aspect_ratio", width=1024, height=1024, aspect_ratio="3:4 (Portrait Standard)", x=3.0, y=4.0,
                 megapixels=1.0, swap_dimensions=False, scale_factor=1.0,
                 multiple=8, batch_size=1, flux2_latent=False, upscale_method="lanczos",
                 keep_proportion="stretch", pad_color="#000000", crop_position="center", vae=None) -> io.NodeOutput:
+        # Load image: the file's (or its crop's) media replaces the connected one,
+        # and the created mask (the file's alpha, or the crop box) replaces the
+        # connected or context mask when non-empty.
+        created_mask = None
+        crop_info = None
+        if load_image:
+            connected_image, created_mask, crop_info = _load_media(image, crop_image, crop_region)
+
         # If no input image but context has one, use context's image
-        if image is None and isinstance(context, dict):
-            image = context.get("image")
+        if connected_image is None and isinstance(context, dict):
+            connected_image = context.get("image")
+
+        # The created mask wins over the connected one; it is stored into the
+        # context below, replacing its old mask.
+        if created_mask is not None:
+            mask = created_mask
 
         # The connected vae overrides the context's.
         if vae is None and isinstance(context, dict):
@@ -288,21 +410,21 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         # Original media W/H before any model upscale; the size spec follows
         # this, and the upscaled image is fitted into the target box.
         OW = OH = 0
-        if image is not None:
-            OW, OH = image.shape[2], image.shape[1]
+        if connected_image is not None:
+            OW, OH = connected_image.shape[2], connected_image.shape[1]
         elif mask is not None:
             OW, OH = mask.shape[2], mask.shape[1]
 
         # Optional model upscale (Load Upscale Model + Upscale Image (using Model)),
         # applied before the resize so the upscaled image is what gets fitted.
-        if upscale_model is not None and image is not None:
-            image, = ImageUpscaleWithModel.execute(upscale_model, image)
+        if upscale_model is not None and connected_image is not None:
+            connected_image, = ImageUpscaleWithModel.execute(upscale_model, connected_image)
 
-        has_media = image is not None or mask is not None
+        has_media = connected_image is not None or mask is not None
         # Source W/H; same shape indices for [B,H,W,C] images and [B,H,W] masks.
         SW = SH = 0
         if has_media:
-            src = image if image is not None else mask
+            src = connected_image if connected_image is not None else mask
             SW, SH = src.shape[2], src.shape[1]
 
         # The context's model decides the latent format when present, else the toggle
@@ -361,9 +483,9 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
 
             # Resize the connected media to match the final dimensions.
             if image is not None:
-                img = _resize_image(image[:, y:y + ch, x:x + cw], out_w, out_h, upscale_method)
+                img = _resize_image(connected_image[:, y:y + ch, x:x + cw], out_w, out_h, upscale_method)
                 if keep_proportion == "pad":
-                    bg = _pad_color_tensor(pad_color, image.dtype, image.device)
+                    bg = _pad_color_tensor(pad_color, connected_image.dtype, connected_image.device)
                     if _color_alpha(pad_color) == 0.0:
                         # Transparent pad: the content is opaque, the border is alpha 0
                         img = _color_pad(img[..., :3], pad_left, pad_right, pad_top, pad_bottom, bg)
@@ -383,7 +505,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
             fw = out_w + pad_left + pad_right
             fh = out_h + pad_top + pad_bottom
             # 1 where the pad border was filled in, 0 over the content; empty for the other fit modes
-            ref = img if image is not None else msk
+            ref = img if connected_image is not None else msk
             mask_padded = torch.zeros(ref.shape[0], fh, fw, dtype=torch.float32, device=ref.device)
             if keep_proportion == "pad":
                 mask_padded[:, :pad_top, :] = 1
@@ -399,7 +521,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         # encoded_latent: the resized image encoded with the vae when both are
         # present, otherwise the empty latent.
         encoded_latent = latent
-        if image is not None and vae is not None:
+        if connected_image is not None and vae is not None:
             encoded_latent, = VAEEncode().encode(vae, img)
 
         # Update context with finalized dimensions and media. The context keeps
@@ -414,15 +536,17 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         if vae is not None:
             ctx["vae"] = vae
 
-        if image is not None:
+        if connected_image is not None:
             ctx_set_image(ctx, img)
         else:
             ctx["latent"] = latent
         if mask is not None:
             ctx["mask"] = msk
+        if crop_info is not None:
+            ctx["crop_info"] = crop_info
 
         return io.NodeOutput(
             ctx,  # context (new context when none connected)
-            latent, encoded_latent, int(fw), int(fh), img if image is not None else None, msk if mask is not None else None,
-            mask_padded
+            latent, encoded_latent, int(fw), int(fh), img if connected_image is not None else None, msk if mask is not None else None,
+            mask_padded, crop_info
         )

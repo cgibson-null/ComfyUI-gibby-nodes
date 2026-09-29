@@ -1,5 +1,5 @@
 from comfy_api.latest import io
-from ..context import _CONTEXT_TYPE
+from . import _CONTEXT_TYPE
 
 
 def _is_unset(value):

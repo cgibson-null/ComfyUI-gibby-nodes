@@ -41,7 +41,7 @@ from .llamacpp_client import (
     unsloth_load,
     unsloth_unload,
 )
-from ..media_pipe import slot_order, pipe_add_images
+from ..pipes.media_pipe import slot_order, pipe_add_images
 from .llamacpp_refs import MAX_REF_SLOTS, _is_frame_batch, collect_reference_images, encode_image_batch
 from .llamacpp_shared import filter_enabled_options
 

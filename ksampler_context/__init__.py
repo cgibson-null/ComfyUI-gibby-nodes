@@ -67,9 +67,9 @@ from ..context import (_CONTEXT_TYPE, GibbyContext, _recondition_text, _latent_d
                        _image_dims, _latent_dims, _is_flux2, ctx_from, ctx_size,
                        ensure_conditioning, encode_image, decode_latent)
 from ..lora_loader import iter_lora_stack
-from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
-from ..crop_image_by_mask import _process_mask, _mask_box, _cover_crop
-from ..paste_image_by_mask import _paste_back
+from ..ksampler_options.crop_inpaint import _KSAMPLER_OPTIONS_TYPE
+from ..crop_paste.crop_image_by_mask import _process_mask, _mask_box, _cover_crop
+from ..crop_paste.paste_image_by_mask import _paste_back
 from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox
 
 

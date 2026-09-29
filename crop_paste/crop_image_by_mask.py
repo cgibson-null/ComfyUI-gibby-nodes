@@ -3,12 +3,9 @@ import nodes
 from comfy_api.latest import io
 from comfy_extras.nodes_mask import GrowMask, InvertMask
 
-from .context import _CONTEXT_TYPE, ctx_from, ctx_set_image
-from .resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox, _pad_color_tensor, _color_alpha
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from, ctx_set_image
+from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox, _pad_color_tensor, _color_alpha
 
-
-# Carries the originals, the mask and the paste rectangles to Image Paste By Mask (Batch) (Context)
-_CROP_INFO_TYPE = io.Custom("GIBBY_CROP_INFO")
 
 # Two consecutive crop regions count as a shot change when they barely overlap
 _CUT_IOU = 0.2

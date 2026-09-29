@@ -7,6 +7,10 @@ A self-contained context source with a mode selector for the loading category:
   The clips row count (1-4) works like Clip Loader - Dual/Triple/Quad.
 - checkpoint: loads a full checkpoint like Load Checkpoint.
 
+With a context connected, its values carry through for anything the node
+does not load or receive connected; the loaded models, connected values and
+widget values override its matching fields.
+
 Carries the sampling parameters as widgets, and always fills in derived values on demand:
 
 - positive/negative conditioning encoded from the prompt widgets via clip
@@ -31,7 +35,7 @@ except ImportError:
     print("Gibby Context Loader: ModelAttentionBackend is missing - ck_attn is disabled (update ComfyUI)")
 
 from ..lora_loader import _apply_lora, iter_lora_stack
-from . import _CONTEXT_TYPE, _lora_stack, GibbyContext
+from . import _CONTEXT_TYPE, _lora_stack, ctx_from, ctx_set_image, GibbyContext
 
 def _clip_name_inputs(count):
     clip_options = ["None"] + folder_paths.get_filename_list("text_encoders")
@@ -102,9 +106,15 @@ class GibbyContextLoader(io.ComfyNode):
             category="gibby/context",
             description=(
                 "Loads models via a mode selector (diffusion model parts or checkpoint), "
-                "carries sampling parameters, and fills in derived values."
+                "carries sampling parameters, and fills in derived values. With a context "
+                "connected, its values carry through for anything the node does not load "
+                "or receive connected; the widget values override its matching fields."
             ),
             inputs=[
+                _CONTEXT_TYPE.Input("context", optional=True, tooltip=(
+                    "Base context; its values carry through for anything this node "
+                    "does not load or receive connected"
+                )),
                 io.DynamicCombo.Input(
                     "mode",
                     options=[
@@ -162,11 +172,18 @@ class GibbyContextLoader(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, mode=None, latent=None, image=None, mask=None,
+    def execute(cls, context=None, mode=None, latent=None, image=None, mask=None,
                 audio=None, mask_audio=None, lora_stack=None, steps=20, step_refiner=0,
                 cfg=1.0, sampler="euler", scheduler="normal", width=0, height=0, positive_prompt="", negative_prompt="", ck_attn=True) -> io.NodeOutput:
         if mode is None:
             raise ValueError("Context Loader requires a 'mode' input.")
+
+        # Start from the base context so anything this node does not load or
+        # receive carries through (image, prompts, crop_info and the like).
+        ctx = ctx_from(context)
+        for key in ("model", "clip", "vae", "vae_audio", "positive", "negative", "latent",
+                    "image", "mask", "audio", "mask_audio", "model_name", "lora_stack"):
+            ctx.setdefault(key, None)
 
         model = clip = vae = vae_audio = None
         model_name = None
@@ -207,33 +224,44 @@ class GibbyContextLoader(io.ComfyNode):
         else:
             raise ValueError(f"Unknown mode '{selected}'.")
 
-        ctx = {
-            "model": model,
-            "clip": clip,
-            "vae": vae,
-            "vae_audio": vae_audio,
-            # Conditioning is generated below from the prompt widgets.
-            "positive": None,
-            "negative": None,
-            "latent": latent,
-            "image": image,
-            "mask": mask,
-            "audio": audio,
-            "mask_audio": mask_audio,
-            "model_name": model_name,
-            "lora_stack": lora_stack,
-            "steps": steps,
-            "step_refiner": step_refiner,
-            "cfg": cfg,
-            "sampler": sampler,
-            "scheduler": scheduler,
-            "width": width,
-            "height": height,
-            "positive_prompt": positive_prompt,
-            "negative_prompt": negative_prompt,
-        }
+        # Loaded models and connected values override the context's.
+        if model is not None:
+            ctx["model"] = model
+        if clip is not None:
+            ctx["clip"] = clip
+        if vae is not None:
+            ctx["vae"] = vae
+        if vae_audio is not None:
+            ctx["vae_audio"] = vae_audio
+        if model_name is not None:
+            ctx["model_name"] = model_name
+        if latent is not None:
+            ctx["latent"] = latent
+        if image is not None:
+            # A new image invalidates the latent and cached sample built from
+            # the context's old one.
+            ctx_set_image(ctx, image)
+        if mask is not None:
+            ctx["mask"] = mask
+        if audio is not None:
+            ctx["audio"] = audio
+        if mask_audio is not None:
+            ctx["mask_audio"] = mask_audio
+        if lora_stack is not None:
+            ctx["lora_stack"] = lora_stack
 
-        # Apply LoRAs from a directly-connected lora_stack to the freshly-loaded model/clip.
+        # Widget values override the matching context fields.
+        ctx["steps"] = steps
+        ctx["step_refiner"] = step_refiner
+        ctx["cfg"] = cfg
+        ctx["sampler"] = sampler
+        ctx["scheduler"] = scheduler
+        ctx["width"] = width
+        ctx["height"] = height
+        ctx["positive_prompt"] = positive_prompt
+        ctx["negative_prompt"] = negative_prompt
+
+        # Apply LoRAs from a directly-connected lora_stack to the context's model/clip.
         for name, sm, sc in iter_lora_stack(lora_stack):
             ctx["model"], ctx["clip"] = _apply_lora(ctx["model"], ctx["clip"], name, sm, sc)
 

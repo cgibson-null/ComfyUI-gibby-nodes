@@ -19,7 +19,7 @@ from comfy_extras.nodes_minimax_h3 import (
     _empty_av_latent, _resize, adapt_canvas,
     CANVAS_MULTIPLE, REF_IMAGE_SHORT_EDGE, FPS,
 )
-from .context import _CONTEXT_TYPE, ctx_from
+from ..context import _CONTEXT_TYPE, ctx_from
 from .media_pipe import slot_order
 
 

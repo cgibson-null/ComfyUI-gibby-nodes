@@ -88,7 +88,7 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 **Crop Image (Context)** - (temp name) like native Crop Image, but outputs mask, bbox, pos and neg coords to be used with segm.
 
-**Pause Execution** - allows to pause execution; throws error at first run, ignore it.
+**Pause Execution** - blocks execution in place (counts down the timeout, optional ding via `emit_sound`) until you click Continue (requeues the prompt - the pausing nodes let the restart through without pausing again) or Stop (interrupts the run); a timeout auto-resolves the pause (continue or stop workflow). `pause_flow` off passes straight through. Stolen from Succy Pack.
 
 ## MiniMax H3
 

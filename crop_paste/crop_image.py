@@ -2,9 +2,9 @@ import json
 import torch
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE, ctx_from
-from .crop_image_by_mask import _CROP_INFO_TYPE, _store_crop_info
-from .detection import _bbox_xyxy
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from
+from .crop_image_by_mask import _store_crop_info
+from ..detection import _bbox_xyxy
 
 
 class GibbyCropImage(io.ComfyNode):

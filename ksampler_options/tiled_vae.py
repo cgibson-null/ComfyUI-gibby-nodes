@@ -1,5 +1,5 @@
 from comfy_api.latest import io
-from ..crop_inpaint_options import _KSAMPLER_OPTIONS_TYPE
+from .crop_inpaint import _KSAMPLER_OPTIONS_TYPE
 
 
 class GibbyTiledVaeOptions(io.ComfyNode):

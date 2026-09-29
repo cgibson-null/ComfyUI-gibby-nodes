@@ -31,7 +31,7 @@ import node_helpers
 from comfy_api.latest import io
 
 from .context import _CONTEXT_TYPE, recondition_prompts, _latent_downscale, ctx_from
-from .media_pipe import slot_order, pipe_add_images
+from .pipes.media_pipe import slot_order, pipe_add_images
 from .resolution_latent import _resize_image_to_mp
 
 

@@ -30,6 +30,8 @@ from ..lora_loader import _apply_lora, iter_lora_stack
 
 _CONTEXT_TYPE = io.Custom("CONTEXT")
 _lora_stack = io.Custom("LORA_STACK")
+# The crop nodes' originals/mask/rects payload, carried in the context's crop_info
+_CROP_INFO_TYPE = io.Custom("GIBBY_CROP_INFO")
 
 
 def ctx_from(context):

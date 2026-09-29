@@ -10,10 +10,8 @@ schema, each living in its own self-contained folder:
 - context/: the CONTEXT object family - Context (bundler), Context Loader (models + params into a full context), Context Override, Sampling Parameters (Context).
 - resolution_latent/: Resize Image / Empty Latent (Context) - empty latent from width/height or aspect ratio + megapixels, resizes linked image/mask to match.
 - image_saver/: Image Saver (Context) - saves images with civitai-compatible metadata; settings and lora names come from the context.
-- media_pipe.py: the media pipe dict shared between nodes (ref images, keyframes with positions, videos, audios) - h3_pipe is it plus the h3 params.
-- H3_pipe/: H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe (raw refs + keyframes stored, encoded at apply time).
+- pipes/: media_pipe.py (the media pipe dict shared between nodes - ref images, keyframes with positions, videos, audios - h3_pipe is it plus the h3 params), h3_pipe.py (H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe, raw refs + keyframes stored, encoded at apply time) and pipe_any.py (Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe).
 - reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to the megapixels target, scaled, encoded with context VAE); optionally references the context's own image at its own size; references a media pipe's images and passes the pipe through, appending the wired images to it; without a context it just builds the pipe from the wired images.
-- pipe_any/: Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe.
 - detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
 - llm/: LLM Connect - Connectivity, Sampling Options, Unsloth Load Options and Generate for a llama.cpp / llama-swap / Unsloth server (OpenAI-compatible API), with auto-growing image/video references; Generate also takes a media pipe (refs + keyframes, labeled) and outputs one.
 - tiling.py: Split Tiles (Context) / Combine Tiles (Context) - splits the context image into a batch of uniform overlapping tiles with crop-inpaint masks; recombines the tile batch (at the upscaled size) with a crossfade across the overlaps.
@@ -29,7 +27,6 @@ import os
 from comfy_api.latest import ComfyExtension, io
 
 from .lora_loader import GibbyLoraLoader
-from .clear_vram_options import GibbyClearVramOptions
 from .context import GibbyContext
 from .context.context_override import GibbyContextOverride
 from .context.sampling_parameters import GibbySamplingParametersContext
@@ -38,21 +35,22 @@ from .ksampler_context import GibbyKSamplerContext
 from .any_switch import GibbyAnySwitch
 from .resolution_latent import GibbyEmptyLatentResolution
 from .image_saver import GibbyImageSaverContext
-from .h3_pipe import H3PipeCreate, H3PipeApply
+from .pipes.h3_pipe import H3PipeCreate, H3PipeApply
 from .reference_latent_context import GibbyReferenceLatentContext
-from .pipe_any import PipeAny
-from .crop_image import GibbyCropImage
-from .crop_image_by_mask import GibbyCropImageByMaskBatch
-from .paste_image_by_mask import GibbyPasteImageByMaskBatch
+from .pipes.pipe_any import PipeAny
+from .crop_paste.crop_image import GibbyCropImage
+from .crop_paste.crop_image_by_mask import GibbyCropImageByMaskBatch
+from .crop_paste.paste_image_by_mask import GibbyPasteImageByMaskBatch
 from .pause_execution import GibbyPauseExecution
-from .color_match_options import GibbyColorMatchOptions
-from .crop_inpaint_options import GibbyCropInpaintOptions
-from .iterative_upscale_options import GibbyIterativeUpscaleOptions
-from .lora_travel_options import GibbyLoraTravelOptions
-from .tiled_vae_options import GibbyTiledVaeOptions
+from .ksampler_options.clear_vram import GibbyClearVramOptions
+from .ksampler_options.color_match import GibbyColorMatchOptions
+from .ksampler_options.crop_inpaint import GibbyCropInpaintOptions
+from .ksampler_options.iterative_upscale import GibbyIterativeUpscaleOptions
+from .ksampler_options.lora_travel import GibbyLoraTravelOptions
+from .ksampler_options.tiled_vae import GibbyTiledVaeOptions
 from .tiling import GibbySplitTiles, GibbyCombineTiles
-from .merge_ksampler_options import GibbyMergeKSamplerOptions
-from .merge_contexts import GibbyMergeContexts
+from .ksampler_options.merge_ksampler_options import GibbyMergeKSamplerOptions
+from .context.merge_contexts import GibbyMergeContexts
 from .detection import GibbyDetection
 from .llm import GibbyConnectivity, GibbySamplingOptions, GibbyLoadOptions, GibbyGenerate
 from .llm.llamacpp_client import list_models as _llm_list_models
