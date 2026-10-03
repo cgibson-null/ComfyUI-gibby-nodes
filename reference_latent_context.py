@@ -31,7 +31,7 @@ import node_helpers
 from comfy_api.latest import io
 
 from .context import _CONTEXT_TYPE, recondition_prompts, _latent_downscale, ctx_from
-from .pipes.media_pipe import slot_order, pipe_add_images
+from .pipes.media_pipe import iter_numbered_slots, pipe_add_images
 from .resolution_latent import _resize_image_to_mp
 
 
@@ -115,11 +115,10 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         context = context or {}
         # The wired image_N, in order (None slots dropped).
         images = images or {}
-        explicit = [images[name] for name in sorted(images, key=lambda n: int(n.rsplit("_", 1)[-1])) if images[name] is not None]
+        explicit = [value for _index, _name, value in iter_numbered_slots(images, "image")]
 
         # Pipe refs lead the reference list, the wired images append to them.
-        pipe_refs = [v for k, v in sorted(((media_pipe or {}).get("ref_images") or {}).items(),
-                                           key=lambda kv: slot_order(kv[0])) if v is not None]
+        pipe_refs = [value for _index, _name, value in iter_numbered_slots((media_pipe or {}).get("ref_images") or {}, "ref_image")]
 
         # The context image takes the main slot: always when no image_N is wired
         # (toggle irrelevant), otherwise only with ref_ctx_img on - then it leads

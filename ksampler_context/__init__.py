@@ -870,19 +870,25 @@ def _scale_mask(mask, scale):
 
 
 def _parse_mask_indices(mask_indices, count):
-    """Parse a mask_indices string ("0-2, 5, 7" - a range includes both ends)
-    into the valid 0-based indices, in order and without duplicates; None when
-    the string is empty."""
+    """Parse a mask_indices string into the valid 0-based indices, in order and
+    without duplicates; None when the string is empty. Accepts indices ("5"),
+    inclusive ranges ("0-2" includes both ends) and slice expressions:
+    ":3" = 0-3, "4:6" = 4-6, "-3:" = the last 3, "-2" = second to last."""
     if not mask_indices:
         return None
     indices = []
-    for m in re.finditer(r'(\d+)\s*-\s*(\d+)|(\d+)', mask_indices):
-        if m.group(3) is not None:
-            indices.append(int(m.group(3)))
+    for m in re.finditer(r'(-?\d+)?\s*:\s*(-?\d+)?|(\d+)\s*-\s*(\d+)|(-?\d+)', mask_indices):
+        if ':' in m.group(0):
+            a = int(m.group(1)) if m.group(1) is not None else 0
+            b = int(m.group(2)) if m.group(2) is not None else count - 1
+        elif m.group(5) is not None:
+            a = b = int(m.group(5))
         else:
-            a, b = int(m.group(1)), int(m.group(2))
-            indices.extend(range(min(a, b), max(a, b) + 1))
-    return list(dict.fromkeys(i for i in indices if i < count))
+            a, b = int(m.group(3)), int(m.group(4))
+        a += count if a < 0 else 0
+        b += count if b < 0 else 0
+        indices.extend(range(min(a, b), max(a, b) + 1))
+    return list(dict.fromkeys(i for i in indices if 0 <= i < count))
 
 
 def _inpaint_regions(image, mask, opts):

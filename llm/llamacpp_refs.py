@@ -29,12 +29,13 @@ from __future__ import annotations
 
 import base64
 import logging
-import re
 from io import BytesIO
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 from PIL import Image
+
+from ..pipes.media_pipe import iter_numbered_slots
 
 logger = logging.getLogger(__name__)
 
@@ -50,34 +51,6 @@ MAX_REF_SLOTS = 32
 
 # Soft warning threshold for total images sent in a single request.
 WARN_TOTAL_IMAGES = 16
-
-# ``images``/``video`` (bare, slot 0) or ``images_3``/``video_12``.
-_SLOT_RE = re.compile(r"^(?P<prefix>[A-Za-z_]+?)(?:_(?P<index>\d+))?$")
-
-
-# --------------------------------------------------------------------------
-# Dynamic socket collection
-# --------------------------------------------------------------------------
-
-def iter_dynamic_slots(values: dict[str, Any], prefix: str) -> Iterator[tuple[int, Any]]:
-    """Yield ``(slot_index, value)`` for every populated ``<prefix>_<n>`` key.
-
-    Slots are yielded in ascending numeric order. A bare ``<prefix>`` key (no
-    numeric suffix) is treated as slot 0 so upstream-style workflows keep
-    working. Empty slots are skipped.
-    """
-    found: list[tuple[int, Any]] = []
-    for key, value in values.items():
-        if value is None:
-            continue
-        match = _SLOT_RE.match(key)
-        if match is None or match.group("prefix") != prefix:
-            continue
-        raw_index = match.group("index")
-        found.append((0 if raw_index is None else int(raw_index), value))
-    found.sort(key=lambda pair: pair[0])
-    return iter(found)
-
 
 # --------------------------------------------------------------------------
 # Frame sampling
@@ -306,12 +279,12 @@ def collect_reference_images(
     encoded: list[str] = []
     report: list[str] = []
 
-    for index, value in iter_dynamic_slots(slot_values, IMAGE_SLOT_PREFIX):
+    for index, _name, value in iter_numbered_slots(slot_values, IMAGE_SLOT_PREFIX):
         frames = encode_image_batch(value, max_image_size)
         encoded.extend(frames)
         report.append(f"{IMAGE_SLOT_PREFIX}_{index}: {len(frames)} image(s)")
 
-    for index, value in iter_dynamic_slots(slot_values, VIDEO_SLOT_PREFIX):
+    for index, _name, value in iter_numbered_slots(slot_values, VIDEO_SLOT_PREFIX):
         frames = encode_video(value, frames_per_video, max_image_size)
         encoded.extend(frames)
         kind = "frame batch" if _is_frame_batch(value) else type(value).__name__

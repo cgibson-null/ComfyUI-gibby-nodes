@@ -7,32 +7,43 @@
 // canvas widgets):
 //   - "mode" combo          -> horizontal toggle switch (custom / aspect ratio / custom AR, plus keep AR when media is linked)
 //   - "crop_ar" combo        -> native labeled toggle (Custom / Selected) above the crop preview
+// The enable preview toggle (above the load image toggle) gates the
+// executed temp preview: off, the backend writes no temp file at all and
+// the node hides the last run's preview; it is hidden while load image
+// and/or crop image is on, where the preview is always written (the file
+// preview and the crop preview are the image UI then, and downstream crop
+// views read the context's image from it).
 // Rows are shown/hidden per mode via widget.options.hidden (the same flag the
 // new frontend's advanced-widget toggle uses). The load image group
-// (file combo + upload, crop toggle, crop AR toggle, crop preview, crop
-// region) is instead added to and removed from node.widgets physically,
-// with the widget store kept in sync the same way the core's dynamic
-// widgets do (the Vue rows follow the store, not node.widgets): removed
-// rows are not serialized into the prompt, so the backend falls back to
-// their schema defaults.
+// (file combo + upload) and the crop group (crop toggle, crop AR toggle,
+// crop preview, crop region) are instead added to and removed from
+// node.widgets physically, with the widget store kept in sync the same way
+// the core's dynamic widgets do (the Vue rows follow the store, not
+// node.widgets): removed rows are not serialized into the prompt, so the
+// backend falls back to their schema defaults. The crop group is
+// independent of the load group: the crop preview shows the image the resize
+// uses (the loaded file, else the connected image's preview, else the
+// connected context node's last-run image).
+//
+// With load and crop off the node's executed temp preview (the backend's
+// ui.PreviewImage) is the image UI - like the core Preview Image, a mask can
+// be drawn on it: the core mask editor rewrites the file combo to its
+// clipspace upload, and the backend uses the file's alpha as the mask. An
+// erased mask (the editor rewrites the combo to a fresh fully-opaque file on
+// every save, erases included) leaves the executed preview in place and
+// clears the file combo - the file is a stale copy of the image it was
+// painted on, and the editor prioritizes the combo over the node's current
+// image, so a fresh mask session would otherwise paint onto that copy.
 // ---------------------------------------------------------------------------
 
 import { app } from "../../../scripts/app.js";
+import {
+    buildCropPreview,
+    liveNode,
+    CROP_PREVIEW_MIN_H,
+} from "../crop_preview.js";
 
 const NODE_TYPE = "Gibby_EmptyLatent_Resolution";
-
-// Resolve the live instance that owns a switcher. The buttons only exist
-// while their node is in the graph on screen, so look the node up in the
-// graph currently shown. A tab switch rebuilds the graph in place (new
-// instance, same id), and a global instance registry went stale after that -
-// first-match lookup then wrote to a dead instance and the buttons stopped
-// reacting until a page refresh.
-function liveNode(id) {
-    const graph =
-        (app.canvas && app.canvas.getCurrentGraph && app.canvas.getCurrentGraph()) ||
-        app.graph;
-    return graph ? graph.getNodeById(id) : null;
-}
 
 const MODES = [
     ["keep_ar", "Keep AR"],
@@ -44,6 +55,9 @@ const MODES = [
 // Standard widget names in schema order (excluding the DOM switcher, which is
 // not serialized). configure() maps legacy positional widgets_values onto
 // these; with widgets_values_named present the order is irrelevant.
+// enable_preview is deliberately not in this list: it postdates the
+// positional order, so legacy lists without widgets_values_named must not
+// shift onto it (configure's named branch restores it separately).
 const CANONICAL_WIDGETS = [
     "mode", "width", "height", "aspect_ratio", "x", "y", "megapixels",
     "scale_factor", "upscale_method", "keep_proportion", "pad_color",
@@ -150,6 +164,9 @@ function addWidgetRow(node, w, after) {
 // Clear the node's preview entry (the store-driven preview overlay).
 function clearNodePreview(node) {
     node.imgs = undefined;
+    // A detached clone (copy/duplicate) shares the original's id - touching
+    // the store would drop the original node's preview.
+    if (!node.graph) return;
     const store = frontendStore("nodeOutput");
     if (store?.removeNodeOutputsForNode) {
         try { store.removeNodeOutputsForNode(node); } catch (e) { /* ignore */ }
@@ -164,11 +181,84 @@ function clearNodePreview(node) {
 function setFilePreview(node) {
     const value = getWidgetValue(node, "image");
     node.imgs = undefined;
+    // A detached clone (copy/duplicate) shares the original's id - touching
+    // the store would overwrite the original node's preview.
+    if (!node.graph) return;
     const store = frontendStore("nodeOutput");
     if (value && store?.setNodeOutputs) {
         try { store.setNodeOutputs(node, String(value)); } catch (e) { /* ignore */ }
     }
     try { node.graph?.setDirtyCanvas(true, true); } catch (e) { /* ignore */ }
+}
+
+// The node connected to the named input (through a subgraph proxy when
+// needed) - the core crop editor's own upstream lookup.
+function upstreamNode(node, name) {
+    const idx = (node.inputs || []).findIndex((i) => i.name === name);
+    if (idx < 0) return null;
+    // A detached clone (copy/duplicate) has no graph - getInputNode throws
+    // NullGraphError there, and the clone has no links anyway.
+    if (!node.graph) return null;
+    let n = node.getInputNode?.(idx);
+    if (!n) return null;
+    if (n.isSubgraphNode?.()) {
+        const link = node.getInputLink?.(idx);
+        if (!link) return null;
+        n = n.resolveSubgraphOutputLink?.(link.origin_slot)?.outputNode ?? null;
+    }
+    return n;
+}
+
+// PreviewImage's temp files (ComfyUI_temp_*) mark an executed output, as
+// opposed to the file-combo preview of a loaded file.
+function isExecutedPreview(url) {
+    try {
+        return new URL(url, location.origin).searchParams.get("filename")?.startsWith("ComfyUI_temp_") === true;
+    } catch (e) { return false; }
+}
+
+// The URL of the image the crop preview shows: the same image the resize
+// uses - the loaded file (load on), else the connected image input's
+// preview (a Load Image's file, or the last run's output - nothing to show
+// while it has none), and only without one the connected context node's
+// preview. The context's image is a runtime tensor, so only its executed
+// preview (a temp file) is shown - it changes on a run, not on a file
+// change. The last run's preview is kept until the next run: a file change
+// in the context node replaces the store entry with the file's preview,
+// which is not the crop's image.
+function cropPreviewUrl(node) {
+    if (getWidgetValue(node, "load_image")) return imagePreviewUrl(node);
+    const store = frontendStore("nodeOutput");
+    if (!store?.getNodeImageUrls) return null;
+    const imgNode = upstreamNode(node, "connected_image");
+    if (imgNode) {
+        // The last run's output (kept across store refreshes) is the crop's
+        // actual input when the upstream node executes; a core Load Image
+        // never has one, so the file preview stands.
+        const urls = store.getNodeImageUrls(imgNode) || [];
+        for (const u of urls) {
+            if (isExecutedPreview(u)) {
+                node._gibbyLastTemp = { url: u, ctx: imgNode.id };
+                return u;
+            }
+        }
+        const last = node._gibbyLastTemp;
+        if (last && last.ctx === imgNode.id) return last.url;
+        return urls.length ? urls[0] : null;
+    }
+    const ctxNode = upstreamNode(node, "context");
+    if (!ctxNode) {
+        node._gibbyLastTemp = null;
+        return null;
+    }
+    for (const u of store.getNodeImageUrls(ctxNode) || []) {
+        if (isExecutedPreview(u)) {
+            node._gibbyLastTemp = { url: u, ctx: ctxNode.id };
+            return u;
+        }
+    }
+    const last = node._gibbyLastTemp;
+    return last && last.ctx === ctxNode.id ? last.url : null;
 }
 
 // Build a horizontal button switcher (low_vram style). Returns the element.
@@ -254,7 +344,7 @@ function refreshModeVisibility(node) {
 
     // The mode switch writes the value directly (no callback), so re-fit the
     // locked crop box here.
-    if (node._gibbyLoadGroup && getWidgetValue(node, "load_image") && getWidgetValue(node, "crop_image")) {
+    if (node._gibbyLoadGroup && getWidgetValue(node, "crop_image")) {
         refitCropBox(node);
     }
 
@@ -291,6 +381,155 @@ function imagePreviewUrl(node) {
     const params = new URLSearchParams({ filename: v, subfolder, type: "input" });
     params.set("_", Date.now().toString());
     return "/view?" + params.toString();
+}
+
+// The file the core mask editor uploads and rewrites the combo to when a
+// mask is drawn on the preview (clipspace-painted-masked-<ts>.png).
+function isMaskEditorFile(value) {
+    if (!value) return false;
+    const v = String(value).replace(/\s*\[\w+\]$/, "");
+    return v.slice(v.lastIndexOf("/") + 1).startsWith("clipspace-painted-masked-");
+}
+
+// The last file the combo pointed at that is not a mask editor upload -
+// the original a drawn mask goes back to with crop on (the box is the
+// mask there, so the drawn one is discarded).
+function trackOriginalFile(node, value) {
+    const v = value !== undefined ? value : getWidgetValue(node, "image");
+    if (v && !isMaskEditorFile(v)) node._gibbyOriginalFile = v;
+}
+
+// Whether the clipspace file the combo points at holds a drawn mask: any
+// non-opaque alpha pixel (the backend's _drawn_mask does the same). The
+// combo can't tell it - the core editor rewrites it to a fresh file on
+// every save, erases included, and that rewrite skips the widget callback
+// - so the file's alpha decides. Checked once per file, cached on the
+// node; null = not checked yet (the file preview stands until it lands).
+async function checkDrawnMask(node) {
+    const v = getWidgetValue(node, "image");
+    const name = v && isMaskEditorFile(v) ? String(v).replace(/\s*\[\w+\]$/, "") : null;
+    if (!name) {
+        node._gibbyMaskFile = null;
+        node._gibbyMaskEmpty = null;
+        return;
+    }
+    if (node._gibbyMaskFile === name && node._gibbyMaskEmpty !== null) return;
+    node._gibbyMaskFile = name;
+    node._gibbyMaskEmpty = null;
+    try {
+        // The editor's upload sends no subfolder, so the file lands in the
+        // input root (the "clipspace" in the ref is nominal)
+        const params = new URLSearchParams({ filename: name, type: "input" });
+        const resp = await fetch("/view?" + params.toString());
+        if (!resp.ok) {
+            // The backend treats a missing file as no mask
+            if (node._gibbyMaskFile === name) node._gibbyMaskEmpty = true;
+            return;
+        }
+        const bmp = await createImageBitmap(await resp.blob());
+        const canvas = document.createElement("canvas");
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(bmp, 0, 0);
+        const data = ctx.getImageData(0, 0, bmp.width, bmp.height).data;
+        let empty = true;
+        for (let i = 3; i < data.length; i += 4) {
+            if (data[i] < 255) { empty = false; break; }
+        }
+        if (node._gibbyMaskFile === name) node._gibbyMaskEmpty = empty;
+    } catch (e) { /* keep null: the file preview stands until a check lands */ }
+}
+
+// The verdict checkDrawnMask cached for the combo's current file
+// (true = erased, false = drawn, null = not decided yet): the verdict is
+// per file - the core editor makes a fresh timestamped file on every
+// save, so one cached for another file says nothing about this one.
+function maskEmptyOf(node) {
+    const value = getWidgetValue(node, "image");
+    if (!isMaskEditorFile(value)) return null;
+    const name = String(value).replace(/\s*\[\w+\]$/, "");
+    return node._gibbyMaskFile === name ? node._gibbyMaskEmpty : null;
+}
+
+// Whether the file preview (the loaded file, or a mask drawn on the
+// executed preview) stands for the executed output: load on, or a mask
+// editor file whose alpha still holds a drawn mask (maskEmptyOf; an
+// erased mask leaves the executed output as the preview, like a plain
+// run).
+function filePreviewActive(node) {
+    return !!getWidgetValue(node, "load_image") ||
+        (isMaskEditorFile(getWidgetValue(node, "image")) &&
+         maskEmptyOf(node) !== true);
+}
+
+// The mask has been erased: the clipspace file is a stale copy of the
+// image it was painted on. Drop it from the node's output entry (the core
+// editor's save put it there over the run's output, erases included), and
+// clear the file combo - the mask editor reads the combo (the widget value
+// store first) and prioritizes it over the node's current image, so a
+// fresh mask session would otherwise paint onto the stale copy instead of
+// the image the preview shows now.
+function resetErasedMask(node) {
+    const store = frontendStore("nodeOutput");
+    if (store?.getNodeOutputs && store.removeNodeOutputsForNode) {
+        const name = String(getWidgetValue(node, "image") || "")
+            .replace(/\s*\[\w+\]$/, "");
+        let img;
+        try {
+            img = store.getNodeOutputs(node)?.images?.[0];
+        } catch (e) { /* ignore */ }
+        if (img && img.filename === name && img.type === "input") {
+            node.imgs = undefined;
+            try {
+                store.removeNodeOutputsForNode(node);
+            } catch (e) { /* ignore */ }
+        }
+    }
+    const w = findWidget(node, "image");
+    if (w) w.value = "";
+    // The store is what the editor's getNodeWidgetValue reads: a direct
+    // widget write alone would leave the stale file in it (the core's
+    // setNodeWidgetValue writes both).
+    const widgets = frontendStore("widgetValue");
+    const graphId = node.graph?.rootGraph?.id;
+    if (widgets?.setValue && graphId) {
+        try {
+            widgets.setValue(`${graphId}:${encodeURIComponent(String(node.id))}:image`, "");
+        } catch (e) { /* ignore */ }
+    }
+}
+
+// Restore the file preview in place of the executed output (the core's
+// combo callback does this on a file change): the loaded file in load
+// mode, or a mask drawn on the executed preview in default mode. A mask
+// editor file's alpha decides the latter (checkDrawnMask, async - the
+// executed preview stands until the check lands): the core editor
+// rewrites the combo to a fresh fully-opaque file on every save, erases
+// included, so an erased mask is a stale copy of the image it was
+// painted on and must not take the preview over from the executed output
+// (a tab switch re-runs this, so it must not restore that copy either).
+function restoreFilePreview(node) {
+    if (getWidgetValue(node, "load_image") ||
+        !isMaskEditorFile(getWidgetValue(node, "image"))) {
+        setFilePreview(node);
+        return;
+    }
+    if (maskEmptyOf(node) === true) {
+        resetErasedMask(node);
+        return;
+    }
+    setTimeout(async () => {
+        const m = liveNode(node.id) || node;
+        if (!m || m._removed) return;
+        if (getWidgetValue(m, "crop_image") || !filePreviewActive(m)) return;
+        await checkDrawnMask(m);
+        if (maskEmptyOf(m) === true) {
+            resetErasedMask(m);
+        } else if (filePreviewActive(m)) {
+            setFilePreview(m);
+        }
+    }, 0);
 }
 
 // The natural aspect ratio of the loaded file (from the crop preview's
@@ -352,239 +591,46 @@ function refitCropBox(node) {
     g.cropPreviewEl._gibbyPaint?.();
 }
 
-// The crop preview: the loaded file with a draggable, resizable box (like
-// the core Crop Image (Context)). The box writes image-pixel coordinates
-// into the crop_region widget.
-// The preview row's fixed height: the image letterboxes inside (like the
-// core crop editor's fixed container), so resizing the node never changes
-// the row height and a manual node height is never fought.
-const CROP_PREVIEW_H = 222;
 
-function buildCropPreview(node) {
-    const wrap = document.createElement("div");
-    wrap.style.cssText =
-        "position:relative; margin:0; background:#111; border:1px solid #333; " +
-        "border-radius:3px; overflow:hidden; line-height:0; box-sizing:border-box; " +
-        "height:" + CROP_PREVIEW_H + "px; display:flex; " +
-        "align-items:center; justify-content:center;";
-    const img = document.createElement("img");
-    img.style.cssText =
-        "display:block; user-select:none; -webkit-user-drag:none;";
-    const box = document.createElement("div");
-    box.style.cssText =
-        "position:absolute; box-sizing:border-box; border:1px solid #4a9eff; " +
-        "background:rgba(74,158,255,0.12); cursor:move;";
-    wrap.appendChild(img);
-    wrap.appendChild(box);
-
-    const HANDLES = [
-        ["nw", 0, 0, "nwse-resize"], ["n", 0.5, 0, "ns-resize"],
-        ["ne", 1, 0, "nesw-resize"], ["e", 1, 0.5, "ew-resize"],
-        ["se", 1, 1, "nwse-resize"], ["s", 0.5, 1, "ns-resize"],
-        ["sw", 0, 1, "nesw-resize"], ["w", 0, 0.5, "ew-resize"],
-    ];
-    const handles = HANDLES.map(([dir, fx, fy, cursor]) => {
-        const h = document.createElement("div");
-        h.style.cssText =
-            "position:absolute; width:8px; height:8px; margin:-4px 0 0 -4px; " +
-            "background:#4a9eff; border:1px solid #fff; box-sizing:content-box; " +
-            "cursor:" + cursor + ";";
-        h._gibbyDir = dir;
-        h._gibbyFx = fx;
-        h._gibbyFy = fy;
-        box.appendChild(h);
-        return h;
-    });
-
-    // Display the image at its natural size capped by the container's
-    // height (the width follows the AR) and shrunk to fit the container's
-    // width: resizing the node's width only changes the black padding,
-    // like resizing its height does.
-    function fitImg() {
-        const nat = wrap._gibbyNatural;
-        if (!nat || !wrap.clientWidth || !wrap.clientHeight) return;
-        const ar = nat.w / nat.h;
-        let ch = Math.min(nat.h, wrap.clientHeight), cw = ch * ar;
-        if (cw > wrap.clientWidth) { cw = wrap.clientWidth; ch = cw / ar; }
-        img.style.width = Math.round(cw) + "px";
-        img.style.height = Math.round(ch) + "px";
-    }
-
-    // The rendered image rect inside the wrap, in CSS px (the box's styles
-    // are CSS px; the overlay follows the canvas zoom, so bounding rects
-    // would mix screen px in). The image is centered in the fixed
-    // container (the flex layout), the box is offset the same way.
-    function imgBox() {
-        const ww = wrap.clientWidth, wh = wrap.clientHeight;
-        const cw = img.clientWidth, ch = img.clientHeight;
-        const nat = wrap._gibbyNatural || { w: 1, h: 1 };
-        const scale = cw / nat.w; // CSS px per image px
-        return {
-            left: (ww - cw) / 2,
-            top: (wh - ch) / 2,
-            scale,
-            // Screen px per image px: the canvas zoom, for pointer deltas.
-            screenScale: scale * (img.getBoundingClientRect().width / cw || 1),
-            W: nat.w,
-            H: nat.h,
-        };
-    }
-    function rect() {
-        const n = liveNode(node.id);
-        const v = (n ? getWidgetValue(n, "crop_region") : null) || {};
-        return { x: v.x || 0, y: v.y || 0, w: v.width || 512, h: v.height || 512 };
-    }
-    function paint() {
-        fitImg();
-        // No image loaded yet, or the row is hidden (zero size): nothing to
-        // anchor the box to.
-        if (!wrap._gibbyNatural || !img.clientWidth) { box.style.display = "none"; return; }
-        box.style.display = "";
-        const b = imgBox();
-        const r = rect();
-        box.style.left = (b.left + r.x * b.scale) + "px";
-        box.style.top = (b.top + r.y * b.scale) + "px";
-        box.style.width = Math.max(1, r.w * b.scale) + "px";
-        box.style.height = Math.max(1, r.h * b.scale) + "px";
-        for (const h of handles) {
-            h.style.left = (h._gibbyFx * r.w * b.scale) + "px";
-            h.style.top = (h._gibbyFy * r.h * b.scale) + "px";
-        }
-    }
-    wrap._gibbyPaint = paint;
-    function setRect(r) {
-        const n = liveNode(node.id);
-        const g = n && n._gibbyLoadGroup;
-        if (g && g.region) {
-            g.region.value = {
-                x: Math.round(r.x), y: Math.round(r.y),
-                width: Math.round(r.w), height: Math.round(r.h),
-            };
-        }
-        paint();
-    }
-
-    let drag = null;
-    function startDrag(e, dir) {
-        const b = imgBox();
-        if (!b.scale) return;
-        drag = { dir, sx: e.clientX, sy: e.clientY, r: rect(), b };
-        e.target.setPointerCapture(e.pointerId);
-        e.preventDefault();
-    }
-    box.addEventListener("pointerdown", (e) => {
-        if (e.target === box) startDrag(e, "move");
-    });
-    for (const h of handles) {
-        h.addEventListener("pointerdown", (e) => {
-            e.stopPropagation();
-            const n = liveNode(node.id);
-            if (!n) return;
-            // With a locked AR only the corners resize.
-            if (lockedRatio(n) && h._gibbyDir.length !== 2) return;
-            startDrag(e, h._gibbyDir);
-        });
-    }
-    function onPointerMove(e) {
-        if (!drag) return;
-        const b = drag.b;
-        // Pointer deltas are screen px; the overlay follows the canvas zoom.
-        const dx = (e.clientX - drag.sx) / b.screenScale;
-        const dy = (e.clientY - drag.sy) / b.screenScale;
-        const s = drag.r;
-        const ratio = lockedRatio(liveNode(node.id));
-        const r = { x: s.x, y: s.y, w: s.w, h: s.h };
-        if (drag.dir === "move") {
-            r.x = clamp(s.x + dx, 0, Math.max(0, b.W - r.w));
-            r.y = clamp(s.y + dy, 0, Math.max(0, b.H - r.h));
-        } else if (drag.dir === "se") {
-            r.w = clamp(s.w + dx, 1, Math.max(1, b.W - s.x));
-            if (ratio) { r.h = clamp(r.w / ratio, 1, Math.max(1, b.H - s.y)); r.w = r.h * ratio; }
-            else r.h = clamp(s.h + dy, 1, Math.max(1, b.H - s.y));
-        } else if (drag.dir === "e") {
-            r.w = clamp(s.w + dx, 1, Math.max(1, b.W - s.x));
-        } else if (drag.dir === "s") {
-            r.h = clamp(s.h + dy, 1, Math.max(1, b.H - s.y));
-        } else if (drag.dir === "ne") {
-            const bottom = s.y + s.h;
-            r.w = clamp(s.w + dx, 1, Math.max(1, b.W - s.x));
-            if (ratio) { r.h = clamp(r.w / ratio, 1, Math.max(1, bottom)); r.w = r.h * ratio; }
-            else r.h = clamp(s.h - dy, 1, Math.max(1, bottom));
-            r.y = bottom - r.h;
-        } else if (drag.dir === "nw") {
-            const right = s.x + s.w;
-            const bottom = s.y + s.h;
-            r.w = clamp(s.w - dx, 1, Math.max(1, right));
-            if (ratio) { r.h = clamp(r.w / ratio, 1, Math.max(1, bottom)); r.w = r.h * ratio; }
-            else r.h = clamp(s.h - dy, 1, Math.max(1, bottom));
-            r.x = right - r.w;
-            r.y = bottom - r.h;
-        } else if (drag.dir === "sw") {
-            const right = s.x + s.w;
-            r.w = clamp(s.w - dx, 1, Math.max(1, right));
-            if (ratio) { r.h = clamp(r.w / ratio, 1, Math.max(1, b.H - s.y)); r.w = r.h * ratio; }
-            else r.h = clamp(s.h + dy, 1, Math.max(1, b.H - s.y));
-            r.x = right - r.w;
-        } else if (drag.dir === "w") {
-            const right = s.x + s.w;
-            r.w = clamp(s.w - dx, 1, Math.max(1, right));
-            r.x = right - r.w;
-        } else if (drag.dir === "n") {
-            const bottom = s.y + s.h;
-            r.h = clamp(s.h - dy, 1, Math.max(1, bottom));
-            r.y = bottom - r.h;
-        }
-        setRect(r);
-    }
-    function onPointerUp() {
-        drag = null;
-    }
-    for (const el of [box, ...handles]) {
-        el.addEventListener("pointermove", onPointerMove);
-        el.addEventListener("pointerup", onPointerUp);
-        el.addEventListener("pointercancel", onPointerUp);
-    }
-
-    img.onload = () => {
-        wrap._gibbyNatural = { w: img.naturalWidth, h: img.naturalHeight };
-        const n = liveNode(node.id);
-        if (n) {
-            refitCropBox(n);
-            paint();
-        }
-    };
-
-    // Show the current file (called when the combo changes and when the row
-    // is re-added).
-    wrap._gibbyLoad = () => {
-        const url = imagePreviewUrl(liveNode(node.id) || node);
-        if (url) img.src = url;
-        paint();
-    };
-    // Resizing the node resizes the image (the fixed container letterboxes
-    // it); repaint the box to follow (like the core crop editor's resize
-    // observer on its container). The row height is fixed, so no refit - a
-    // manual node height is never fought.
-    new ResizeObserver(() => {
-        paint();
-    }).observe(wrap);
-
-    return wrap;
-}
-
-// Add and remove the load image group's rows (like the context loader's
-// mode widgets): splice node.widgets and keep the widget store in sync so
-// the Vue rows follow. Removed rows are not serialized into the prompt, so
-// the backend falls back to their schema defaults. The image, crop image,
-// crop preview and crop region rows never leave node.widgets and are hidden
-// instead: the first two and the region are required serialized inputs
-// (removing them drops their values from the prompt and the queue fails),
-// and the preview is a DOM widget whose floating element must stay laid out.
+// Add and remove the load image and crop group rows (like the context
+// loader's mode widgets): splice node.widgets and keep the widget store in
+// sync so the Vue rows follow. Removed rows are not serialized into the
+// prompt, so the backend falls back to their schema defaults. The image,
+// crop image, crop preview and crop region rows never leave node.widgets
+// and are hidden instead: the first two and the region are required
+// serialized inputs (removing them drops their values from the prompt and
+// the queue fails), and the preview is a DOM widget whose floating element
+// must stay laid out. The crop group is independent of the load group.
 function syncLoadGroup(node) {
     if (!node || node._removed || !node._gibbyLoadGroup) return;
     const g = node._gibbyLoadGroup;
     const load = !!getWidgetValue(node, "load_image");
-    const crop = load && !!getWidgetValue(node, "crop_image");
+    const crop = !!getWidgetValue(node, "crop_image");
+    // A mask drawn on the preview rewrites the combo to the core editor's
+    // clipspace file; with crop on the box is the mask, so go back to the
+    // original file (the drawn mask is discarded).
+    if (load && crop && isMaskEditorFile(getWidgetValue(node, "image")) && node._gibbyOriginalFile) {
+        g.image.value = node._gibbyOriginalFile;
+    }
+    // The combo holds a file only while load is on (the backend loads it):
+    // restore it when it was cleared while load was off, and clear it when
+    // load goes off - a stale file would hijack the core mask editor, which
+    // loads the combo file over the node's preview as its base image (a mask
+    // editor file is the drawn mask and is kept either way).
+    if (load) {
+        const v = getWidgetValue(node, "image");
+        const nv = v ? String(v).replace(/\s*\[\w+\]$/, "") : "";
+        const opts = g.image.options?.values || [];
+        const hasFile = nv && (isMaskEditorFile(v) || opts.includes(nv) || opts.includes(v));
+        if (!hasFile) g.image.value = node._gibbyOriginalFile || opts[0] || "";
+    } else {
+        const v = getWidgetValue(node, "image");
+        if (v && !isMaskEditorFile(v)) {
+            trackOriginalFile(node, v);
+            setWidgetValue(node, "image", "");
+            clearNodePreview(node);
+        }
+    }
     const widgets = node.widgets || [];
 
     // The upload button is injected by the core; resolve it lazily in case
@@ -594,10 +640,10 @@ function syncLoadGroup(node) {
         if (g.upload) g.addable.push(g.upload);
     }
 
-    // The group rows in display order, after the load_image toggle; the
-    // whole group hides with it. The image/crop image/region rows are always
-    // present (see above) and hidden with the toggle; the upload and AR
-    // toggle rows are removed with it.
+    // The group rows in display order, after the load_image toggle. The
+    // image/crop image/region rows are always present (see above) and hidden
+    // with their toggle; the upload and AR toggle/preview rows are removed
+    // with it.
     let group = [g.image];
     if (load) group.push(g.upload);
     group.push(g.cropImage);
@@ -625,22 +671,30 @@ function syncLoadGroup(node) {
     }
     // The image, crop image, preview and region stay in node.widgets;
     // hiding them (instead of removing them) keeps them in the layout pass
-    // and in the prompt (see above).
+    // and in the prompt (see above). The crop toggle stays visible: the
+    // crop group is independent of the load one.
     if (g.image) setWidgetHidden(g.image, !load);
-    if (g.cropImage) setWidgetHidden(g.cropImage, !load);
     if (g.cropPreview) setWidgetHidden(g.cropPreview, !crop);
     if (g.region) setWidgetHidden(g.region, !crop);
+    // The preview toggle gates only the executed temp preview - the file
+    // preview (load) and the crop preview (crop) are the image UI then.
+    setWidgetHidden(findWidget(node, "enable_preview"), load || crop);
 
-    // Swap the native file preview for the crop preview. The overlay is
-    // store-driven, so the store entry is cleared/re-set to make it react;
-    // hideOutputImages (the core crop nodes' own flag) stays in sync too.
-    const nativePreview = load && !crop;
-    node.hideOutputImages = !nativePreview;
-    if (nativePreview) {
-        setFilePreview(node);
+    // The executed temp preview (the node's own Preview Image) is the image
+    // UI in the default mode - like the core Preview Image, a mask can be
+    // drawn on it; the file preview (the loaded file with its drawn mask)
+    // takes over in load mode, and the crop preview is the image UI in crop
+    // mode (hideOutputImages hides the executed outputs there; in the
+    // default mode the enable preview toggle off does, keeping the last
+    // run's preview in the store for the downstream crop views). An erased
+    // mask (a stale copy of the image it was painted on) leaves the
+    // executed output as the preview - restoreFilePreview.
+    node.hideOutputImages = crop || (!load && !getWidgetValue(node, "enable_preview"));
+    if (!crop) {
+        restoreFilePreview(node);
     } else {
         clearNodePreview(node);
-        if (crop) g.cropPreviewEl?._gibbyLoad?.();
+        g.cropPreviewEl?._gibbyLoad?.();
     }
 
     if (crop) refitCropBox(node);
@@ -693,8 +747,14 @@ function setupResolutionNode(node) {
         // Keep the switcher out of the serialized widget list: it mirrors
         // "mode", and its value as the first positional widgets_values entry
         // shifts every other value by one slot on graph reload.
+        // options.serialize is what the V3 prompt builder reads (serialize
+        // the legacy one).
         modeDom.serialize = false;
-        modeDom.computeLayoutSize = () => ({ minHeight: modeEl.style.display === "none" ? 0 : 26, minWidth: 1 });
+        modeDom.options = { ...(modeDom.options || {}), serialize: false };
+        // Fixed row: with a maxHeight the layout pass never gives it a
+        // share of the node's free height (the crop preview takes it all).
+        const modeH = () => modeEl.style.display === "none" ? 0 : 26;
+        modeDom.computeLayoutSize = () => ({ minHeight: modeH(), maxHeight: modeH(), minWidth: 1 });
     }
 
     // Keep width/height and x/y as standard ComfyUI inputs
@@ -713,24 +773,41 @@ function setupResolutionNode(node) {
         if (!n) return;
         const combo = findWidget(n, "crop_ar");
         if (combo) combo.value = v ? "selected" : "custom";
-        if (getWidgetValue(n, "load_image") && getWidgetValue(n, "crop_image")) {
+        if (getWidgetValue(n, "crop_image")) {
             refitCropBox(n);
         }
     }, { on: "Selected", off: "Custom" });
     if (arToggleW) {
         arToggleW.serialize = false;
+        arToggleW.options = { ...(arToggleW.options || {}), serialize: false };
         arToggleW.label = "Crop AR";
     }
-    const cropEl = buildCropPreview(node);
+    // The shared crop preview: the image the resize uses (cropPreviewUrl)
+    // and the box locked to the node's crop_ar when "selected"
+    // (lockedRatio). No control rows - the node keeps its own
+    // width/height/x/y widgets.
+    const cropEl = buildCropPreview(node, {
+        getUrl: cropPreviewUrl,
+        getRatio: lockedRatio,
+        // Refit the box to the locked AR once the image is loaded (the live
+        // node - a tab switch rebuilds the graph in place).
+        onImageLoad: (n) => refitCropBox(liveNode(n.id) || n),
+    });
     const cropDom = node.addDOMWidget("gibby_crop_preview", "GIBBY_CROP_PREVIEW", cropEl, {
         getValue: () => getWidgetValue(node, "crop_region"),
         setValue: (v) => setWidgetValue(node, "crop_region", v),
     });
     if (cropDom) {
+        // Out of the serialized widget list: the value mirrors
+        // crop_region. options.serialize is what the V3 prompt builder
+        // reads (serialize the legacy one).
         cropDom.serialize = false;
-        cropDom.computeLayoutSize = () => ({ minHeight: CROP_PREVIEW_H, minWidth: 1 });
+        cropDom.options = { ...(cropDom.options || {}), serialize: false };
+        // The preview stretches with the node (no maxHeight).
+        cropDom.computeLayoutSize = () => ({ minHeight: CROP_PREVIEW_MIN_H, minWidth: 1 });
     }
 
+    const enableW = findWidget(node, "enable_preview");
     const loadW = findWidget(node, "load_image");
     const imageW = findWidget(node, "image");
     const cropImageW = findWidget(node, "crop_image");
@@ -765,26 +842,51 @@ function setupResolutionNode(node) {
         uploadW, arToggleW,
     ].filter(Boolean);
 
-    // File combo: a file change updates the store-driven preview only
-    // while the file combo is in use (load on, crop off); with crop on it
-    // refreshes the crop preview instead, and with load off it clears it.
+    // Re-resolve the crop preview's image (the nodeOutput store changed: an
+    // upstream execution replaced the preview it shows).
+    node._gibbyRefreshCropPreview = () => {
+        if (getWidgetValue(node, "crop_image")) {
+            node._gibbyLoadGroup.cropPreviewEl?._gibbyLoad?.();
+        }
+    };
+
+    // File combo: a file change updates the store-driven preview while the
+    // file combo is in use (load on, crop off, or a mask drawn on the
+    // executed preview - the core editor rewrites the combo to its clipspace
+    // file); with crop on it refreshes the crop preview instead, and with
+    // both off a plain file clears it.
     if (imageW && !imageW._gibbyWrapped) {
         imageW._gibbyWrapped = true;
         imageW.callback = function (...args) {
             const n = liveNode(node.id);
             const grp = n && n._gibbyLoadGroup;
             if (!n || !grp) return undefined;
+            trackOriginalFile(n, args[0]);
             const load = !!getWidgetValue(n, "load_image");
-            const crop = load && !!getWidgetValue(n, "crop_image");
-            if (!load) {
-                clearNodePreview(n);
-            } else if (crop) {
+            const crop = !!getWidgetValue(n, "crop_image");
+            if (crop) {
                 clearNodePreview(n);
                 grp.cropPreviewEl?._gibbyLoad?.();
+            } else if (load || isMaskEditorFile(args[0])) {
+                restoreFilePreview(n);
             } else {
-                setFilePreview(n);
+                clearNodePreview(n);
             }
             return undefined;
+        };
+    }
+    // Enable preview: re-apply the preview state (off hides the last run's
+    // preview on the node - it is kept in the store, which downstream crop
+    // views read the context's image from).
+    if (enableW && !enableW._gibbyWrapped) {
+        enableW._gibbyWrapped = true;
+        const prev = enableW.callback;
+        enableW.callback = function (...args) {
+            if (prev) {
+                try { prev.apply(this, args); } catch (e) { /* ignore */ }
+            }
+            const n = liveNode(node.id);
+            if (n) syncLoadGroup(n);
         };
     }
     // The load/crop toggles add and remove their rows.
@@ -812,7 +914,7 @@ function setupResolutionNode(node) {
                     try { prev.apply(this, args); } catch (e) { /* ignore */ }
                 }
                 const n = liveNode(node.id);
-                if (n && n._gibbyLoadGroup && getWidgetValue(n, "load_image") && getWidgetValue(n, "crop_image")) {
+                if (n && n._gibbyLoadGroup && getWidgetValue(n, "crop_image")) {
                     refitCropBox(n);
                 }
             };
@@ -829,16 +931,17 @@ function setupResolutionNode(node) {
                 try { prev.apply(this, args); } catch (e) { /* ignore */ }
             }
             const n = liveNode(node.id);
-            if (n && n._gibbyLoadGroup && getWidgetValue(n, "load_image") && getWidgetValue(n, "crop_image")) {
+            if (n && n._gibbyLoadGroup && getWidgetValue(n, "crop_image")) {
                 n._gibbyLoadGroup.cropPreviewEl?._gibbyPaint?.();
             }
         };
     }
 
     // Row order: the switcher on top, the size rows, then the load image
-    // group at the bottom - the crop rows under the crop toggle, the
-    // x/y/width/height row under the crop preview.
-    const loadGroup = [loadW, imageW, uploadW, cropImageW, arToggleW, cropDom, cropArW, regionW].filter(Boolean);
+    // group at the bottom - the preview toggle above the load image toggle,
+    // the crop rows under the crop toggle, the x/y/width/height row under
+    // the crop preview.
+    const loadGroup = [enableW, loadW, imageW, uploadW, cropImageW, arToggleW, cropDom, cropArW, regionW].filter(Boolean);
     const ordered = [modeDom];
     for (const w of node.widgets) {
         if (w !== modeDom && !loadGroup.includes(w) && !ordered.includes(w)) {
@@ -851,6 +954,7 @@ function setupResolutionNode(node) {
     node.widgets.splice(0, node.widgets.length, ...ordered);
     syncNodeWidgetOrder(node);
 
+    trackOriginalFile(node);
     refreshModeVisibility(node);
     syncLoadGroup(node);
     // Delay paint to ensure DOM is ready
@@ -907,6 +1011,26 @@ app.registerExtension({
             refreshModeVisibility(this);
         };
 
+        // The executed temp preview replaces the file preview in the store on
+        // every run; restore the file preview while the combo holds one
+        // (restoreFilePreview) - the loaded file in load mode, or a mask
+        // drawn on the preview in default mode, so the mask stays on top of
+        // the image. An erased mask leaves the executed output as the
+        // preview instead, like a plain run.
+        // Deferred to a macrotask: the store subscription is batched, so a
+        // same-tick restore would hide the temp preview from it and the
+        // downstream crop preview would never see the run's output.
+        const origOnExecuted = nodeType.prototype.onExecuted;
+        nodeType.prototype.onExecuted = function (output) {
+            if (origOnExecuted) {
+                try { origOnExecuted.apply(this, arguments); } catch (e) { /* ignore */ }
+            }
+            const n = liveNode(this.id) || this;
+            if (!n || n._removed) return;
+            if (getWidgetValue(n, "crop_image") || !filePreviewActive(n)) return;
+            setTimeout(() => restoreFilePreview(liveNode(n.id) || n), 0);
+        };
+
         // Widget values restore positionally by default, and lists saved
         // while the DOM switcher sat in node.widgets carry its value as the
         // first positional entry, shifting every other value by one slot.
@@ -918,7 +1042,9 @@ app.registerExtension({
             origConfigure.apply(this, arguments);
 
             if (data && data.widgets_values_named) {
-                for (const name of CANONICAL_WIDGETS) {
+                // enable_preview postdates the positional order (see
+                // CANONICAL_WIDGETS); restore it by name here.
+                for (const name of [...CANONICAL_WIDGETS, "enable_preview"]) {
                     let w = findWidget(this, name);
                     // Rows currently removed from node.widgets live on the
                     // load group; restore there so they come back with the
@@ -939,10 +1065,36 @@ app.registerExtension({
                 }
             }
 
+            trackOriginalFile(this);
             refreshModeVisibility(this);
             // The saved toggles may differ from the schema defaults the group
             // started with; re-apply the rows.
             syncLoadGroup(this);
         };
+    },
+    // The crop preview's image lives in the nodeOutput store (the loaded
+    // file, an upstream node's last-run image, or a context node's executed
+    // image) - refresh every resize node's crop preview whenever the store
+    // changes.
+    setup() {
+        const refreshAll = () => {
+            const graph =
+                (app.canvas && app.canvas.getCurrentGraph && app.canvas.getCurrentGraph()) ||
+                app.graph;
+            if (!graph) return;
+            for (const n of graph.nodes || []) {
+                if (n?.type === NODE_TYPE) n._gibbyRefreshCropPreview?.();
+            }
+        };
+        const subscribe = () => {
+            const store = frontendStore("nodeOutput");
+            if (!store?.$subscribe) {
+                // The Vue app is not mounted yet - retry shortly.
+                setTimeout(subscribe, 100);
+                return;
+            }
+            store.$subscribe(refreshAll);
+        };
+        subscribe();
     },
 });

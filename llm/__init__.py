@@ -41,7 +41,7 @@ from .llamacpp_client import (
     unsloth_load,
     unsloth_unload,
 )
-from ..pipes.media_pipe import slot_order, pipe_add_images
+from ..pipes.media_pipe import iter_numbered_slots, pipe_add_images
 from .llamacpp_refs import MAX_REF_SLOTS, _is_frame_batch, collect_reference_images, encode_image_batch
 from .llamacpp_shared import filter_enabled_options
 
@@ -582,8 +582,7 @@ class GibbyGenerate(io.ComfyNode):
 
         # Pipe refs and keyframes lead, the wired slots append to them.
         pipe = media_pipe or {}
-        pipe_refs = [v for k, v in sorted((pipe.get("ref_images") or {}).items(),
-                                           key=lambda kv: slot_order(kv[0])) if v is not None]
+        pipe_refs = [value for _index, _name, value in iter_numbered_slots(pipe.get("ref_images") or {}, "ref_image")]
         kf_imgs = list(pipe.get("keyframes") or [])
 
         images_b64 = []
@@ -655,10 +654,9 @@ format: {format}
         # refs too, native Video objects don't - H3 needs raw frames. The
         # generated text overwrites the prompt, so the pipe carries the LLM's
         # description of the refs forward (an empty reply keeps the old one).
-        out_pipe = pipe_add_images(media_pipe, [images[name] for name in sorted(images or {}, key=slot_order)
-                                                 if (images or {}).get(name) is not None])
-        videos = {name: video[name] for name in sorted(video or {}, key=slot_order)
-                  if (video or {}).get(name) is not None and _is_frame_batch(video[name])}
+        out_pipe = pipe_add_images(media_pipe, [value for _index, _name, value in iter_numbered_slots(images or {}, "images")])
+        videos = {name: value for _index, name, value in iter_numbered_slots(video or {}, "video")
+                  if _is_frame_batch(value)}
         if videos:
             out_pipe["ref_videos"] = {**(out_pipe.get("ref_videos") or {}), **videos}
         if result_text and result_text.strip():

@@ -80,15 +80,11 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 **Group Header Toggles** - three small buttons (queue / bypass / mute) in the top-right corner of each group header. Active by default, available in settings. Stolen from [rgthree](https://github.com/rgthree/rgthree-comfy).
 
-**Resize Image / Empty Latent (Context)** - creates empty latent or resizes connectd image/mask allowing to keep proportions. Optional vae overrides the context's vae; encoded_latent outputs the image encoded with it (empty_latent when no image or vae). Always outputs a context - without a context input it creates a new one with width, height and the empty latent.
+**Resize Image / Empty Latent (Context)** - creates empty latent or resizes connectd image/mask allowing to keep proportions. Optional vae overrides the context's vae; encoded_latent outputs the image encoded with it (empty_latent when no image or vae). Always outputs a context - without a context input it creates a new one with width, height and the empty latent. `Enable preview` toggle (off by default, hidden while load image / crop image is on) writes and shows the output image's temp preview in the node on execution; off writes no preview file at all (while load / crop is on the preview is always written - downstream crop views read the context's image from it).
 
 **Reference Latent (Context)** - faster flux2/klein referenes, rescale all to the `megapixels` target then to `scale` (0 = own size), floored to the VAE's downscale ratio (2x for qwen image 2.1, so the latents splice at the vision slots) and the prompts are also re-encoded with the images. `ref_ctx_img` additionally references the context's own image at its own size (always when no image is linked, otherwise only when enabled); with no context image the first image becomes the context image and is stored back on the output context. A media pipe's reference images are referenced too - the wired images append to them in the output pipe. Without a context input it is just a media pipe creator: the wired images append to the pipe and the context passes through empty.
 
 **Image Saver (Context)** - saves image with a1111 metadata (civit compatible) created from context values. Ripoff from [ImageSaver](https://github.com/alexopus/ComfyUI-Image-Saver) pack.
-
-**Crop Image (Context)** - (temp name) like native Crop Image, but outputs mask, bbox, pos and neg coords to be used with segm.
-
-**Pause Execution** - blocks execution in place (counts down the timeout, optional ding via `emit_sound`) until you click Continue (requeues the prompt - the pausing nodes let the restart through without pausing again) or Stop (interrupts the run); a timeout auto-resolves the pause (continue or stop workflow). `pause_flow` off passes straight through. Stolen from Succy Pack.
 
 ## MiniMax H3
 

@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
-import requests
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
@@ -47,7 +46,9 @@ from comfy.sd1_clip import escape_important, unescape_important, token_weights
 from comfy_api.latest import io
 
 from .context import _CONTEXT_TYPE, ctx_from, ctx_size, ctx_set_image
-from .lora_loader import _format_lora_tag, _get_or_fetch_lora_civitai_info, _hash_file_sync, _lora_hash_for, iter_lora_stack
+from .lora_loader import (_civitai_get_json, _format_lora_tag, _get_or_fetch_lora_civitai_info,
+                           _hash_entry_fresh, _hash_file_sync, _lora_hash_for, _load_json_cache,
+                           _remember_hash_entry, _save_json_cache, iter_lora_stack)
 
 
 # --- File path matching (ComfyUI-Image-Saver/utils.py) -----------------------
@@ -123,27 +124,6 @@ def _get_file_path_match(folder_name: str, file_name: str, supported_extensions=
     return str(matching_file_path) if matching_file_path is not None else None
 
 
-def _http_get_json(url: str):
-    try:
-        response = requests.get(url, timeout=300)
-    except requests.exceptions.Timeout:
-        print(f"Gibby Image Saver: HTTP GET Request timed out for {url}")
-        return None
-    except requests.exceptions.ConnectionError as e:
-        print(f"Gibby Image Saver: Warning - Network connection error for {url}: {e}")
-        return None
-
-    if not response.ok:
-        print(f"Gibby Image Saver: HTTP GET Request failed with error code: {response.status_code}: {response.reason}")
-        return None
-
-    try:
-        return response.json()
-    except ValueError as e:
-        print(f"Gibby Image Saver: HTTP Response JSON error: {e}")
-    return None
-
-
 # --- Model info cache (hashes + Civitai data; JSON instead of .sha256/.civitai.info files)
 
 _PLUGIN_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -151,19 +131,11 @@ _MODEL_INFO_CACHE_PATH = os.path.join(_PLUGIN_ROOT, "model_info_cache.json")
 
 
 def _load_model_info_cache() -> dict:
-    try:
-        with open(_MODEL_INFO_CACHE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    return _load_json_cache(_MODEL_INFO_CACHE_PATH)
 
 
 def _save_model_info_cache(cache: dict):
-    try:
-        with open(_MODEL_INFO_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2)
-    except Exception as e:
-        print(f"Gibby Image Saver: could not save model info cache: {e}")
+    _save_json_cache(_MODEL_INFO_CACHE_PATH, cache)
 
 
 def _model_hash_for(model_path: str):
@@ -171,22 +143,15 @@ def _model_hash_for(model_path: str):
     if not model_path or not os.path.isfile(model_path):
         return None
 
-    stat = os.stat(model_path)
     name = os.path.basename(model_path)
+    stat = os.stat(model_path)
     cache = _load_model_info_cache()
     entry = cache.get(name, {})
-
-    if (
-        entry.get("hash")
-        and entry.get("size") == stat.st_size
-        and entry.get("mtime") == stat.st_mtime
-    ):
+    if _hash_entry_fresh(entry, stat):
         return entry["hash"]
 
     digest = _hash_file_sync(model_path)
-    entry.update({"hash": digest, "size": stat.st_size, "mtime": stat.st_mtime})
-    cache[name] = entry
-    _save_model_info_cache(cache)
+    _remember_hash_entry(cache, _save_model_info_cache, name, stat, digest)
     return digest
 
 
@@ -335,11 +300,12 @@ def _get_model_civitai_info(filepath: str | None, model_hash: str) -> dict[str, 
 def _download_model_info(model_hash: str) -> dict[str, object] | None:
     print(f"Gibby Image Saver: Downloading model info for '{model_hash}'.")
 
-    content = _http_get_json(f'https://civitai.red/api/v1/model-versions/by-hash/{model_hash.upper()}')
-    if content is None:
+    try:
+        content = _civitai_get_json(f'https://civitai.red/api/v1/model-versions/by-hash/{model_hash.upper()}')
+        parent_model = _civitai_get_json(f'https://civitai.red/api/v1/models/{content["modelId"]}')
+    except Exception as e:
+        print(f"Gibby Image Saver: Civitai download error for '{model_hash}': {e}")
         return None
-    model_id = content["modelId"]
-    parent_model = _http_get_json(f'https://civitai.red/api/v1/models/{model_id}')
     if not parent_model:
         parent_model = {}
 

@@ -38,10 +38,8 @@ from .image_saver import GibbyImageSaverContext
 from .pipes.h3_pipe import H3PipeCreate, H3PipeApply
 from .reference_latent_context import GibbyReferenceLatentContext
 from .pipes.pipe_any import PipeAny
-from .crop_paste.crop_image import GibbyCropImage
 from .crop_paste.crop_image_by_mask import GibbyCropImageByMaskBatch
 from .crop_paste.paste_image_by_mask import GibbyPasteImageByMaskBatch
-from .pause_execution import GibbyPauseExecution
 from .ksampler_options.clear_vram import GibbyClearVramOptions
 from .ksampler_options.color_match import GibbyColorMatchOptions
 from .ksampler_options.crop_inpaint import GibbyCropInpaintOptions
@@ -86,18 +84,20 @@ try:
     # lora_loader.js for the Lora Loader rows, fast_groups.js for the Fast
     # Groups Muter / Bypasser nodes, group_header_toggles.js for the queue/
     # bypass/mute buttons on group headers, context.js for Context suggestions,
-    # and resolution_latent.js for Resize Image / Empty Latent (Context)'s mode switcher.
+    # resolution_latent.js for Resize Image / Empty Latent (Context)'s mode
+    # switcher and crop preview, and crop_preview.js for the shared crop
+    # preview it uses.
     for _rel in (
         "lora_loader/lora_loader.js",
         "fast_groups.js",
         "group_header_toggles.js",
         "context/context.js",
         "context/context_loader.js",
+        "crop_preview.js",
         "resolution_latent/resolution_latent.js",
         "ksampler_context/ksampler_context.js",
         "llm/llm.js",
         "node_runtime.js",
-        "pause_execution/pause_execution.js",
     ):
         PromptServer.instance.routes.get(
             f"/extensions/{_FOLDER_NAME}/{_rel}"
@@ -124,7 +124,7 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImage, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, GibbyPauseExecution, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySplitTiles, GibbyTiledVaeOptions]
+        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySplitTiles, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

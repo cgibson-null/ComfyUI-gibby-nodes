@@ -10,7 +10,7 @@ conditionings from them).
 import comfy.samplers
 from comfy_api.latest import io
 
-from . import _CONTEXT_TYPE, recondition_prompts, ctx_from, ctx_set_image
+from . import _CONTEXT_TYPE, recondition_prompts, set_sampling, ctx_from, ctx_set_image
 
 
 class GibbyContextOverride(io.ComfyNode):
@@ -83,11 +83,7 @@ class GibbyContextOverride(io.ComfyNode):
 
         # Sampling parameters, only when the toggle is on.
         if override_sampling:
-            ctx["steps"] = steps
-            ctx["step_refiner"] = step_refiner
-            ctx["cfg"] = cfg
-            ctx["sampler"] = sampler
-            ctx["scheduler"] = scheduler
+            set_sampling(ctx, steps, step_refiner, cfg, sampler, scheduler)
 
         # Prompts plus regenerated conditionings, only when the toggle is on. The
         # re-encode is grafted onto the existing conditionings so reference payloads

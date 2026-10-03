@@ -20,7 +20,7 @@ from comfy_extras.nodes_minimax_h3 import (
     CANVAS_MULTIPLE, REF_IMAGE_SHORT_EDGE, FPS,
 )
 from ..context import _CONTEXT_TYPE, ctx_from
-from .media_pipe import slot_order
+from .media_pipe import iter_numbered_slots
 
 
 def _snap_frames(n):
@@ -132,10 +132,7 @@ def _build_ref_blocks_and_items(vae, audio_vae, frame_count, width, height, ref_
     """Shared helper: encode all refs into blocks + tokenization hints"""
     ref_items, ref_blocks = [], []
 
-    for name in sorted((ref_images or {}), key=slot_order):
-        img = ref_images[name]
-        if img is None:
-            continue
+    for _index, _name, img in iter_numbered_slots(ref_images or {}, "ref_image"):
         h, w = img.shape[1], img.shape[2]
         scale = (min(1.0, math.sqrt((width * height) / (w * h)))
                  if ref_image_size == "match"
@@ -148,11 +145,8 @@ def _build_ref_blocks_and_items(vae, audio_vae, frame_count, width, height, ref_
                            "latent_w": tw // 16, "latent": vae.encode(resized)})
 
     ref_video_audios = ref_video_audios or {}
-    for name in sorted((ref_videos or {}), key=slot_order):
-        video_frames = ref_videos[name]
-        if video_frames is None:
-            continue
-        soundtrack = ref_video_audios.get("ref_video_audio_" + name.rsplit("_", 1)[-1])
+    for index, _name, video_frames in iter_numbered_slots(ref_videos or {}, "ref_video"):
+        soundtrack = ref_video_audios.get(f"ref_video_audio_{index}")
         vh, vw = video_frames.shape[1], video_frames.shape[2]
         cw, ch = adapt_canvas(vw, vh)
         if vw * vh < cw * ch:
@@ -177,10 +171,7 @@ def _build_ref_blocks_and_items(vae, audio_vae, frame_count, width, height, ref_
                            "latent_w": cw // 16, "ref_audio_t": ref_audio_t,
                            "latent": video_latent, "audio_latent": audio_latent})
 
-    for name in sorted((ref_audios or {}), key=slot_order):
-        audio = ref_audios[name]
-        if audio is None:
-            continue
+    for _index, _name, audio in iter_numbered_slots(ref_audios or {}, "ref_audio"):
         audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)
         ref_items.append({"type": "audio"})
         ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t,

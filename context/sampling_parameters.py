@@ -11,7 +11,7 @@ import comfy.samplers
 from nodes import MAX_RESOLUTION
 from comfy_api.latest import io
 
-from . import _CONTEXT_TYPE, ctx_from
+from . import _CONTEXT_TYPE, set_sampling, ctx_from
 
 
 class GibbySamplingParametersContext(io.ComfyNode):
@@ -52,10 +52,6 @@ class GibbySamplingParametersContext(io.ComfyNode):
     def execute(cls, context=None, steps_total=30, refiner_step=24, cfg=8.0, sampler_name="euler", scheduler="normal") -> io.NodeOutput:
         ctx = ctx_from(context)
         # Widget values override the matching context fields.
-        ctx["steps"] = steps_total
-        ctx["step_refiner"] = refiner_step
-        ctx["cfg"] = cfg
-        ctx["sampler"] = sampler_name
-        ctx["scheduler"] = scheduler
+        set_sampling(ctx, steps_total, refiner_step, cfg, sampler_name, scheduler)
 
         return io.NodeOutput(ctx, steps_total, refiner_step, cfg, sampler_name, scheduler)

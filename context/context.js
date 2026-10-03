@@ -14,8 +14,27 @@ import { app } from "../../../scripts/app.js";
 // registration (including subgraph types registered when a workflow loads) and
 // on suggestion-count changes, which wipes a one-time patch - so the append is
 // re-applied after each rebuild by hooking the core extension's setDefaults.
+//
+// The menu renders list entries as-is and creates the clicked entry as a node
+// - plain class names therefore show as ids (GibbyLoraLoader). Object
+// entries {node: className, title: label} are natively supported by both
+// paths, so entries are converted to that form to show display names instead.
 
 const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO", "GIBBY_TILING_INFO", "LORA_STACK", "LLAMACPP_CONNECTIVITY", "LLAMACPP_OPTIONS"];
+
+const classToDisplay = new Map(); // comfyClass -> display_name (when different)
+
+function entryName(entry) {
+    return typeof entry === "string" ? entry : entry.node;
+}
+
+function displayEntry(entry) {
+    if (typeof entry === "string") {
+        const display = classToDisplay.get(entry);
+        if (display) return {node: entry, title: display};
+    }
+    return entry;
+}
 
 // Autogrow inputs (COMFY_AUTOGROW_V3) hide their real type inside
 // spec.template.input - e.g. Merge KSampler Options' option1...option10.
@@ -78,8 +97,8 @@ function track(nodeType, nodeData) {
 function applySuggestions() {
     const sortSuggestions = (suggestions) => {
         const items = suggestions.slice().sort((a, b) => {
-            const nameA = (a.content || String(a)).toLowerCase();
-            const nameB = (b.content || String(b)).toLowerCase();
+            const nameA = (a.title || entryName(a)).toLowerCase();
+            const nameB = (b.title || entryName(b)).toLowerCase();
             return nameA.localeCompare(nameB);
         });
         for (let i = 0; i < suggestions.length; i++) {
@@ -93,8 +112,9 @@ function applySuggestions() {
             LiteGraph.slot_types_default_out[type] ||
             (LiteGraph.slot_types_default_out[type] = ["Reroute"]);
         for (const t of inputTypes.get(type) || []) {
-            if (!outSuggestions.includes(t)) outSuggestions.push(t);
+            if (!outSuggestions.some((e) => entryName(e) === t)) outSuggestions.push(t);
         }
+        for (let i = 0; i < outSuggestions.length; i++) outSuggestions[i] = displayEntry(outSuggestions[i]);
         sortSuggestions(outSuggestions);
 
         // Dragging into an input of this type: nodes that produce it
@@ -102,9 +122,18 @@ function applySuggestions() {
             LiteGraph.slot_types_default_in[type] ||
             (LiteGraph.slot_types_default_in[type] = ["Reroute"]);
         for (const t of outputTypes.get(type) || []) {
-            if (!inSuggestions.includes(t)) inSuggestions.push(t);
+            if (!inSuggestions.some((e) => entryName(e) === t)) inSuggestions.push(t);
         }
+        for (let i = 0; i < inSuggestions.length; i++) inSuggestions[i] = displayEntry(inSuggestions[i]);
         sortSuggestions(inSuggestions);
+    }
+
+    // Core-owned lists (standard types) get the same display-name treatment.
+    for (const lists of [LiteGraph.slot_types_default_out, LiteGraph.slot_types_default_in]) {
+        for (const type in lists) {
+            const entries = lists[type];
+            for (let i = 0; i < entries.length; i++) entries[i] = displayEntry(entries[i]);
+        }
     }
 }
 
@@ -128,6 +157,9 @@ app.registerExtension({
         hookSlotDefaults();
     },
     beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData?.display_name && nodeData.display_name !== nodeType.comfyClass) {
+            classToDisplay.set(nodeType.comfyClass, nodeData.display_name);
+        }
         track(nodeType.comfyClass, nodeData);
         hookSlotDefaults();
         applySuggestions();

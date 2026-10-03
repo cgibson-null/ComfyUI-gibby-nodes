@@ -26,10 +26,9 @@ from comfy_extras.nodes_audio import VAEEncodeAudio
 from comfy_extras.nodes_lt import LTXVConcatAVLatent
 from comfy_api.latest import io
 
-from ..lora_loader import _apply_lora, iter_lora_stack
+from ..lora_loader import _apply_lora, _lora_stack, iter_lora_stack
 
 _CONTEXT_TYPE = io.Custom("CONTEXT")
-_lora_stack = io.Custom("LORA_STACK")
 # The crop nodes' originals/mask/rects payload, carried in the context's crop_info
 _CROP_INFO_TYPE = io.Custom("GIBBY_CROP_INFO")
 
@@ -56,6 +55,15 @@ def ctx_set_image(ctx, image):
     them."""
     ctx["image"] = image
     drop_image_derived(ctx)
+
+
+def set_sampling(ctx, steps, step_refiner, cfg, sampler, scheduler):
+    """Override the context's sampling parameters (steps, step_refiner, cfg, sampler, scheduler)."""
+    ctx["steps"] = steps
+    ctx["step_refiner"] = step_refiner
+    ctx["cfg"] = cfg
+    ctx["sampler"] = sampler
+    ctx["scheduler"] = scheduler
 
 
 def _latent_downscale(vae, channels):

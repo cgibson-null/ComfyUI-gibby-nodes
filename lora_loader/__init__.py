@@ -78,20 +78,28 @@ _civitai_settings = {
 # in a small local JSON file, keyed by lora filename, so they're shared by
 # every node instance and survive restarts.
 
-def _load_info_cache():
+def _load_json_cache(path):
     try:
-        with open(_INFO_CACHE_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
-def _save_info_cache(cache):
+def _save_json_cache(path, cache):
     try:
-        with open(_INFO_CACHE_PATH, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2)
     except Exception as e:
-        logging.warning(f"[Lora Loader] Could not save info cache: {e}")
+        logging.warning(f"[Gibby] Could not save {os.path.basename(path)}: {e}")
+
+
+def _load_info_cache():
+    return _load_json_cache(_INFO_CACHE_PATH)
+
+
+def _save_info_cache(cache):
+    _save_json_cache(_INFO_CACHE_PATH, cache)
 
 
 def _hash_file_sync(path):
@@ -100,6 +108,20 @@ def _hash_file_sync(path):
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _hash_entry_fresh(entry, stat):
+    """Whether a hash-cache entry still matches the file (hash present, same size and mtime)."""
+    return bool(entry.get("hash")) and entry.get("size") == stat.st_size and entry.get("mtime") == stat.st_mtime
+
+
+def _remember_hash_entry(cache, save_cache, name, stat, hash_, **extra):
+    """Record hash_ (+ extra fields) for a file in the cache under name, with the
+    file's size and mtime for the freshness check; saves the cache."""
+    entry = cache.get(name, {})
+    entry.update({"hash": hash_, "size": stat.st_size, "mtime": stat.st_mtime, **extra})
+    cache[name] = entry
+    save_cache(cache)
 
 
 def _lora_hash_for(lora_name):
@@ -112,18 +134,11 @@ def _lora_hash_for(lora_name):
     stat = os.stat(path)
     cache = _load_info_cache()
     entry = cache.get(lora_name, {})
-
-    if (
-        entry.get("hash")
-        and entry.get("size") == stat.st_size
-        and entry.get("mtime") == stat.st_mtime
-    ):
+    if _hash_entry_fresh(entry, stat):
         return entry["hash"]
 
     digest = _hash_file_sync(path)
-    entry.update({"hash": digest, "size": stat.st_size, "mtime": stat.st_mtime})
-    cache[lora_name] = entry
-    _save_info_cache(cache)
+    _remember_hash_entry(cache, _save_info_cache, lora_name, stat, digest)
     return digest
 
 
@@ -194,39 +209,28 @@ async def _get_local_lora_metadata(lora_name):
     stat = os.stat(path)
     cache = _load_info_cache()
     entry = cache.get(lora_name, {})
-
-    if (
-        entry.get("hash")
-        and entry.get("size") == stat.st_size
-        and entry.get("mtime") == stat.st_mtime
-    ):
+    if _hash_entry_fresh(entry, stat):
         return entry["hash"], entry.get("trained_words", [])
 
     digest, trained_words = await get_event_loop().run_in_executor(
         None, _read_local_lora_metadata_sync, path
     )
-    entry.update(
-        {
-            "hash": digest,
-            "size": stat.st_size,
-            "mtime": stat.st_mtime,
-            "trained_words": trained_words,
-        }
-    )
-    cache[lora_name] = entry
-    _save_info_cache(cache)
+    _remember_hash_entry(cache, _save_info_cache, lora_name, stat, digest, trained_words=trained_words)
     return digest, trained_words
 
 
 # --- Civitai lookup (owned here, shared with Image Saver) ---------------------
 
+def _civitai_get_json(url, timeout=30):
+    """GET a Civitai API url and return the parsed JSON; raises on failure."""
+    req = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-GibbyLoraLoader"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def _fetch_civitai_by_hash(digest):
     """Fetch a model version's raw Civitai API data by hash; raises on failure."""
-    url = f"https://civitai.red/api/v1/model-versions/by-hash/{digest.upper()}"
-    headers = {"User-Agent": "ComfyUI-GibbyLoraLoader"}
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return _civitai_get_json(f"https://civitai.red/api/v1/model-versions/by-hash/{digest.upper()}")
 
 
 def _get_excluded_words():
