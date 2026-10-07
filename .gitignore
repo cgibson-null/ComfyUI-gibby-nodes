@@ -16,6 +16,7 @@ env/
 
 # Local agent instructions (never committed)
 AGENTS.md
+.pi/
 
 # OS
 .DS_Store

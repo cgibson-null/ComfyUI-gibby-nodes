@@ -41,11 +41,11 @@ Use **inputs** to override context values (override happens first, so output con
 - `value < 0` - offset from the end (e.g. -5 = last 5 steps)
 - `value ≥ 1` - absolute step number
 
-**Denoise:** only applies when an image is present, otherwise forced to 1.0.
+**Denoise:** only applies when an image is present, otherwise forced to 1.0. Always slices the schedule, so start/end step narrow the denoised range instead of cancelling the denoise. flux2 models sample with the Flux2 schedule for the sampled size, denoise takes its low-noise tail exactly like `Flux2Scheduler` -> `SplitSigmasDenoise` (`low_sigmas`).
 
 **Decode:** on by default. Decodes the output latent to image/audio/both and removes latent from context. An image whose size is not a multiple of the VAE's downscale ratio is pre-scaled to it before encoding, and the decoded image is stretched back to the original size, so the content stays aligned with the original. Disable to skip decoding in case you're chaining ksamplers (wan high pass).
 
-**Options:** connect options nodes to the `options` input - **Crop-Inpaint options**, **Iterative Options**, **Lora Travel options**, **Tiled VAE options**, **Clear VRAM options**, or **Merge KSampler Options** (dynamic `option1…option10` inputs that append several options lists into one).
+**Options:** connect options nodes to the `options` input - **Crop-Inpaint options**, **Iterative Options**, **Lora Travel options**, **Tiled VAE options**, **Clear VRAM options**, **DyPE options**, or **Merge KSampler Options** (dynamic `option1…option10` inputs that append several options lists into one).
 
 **Crop-Inpaint options** - allows crop area per mask, configure boundaries and resolution, and inpaint it at proper size, then paste back onto original.
 
@@ -55,6 +55,8 @@ Crop-Inpaint options and Iterative Options are inclusive, meaning can be used to
 **Lora Travel options** - dynamically change loras strength per step; str values in node are multipliers for value set in lora loader, unless it's 0 - then they are applied as actual str; can be used per iteration.
 
 **Clear VRAM options** frees VRAM like [Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use)'s Clean VRAM Used.
+
+**DyPE options** - needs the [DyPE](https://github.com/wildminder/ComfyUI-DyPE) pack. dype/sega/spa patch the model for high-resolution generation, so every other feature applies to them. pixelrush/freescale/hiflow cascade the context's latent instead of sampling it: the context mask keeps everything outside it from the pre-cascade latent, the seed drives their noise, and 0 on their guidance/steps widgets means the context's value. What a cascade can't hook (its own sampler and schedule) is named on the console: connected sampler or sigmas, start/end step, denoise, lora/prompt travel, and the crop-inpaint / iterative upscale steps.
 
 **Tiled VAE options** - self-explanatory.
 

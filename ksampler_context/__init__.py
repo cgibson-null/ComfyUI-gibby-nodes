@@ -15,7 +15,9 @@ Key behaviors:
 - Crop-inpaint with an empty mask has no regions to inpaint: sampling is
   skipped entirely and the image passes through
 - Handles start_step/end_step as offsets from total steps when negative
-- Automatically uses Flux2Scheduler for Flux2 models
+- Flux2 models use the Flux2 schedule for the sampled size; denoise takes that
+  schedule's low-noise tail (like the native SplitSigmasDenoise) and start/end
+  steps then slice the result
 - Updates context after sampling (removes latent/mask, stores decoded image)
 - Options are applied in list order: crop-inpaint and iterative upscale run
   before evaluate, tiled VAE settings apply to encode/decode, clear VRAM
@@ -28,6 +30,15 @@ Key behaviors:
   prompts are re-encoded grafted onto the context conditionings so
   reference payloads (flux2 reference_latents, h3 minimax refs/keyframes) survive;
   the options output returns the (updated) options for feeding back in
+- DyPE options (soft dependency on the ComfyUI-DyPE pack, see dype_helper.py):
+  dype/sega/spa patch the model, pixelrush/freescale/hiflow take sampling
+  over. A patch is applied per sample at the size actually being sampled, so
+  combined with the iterative upscale every step is patched to its own new
+  resolution; the patch never leaves the step, so the outbound context carries
+  the original unpatched model. A cascade seeds the pack's noise from the seed
+  and keeps the context's mask - everything outside it comes back from the
+  pre-cascade latent - and names the features its own sampler and schedule
+  cannot honour
 """
 
 import gc
@@ -54,9 +65,8 @@ except ImportError:
     vae_decode_audio = None
 
 try:
-    from comfy_extras.nodes_flux import Flux2Scheduler, get_schedule
+    from comfy_extras.nodes_flux import get_schedule
 except ImportError:
-    Flux2Scheduler = None
     get_schedule = None
 
 import comfy.utils as _comfy_utils
@@ -65,12 +75,15 @@ from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.nodes_post_processing import ColorTransfer
 from ..context import (_CONTEXT_TYPE, GibbyContext, _recondition_text, _latent_downscale,
                        _image_dims, _latent_dims, _is_flux2, ctx_from, ctx_size,
-                       ensure_conditioning, encode_image, decode_latent)
+                       ensure_conditioning, encode_image, decode_latent,
+                    _mp, _image_count_s, _latent_count_s, _log)
 from ..lora_loader import iter_lora_stack
 from ..ksampler_options.crop_inpaint import _KSAMPLER_OPTIONS_TYPE
 from ..crop_paste.crop_image_by_mask import _process_mask, _mask_box, _cover_crop
 from ..crop_paste.paste_image_by_mask import _paste_back
 from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox
+from .dype_helper import (DYPE_PATCH_METHODS, apply_dype_patch, is_dype_cascade, run_dype_cascade,
+                          warn_cascade_not_in_step, warn_cascade_overrides)
 
 
 def _find_option(options_list, opt_type):
@@ -98,7 +111,7 @@ def _clear_vram(event, verbose=False):
     comfy.model_management.unload_all_models()
     comfy.model_management.soft_empty_cache()
     if verbose:
-        print(f"Gibby KSampler (Context): Clear VRAM: {event}")
+        _log("Clear VRAM", event)
 
 
 def _tiled_settings(options_list):
@@ -292,7 +305,7 @@ def _update_travel_step(travel_state, step, new_row=False):
     if travel_state["verbose"] and active:
         if new_row:
             print()
-        print("Gibby Lora Travel: step {}/{}".format(step + 1, travel_state["steps"]))
+        _log("Lora Travel", "step {}/{}".format(step + 1, travel_state["steps"]))
         for name, s in active.items():
             print("  {}={:.2f}".format(name, s))
 
@@ -538,7 +551,7 @@ def _prepare_prompt_travels(ctx, pos_text, neg_text, steps_value, verbose):
         return None
     clip = ctx.get("clip")
     if clip is None:
-        print("Gibby KSampler (Context): Prompt Travel skipped: the context has no clip")
+        _log("Prompt Travel skipped", "the context has no clip")
         return None
 
     pos_plan = _plan_prompt_travel(pos_text, steps_value)
@@ -601,7 +614,7 @@ def _log_prompt_step(state, step, new_row=False):
         return
     if new_row:
         print()
-    print("Gibby Prompt Travel: step {}/{}".format(step + 1, state["steps"]))
+    _log("Prompt Travel", "step {}/{}".format(step + 1, state["steps"]))
     print("  positive: {}".format(state["positive_text"][step]))
     print("  negative: {}".format(state["negative_text"][step]))
 
@@ -814,23 +827,24 @@ def _log_start(verbose, ctx, seed, steps_value, denoise, start_step=0.0, end_ste
         w, h, length = _latent_dims(ctx.get("latent"), ctx.get("vae"))
     if w in (None, 0):
         w, h = ctx.get("width", 0), ctx.get("height", 0)
-    res = f"{w}x{h}" if w and h else "unknown"
+    res = f"{w}x{h} ({_mp(w, h)} Mp)" if w and h else "unknown"
     length_s = f" length={length} frames" if length else ""
-    print(f"Gibby KSampler (Context) start: model={model_name} steps={_steps_display(steps_value, start_step, end_step)} "
+    _log("start:", f"model={model_name} steps={_steps_display(steps_value, start_step, end_step)} "
           f"cfg={ctx.get('cfg', 8.0)} sampler={ctx.get('sampler', 'euler')} scheduler={ctx.get('scheduler', 'normal')} "
           f"denoise={denoise} seed={seed} resolution={res}{length_s}")
 
 
 def _log_finish(verbose, image, latent, t_start, vae=None):
-    """Console log at the end of a run: resulting resolution and total time."""
+    """Console log at the end of a run: total time, resulting resolution and frame/image count."""
     if not verbose:
         return
-    w, h, length = _image_dims(image)
+    w, h, _ = _image_dims(image)
+    count_s = _image_count_s(image)
     if w is None:
-        w, h, length = _latent_dims(latent, vae)
-    res = f"{w}x{h}" if w and h else "unknown"
-    length_s = f" length={length} frames" if length else ""
-    print(f"Gibby KSampler (Context) finish: resolution={res}{length_s} total_time={time.time() - t_start:.2f}s")
+        w, h, _ = _latent_dims(latent, vae)
+        count_s = _latent_count_s(latent)
+    res = f"{w}x{h} ({_mp(w, h)} Mp)" if w and h else "unknown"
+    _log("finish:", f"total_time={time.time() - t_start:.2f}s resolution={res}{count_s}")
 
 
 def _normalize_mask(mask):
@@ -1038,10 +1052,16 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
                           sigmas_tensor, positive, negative, inpaint_opts,
                           tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                           decode=True, clear_after_model=False, clear_after_vae=False, clear_verbose=False,
-                          verbose=False, travel_state=None, prompt_state=None, step_offset=0, latent=None):
+                          verbose=False, travel_state=None, prompt_state=None, step_offset=0, latent=None,
+                          dype_opt=None):
     """Shared sample step: encode the image (or use the given latent), sample it
     (masked when a mask is present, per the crop-inpaint options), and decode the
-    result. Returns (image, model_obj); image is None when decode is off."""
+    result. Returns (image, model_obj); image is None when decode is off.
+
+    The DyPE patch is applied to this step's own latent size and kept local: the
+    returned model is the unpatched one, so a multi-step caller (iterative
+    upscale, crop-inpaint) re-patches per step at that step's resolution and the
+    context keeps the original model."""
     if image is not None:
         tiled = _tiled_for(image.shape[2], image.shape[1], tiled_above)
     else:
@@ -1061,8 +1081,11 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
                                                  (inpaint_opts or {}).get("inpaint_mode", "masked_only"),
                                                  (inpaint_opts or {}).get("mask_scale_start", 1.0),
                                                  (inpaint_opts or {}).get("mask_scale_end", 1.0))
-    callback = latent_preview.prepare_callback(model_obj, steps_value)
-    samples = _sample_with_travels(model_obj, travel_state, prompt_state, noise, cfg_value, sampler_obj, sigmas_tensor,
+    # DyPE is sized to the grid being sampled, so it is patched per step
+    dype_w, dype_h, _ = _latent_dims(latent, vae)
+    step_model = apply_dype_patch(model_obj, dype_opt, dype_w, dype_h)
+    callback = latent_preview.prepare_callback(step_model, steps_value)
+    samples = _sample_with_travels(step_model, travel_state, prompt_state, noise, cfg_value, sampler_obj, sigmas_tensor,
                                     positive, negative, latent_samples, noise_mask, callback,
                                     not _comfy_utils.PROGRESS_BAR_ENABLED, seed, step_offset)
     # The model is done after sampling: free it before the decode so large
@@ -1080,8 +1103,9 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
 def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
                   sampler_obj, denoise, cfg_value, positive, negative, decode, options_list=None,
                   clear_after_model=False, clear_after_vae=False, clear_verbose=False, verbose=False,
-                  travel_state=None, prompt_state=None):
-    """Crop image by mask bbox, resize, sample each crop, composite back."""
+                  travel_state=None, prompt_state=None, dype_opt=None):
+    """Crop image by mask bbox, resize, sample each crop, composite back.
+    Each crop is sampled with the DyPE patch sized to that crop."""
     image = ctx["image"]
     mask = ctx["mask"]
     vae = ctx.get("vae")
@@ -1090,7 +1114,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
 
     opt_verbose = opts.get("verbose", False)
     if opt_verbose and opts.get("mask_mode", "single") == "split":
-        print(f"Gibby Crop-Inpaint: {len(regions)} masks")
+        _log("Crop-Inpaint", f"{len(regions)} masks")
 
     # Process each region
     megapixels = opts.get("megapixels", 0.0)
@@ -1108,7 +1132,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
         crop_img, crop_mask, (sx0, sy0, src_w, src_h) = _cover_crop(
             src, region_mask, cx, cy, w, h, target_w, target_h, method)
         if opt_verbose:
-            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
+            _log("Crop-Inpaint", f"mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
         # The sigmas are sized to this crop: a Flux2 model gets its schedule
         # (get_schedule) from it
         sigmas_tensor = _calculate_sigmas(model_obj, ctx.get("scheduler", "normal"), steps_value, ctx.get("sampler", "euler"),
@@ -1118,13 +1142,14 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
                                                         tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                                                         decode and vae is not None,
                                                         clear_after_model, clear_after_vae, clear_verbose, verbose,
-                                                        travel_state=travel_state, prompt_state=prompt_state)
+                                                        travel_state=travel_state, prompt_state=prompt_state,
+                                                        dype_opt=dype_opt)
         if refined_crop is not None:
             # Match the crop's color back to the original crop before pasting,
             # so the match is anchored to this region, not the whole image
             refined_crop = _color_match(refined_crop, crop_img, opts)
             if opt_verbose:
-                print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined_crop.shape[2]}x{refined_crop.shape[1]} -> {src_w}x{src_h}")
+                _log("Crop-Inpaint", f"mask {idx + 1}/{len(regions)} composited {refined_crop.shape[2]}x{refined_crop.shape[1]} -> {src_w}x{src_h}")
             _paste_back(src, refined_crop, crop_mask, sx0, sy0, src_w, src_h)
 
     # Without a decode the VAE is done after the last region's encode: free it.
@@ -1146,7 +1171,7 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
                             inpaint_opts=None, tiled_above=None, tile_size=512, overlap=64,
                             temporal_size=64, temporal_overlap=8,
                             clear_after_model=False, clear_after_vae=False, clear_verbose=False, verbose=False,
-                            travel_state=None, prompt_state=None, step_offset=0):
+                            travel_state=None, prompt_state=None, step_offset=0, dype_opt=None):
     """One iterative upscale step: scale image (and mask) to target size, encode, ksample, decode.
     With a mask, each step samples only the masked area (crop-inpaint options control the mask)."""
     if upscale_model is not None:
@@ -1170,7 +1195,8 @@ def _iterative_upscale_step(image, mask, target_w, target_h, method, upscale_mod
                                               tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                                               clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
                                               clear_verbose=clear_verbose, verbose=verbose,
-                                              travel_state=travel_state, prompt_state=prompt_state, step_offset=step_offset)
+                                              travel_state=travel_state, prompt_state=prompt_state, step_offset=step_offset,
+                                              dype_opt=dype_opt)
     return image, mask
 
 
@@ -1179,8 +1205,12 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                        start_step=0.0, end_step=10000.0, leftover_noise=False,
                        inpaint_opts=None,
                        clear_after_model=False, clear_after_vae=False, clear_verbose=False, verbose=False,
-                       travel_state=None, prompt_state=None, steps=0):
+                       travel_state=None, prompt_state=None, steps=0, dype_opt=None):
     """Iterative pixel-space upscale along a linear scale path (simple step mode).
+
+    Every step samples with the DyPE patch sized to that step's target size
+    (dype_opt), so the resolution the patch advertises always matches the grid
+    actually being denoised.
 
     A target size (target_size_image in the options) overrides the upscale
     factor: the final resolution is the provided size, and the per-step scale
@@ -1328,7 +1358,7 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                 next_step = i
             continue
         if opt_verbose:
-            print(f"Gibby Iterative Upscale: step {i}/{total_steps} scale={scale:.2f} size={target_w}x{target_h} denoise={denoise_step:.3f}")
+            _log("Iterative Upscale", f"step {i}/{total_steps} scale={scale:.2f} size={target_w}x{target_h} denoise={denoise_step:.3f}")
         if per_iteration:
             # One strength for the whole iteration: all its sampling steps share it
             _update_travel_step(travel_state, i - 1)
@@ -1343,7 +1373,7 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                                                       clear_verbose=clear_verbose, verbose=verbose,
                                                       travel_state=travel_state, prompt_state=None,
                                                       step_offset=_resolve_step_range(run_steps, start_step, end_step)[0],
-                                                      latent=ctx["latent"])
+                                                      latent=ctx["latent"], dype_opt=dype_opt)
             # Treat the generated image as if it had been provided: it becomes
             # the color match reference for the final step
             if original_image is None:
@@ -1353,7 +1383,8 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
                                                     step_seed, steps_value, cfg_value, sampler_obj, sigmas_tensor, positive, negative, inpaint_opts,
                                                     tiled_above, tile_size, overlap, temporal_size, temporal_overlap,
                                                     clear_after_model, clear_after_vae, clear_verbose, verbose,
-                                                    travel_state, prompt_state, step_offset)
+                                                    travel_state, prompt_state, step_offset,
+                                                    dype_opt=dype_opt)
         next_step = i
 
     # After the final planned step, match the result's color back to the
@@ -1385,17 +1416,18 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
                                cfg_value, sampler_obj, positive, negative,
                                start_step=0.0, end_step=10000.0, leftover_noise=False,
                                clear_after_model=False, clear_after_vae=False, clear_verbose=False, verbose=False,
-                               travel_state=None, prompt_state=None):
+                               travel_state=None, prompt_state=None, dype_opt=None):
     """Iterative inpaint upscale: crop the mask regions (crop-inpaint options), iteratively
     upscale each crop with the mask applied on every step, then composite the refined crops
-    back into the original-resolution image - the result keeps the original size."""
+    back into the original-resolution image - the result keeps the original size.
+    Each crop's steps sample with the DyPE patch sized to that step."""
     image = ctx["image"]
     vae = ctx["vae"]
     mask, regions = _inpaint_regions(image, ctx["mask"], inpaint_opts)
 
     opt_verbose = inpaint_opts.get("verbose", False)
     if opt_verbose and inpaint_opts.get("mask_mode", "single") == "split":
-        print(f"Gibby Crop-Inpaint: {len(regions)} masks")
+        _log("Crop-Inpaint", f"{len(regions)} masks")
 
     # The result stays at the original resolution: each crop is refined by the
     # iterative upscale, then composited back into its original region (the
@@ -1416,7 +1448,7 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
         crop_img, crop_mask, (sx0, sy0, src_w, src_h) = _cover_crop(
             src, region_mask, cx, cy, w, h, target_w, target_h, crop_method)
         if opt_verbose:
-            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
+            _log("Crop-Inpaint", f"mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
         crop_ctx = {"image": crop_img, "mask": crop_mask, "vae": vae,
                     "scheduler": ctx.get("scheduler", "normal"), "sampler": ctx.get("sampler", "euler")}
         # Pass the crop (image + mask) to the iterative upscale
@@ -1424,16 +1456,17 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
                                  steps_value, cfg_value, sampler_obj, positive, negative,
                                  start_step, end_step, leftover_noise, inpaint_opts=inpaint_opts,
                                  clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
-                                 clear_verbose=clear_verbose, verbose=verbose, travel_state=travel_state, prompt_state=prompt_state)
+                                 clear_verbose=clear_verbose, verbose=verbose, travel_state=travel_state, prompt_state=prompt_state,
+                                 dype_opt=dype_opt)
         out_options = out[6]
         refined = out[2]
         # Composite the refined crop back into its original-resolution region
         if opt_verbose:
-            print(f"Gibby Crop-Inpaint: mask {idx + 1}/{len(regions)} composited {refined.shape[2]}x{refined.shape[1]} -> {src_w}x{src_h}")
+            _log("Crop-Inpaint", f"mask {idx + 1}/{len(regions)} composited {refined.shape[2]}x{refined.shape[1]} -> {src_w}x{src_h}")
         _paste_back(full_src, refined, crop_ctx.get("mask"), sx0, sy0, src_w, src_h)
 
     if opt_verbose:
-        print(f"Gibby Crop-Inpaint: composited {len(regions)} region(s) into {full.shape[2]}x{full.shape[1]} (final image)")
+        _log("Crop-Inpaint", f"composited {len(regions)} region(s) into {full.shape[2]}x{full.shape[1]} (final image)")
 
     # Update context: the image was replaced, so the tiling info of the old
     # one (if any) is stale
@@ -1447,15 +1480,19 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
 
 def _calculate_sigmas(model, scheduler_name, steps, sampler_name="euler", denoise=1.0, width=None, height=None):
     """Calculate sigmas from scheduler name and step count, respecting denoise level.
-    A Flux2 model with a size uses the Flux2 schedule (get_schedule) for that size
-    instead, with denoise taking the schedule's tail."""
-    if _is_flux2(model) and get_schedule is not None and width and height:
+    A Flux2 model uses the Flux2 schedule (get_schedule) for the size instead, its
+    shift needs the sequence length; denoise always takes the schedule's low-noise
+    tail, like the native SplitSigmasDenoise."""
+    if _is_flux2(model) and get_schedule is not None:
+        if not width or not height:
+            width, height = 1024, 1024
         seq_len = (width * height) / (16 * 16)
         sigmas = get_schedule(steps, round(seq_len)).to(comfy.model_management.get_torch_device())
         if denoise is not None and denoise <= 0.0:
             sigmas = torch.FloatTensor([])
         elif denoise is not None and denoise < 0.9999:
-            total_steps = round(steps * denoise)
+            # A low denoise on a short schedule still samples one step
+            total_steps = max(round(steps * denoise), 1)
             sigmas = sigmas[-(total_steps + 1):]
         return sigmas
 
@@ -1503,6 +1540,20 @@ def _apply_start_end_steps(sigmas_tensor, steps_value, start_step, end_step, lef
     return sigmas_tensor, skip
 
 
+def _dype_model(model_obj, ctx, dype_opt, verbose=False):
+    """The model with the DyPE patch applied for the single-sample path
+    (dype/sega/spa). The patch stays on this local clone - the context and
+    the outputs keep the original unpatched model. The cascade methods hijack
+    sampling instead of patching, and a context with no size leaves the model
+    untouched."""
+    if dype_opt is None or dype_opt.get("method") not in DYPE_PATCH_METHODS:
+        return model_obj
+    w, h, _ = _latent_dims(ctx.get("latent"), ctx.get("vae"))
+    if not w:
+        w, h = ctx_size(ctx)
+    return apply_dype_patch(model_obj, dype_opt, int(w), int(h))
+
+
 def _resolve_early_params(ctx, steps):
     """Resolve steps/cfg/sampler for the pre-evaluate sampling paths."""
     base_steps = ctx.get("steps") or 0
@@ -1531,7 +1582,8 @@ class GibbyKSamplerContext(io.ComfyNode):
             category="gibby",
             description=(
                 "Samples using parameters from a CONTEXT object. Override model, latent, image, "
-                "mask, sampler, or sigmas as needed. Automatically encodes images and updates context."
+                "mask, sampler, or sigmas as needed. Automatically encodes images and updates context. "
+                "DyPE options patch the model per sample (or cascade the latent) - see DyPE options."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context"),
@@ -1541,7 +1593,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                 io.Mask.Input("mask", optional=True),
                 io.Sampler.Input("sampler", optional=True),
                 io.Sigmas.Input("sigmas", optional=True),
-                _KSAMPLER_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect an options node (Crop-Inpaint, Iterative Options, Color Match, Tiled VAE, Clear VRAM) or Merge KSampler Options"),
+                _KSAMPLER_OPTIONS_TYPE.Input("options", optional=True, tooltip="Connect an options node (Crop-Inpaint, Iterative Options, Color Match, Tiled VAE, Clear VRAM, DyPE) or Merge KSampler Options"),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate="fixed"),
                 io.Int.Input("steps", default=0, min=0, max=10000),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
@@ -1617,6 +1669,9 @@ class GibbyKSamplerContext(io.ComfyNode):
         # evaluate(), which would otherwise encode the image for nothing
         inpaint_opt = _find_option(options_list, "inpaint")
         iterative_opt = _find_option(options_list, "iterative_upscale")
+        # DyPE (soft dependency): patches the model, or takes sampling over when a
+        # cascade method is selected; absent when the options node is not wired
+        dype_opt = _find_option(options_list, "dype")
         # The color match option enables and tunes color matching for
         # crop-inpaint and the iterative upscale; without it no matching runs
         color_opt = _find_option(options_list, "color_match")
@@ -1638,8 +1693,13 @@ class GibbyKSamplerContext(io.ComfyNode):
             if clear_after_finish:
                 _clear_vram("after finish", clear_verbose)
             if verbose:
-                print("Gibby KSampler (Context): crop-inpaint skipped: the mask is empty")
+                _log("Crop-Inpaint skipped", "the mask is empty")
             return io.NodeOutput(ctx, None, ctx["image"], None, ctx.get("vae"), ctx.get("vae_audio"), options_list)
+        # A cascade hooks the sampler, not the model, so it cannot run inside the
+        # crop-inpaint / iterative upscale steps that are about to start
+        if is_dype_cascade(dype_opt) and ((inpaint_opt is not None and has_image and has_mask) or
+                                          (iterative_opt is not None and has_vae)):
+            warn_cascade_not_in_step(dype_opt)
         result = None
         if inpaint_opt is not None and iterative_opt is not None and has_image and has_mask and has_vae:
             # Crop first, then pass each crop (image + mask) to the iterative
@@ -1655,7 +1715,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                                                  steps_value, cfg_value, sampler_obj, ctx.get("positive"), ctx.get("negative"),
                                                  start_step, end_step, leftover_noise,
                                                  clear_after_model, clear_after_vae, clear_verbose, verbose=verbose,
-                                                 travel_state=travel_state, prompt_state=prompt_state)
+                                                 travel_state=travel_state, prompt_state=prompt_state, dype_opt=dype_opt)
         elif iterative_opt is not None and has_vae:
             # No crop-inpaint (or no mask for it): iterative on the existing image,
             # masked on every step when a mask is present. With no image in the
@@ -1673,7 +1733,8 @@ class GibbyKSamplerContext(io.ComfyNode):
                                          start_step, end_step, leftover_noise,
                                          clear_after_model=clear_after_model, clear_after_vae=clear_after_vae,
                                          clear_verbose=clear_verbose, verbose=verbose,
-                                         travel_state=travel_state, prompt_state=prompt_state, steps=steps)
+                                         travel_state=travel_state, prompt_state=prompt_state, steps=steps,
+                                         dype_opt=dype_opt)
         elif inpaint_opt is not None and has_image and has_mask:
             # Crop-inpaint only: crop, sample each crop, composite back (an empty
             # mask has no regions and is skipped above)
@@ -1687,7 +1748,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             result = _crop_inpaint(ctx, inpaint_opt, model_obj, seed, steps_value,
                                    sampler_obj, denoise, cfg_value, ctx.get("positive"), ctx.get("negative"), decode,
                                    options_list, clear_after_model, clear_after_vae, clear_verbose, verbose,
-                                   travel_state=travel_state, prompt_state=prompt_state)
+                                   travel_state=travel_state, prompt_state=prompt_state, dype_opt=dype_opt)
         if result is not None:
             if clear_after_finish:
                 _clear_vram("after finish", clear_verbose)
@@ -1737,23 +1798,27 @@ class GibbyKSamplerContext(io.ComfyNode):
             sw, sh = w // dw * dw, h // dh * dh
             if (sw, sh) != (w, h):
                 if verbose:
-                    print(f"Gibby KSampler (Context): pre-scaled {w}x{h} -> {sw}x{sh} for VAE encode")
+                    _log("pre-scaled", f"{w}x{h} ({_mp(w, h)} Mp) -> {sw}x{sh} ({_mp(sw, sh)} Mp) for VAE encode")
                 ctx["image"] = _resize_image(ctx["image"], sw, sh)
                 w, h = sw, sh
             encode_tiled = _tiled_for(w, h, tiled_above)
             if verbose:
-                print(f"Gibby KSampler (Context): VAE encode starting {w}x{h}")
+                _log("VAE encode starting", f"{w}x{h} ({_mp(w, h)} Mp){_image_count_s(ctx['image'])}")
         else:
             encode_tiled = False
         t0 = time.time()
         GibbyContext.evaluate(ctx, tiled=encode_tiled, tile_size=tile_size, overlap=overlap,
                                temporal_size=temporal_size, temporal_overlap=temporal_overlap)
         if verbose and encode_will_run:
-            print(f"Gibby KSampler (Context): VAE encode took {time.time() - t0:.2f}s")
+            _log("VAE encode took", f"{time.time() - t0:.2f}s")
 
         # Apply mask only if it came from the input (not context) and latent exists.
         if mask is not None and ctx.get("latent") is not None and "noise_mask" not in ctx["latent"]:
             ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], mask)
+
+        # DyPE model patch: after evaluate, so it is sized to the latent that is
+        # actually about to be sampled
+        model_obj = _dype_model(model_obj, ctx, dype_opt, verbose)
 
         _log_start(verbose, ctx, seed, steps_value, denoise_value, start_step, end_step)
 
@@ -1766,6 +1831,9 @@ class GibbyKSamplerContext(io.ComfyNode):
         # the latent output wasn't connected during the first run (result discarded
         # by the engine) but is connected now.
         travel_sig = _travel_signature(travel_opts, run_steps)
+        # DyPE: scalars only, so the comparison never touches a model object
+        dype_sig = None if dype_opt is None else {k: v for k, v in dype_opt.items()
+                                                  if isinstance(v, (bool, int, float, str))}
         prompt_sig = _prompt_travel_signature(pos_prompt_text, neg_prompt_text, run_steps)
         cached = ctx.get("_kctx_sampled")
         if cached is not None:
@@ -1782,14 +1850,15 @@ class GibbyKSamplerContext(io.ComfyNode):
                     and cached.get("start_step") == start_step
                     and cached.get("end_step") == end_step
                     and cached.get("lora_travel") == travel_sig
-                    and cached.get("prompt_travel") == prompt_sig):
+                    and cached.get("prompt_travel") == prompt_sig
+                    and cached.get("dype") == dype_sig):
                 out_latent = cached["out_latent"]
                 decoded_image = ctx.get("image")
                 decoded_audio = ctx.get("audio")
                 if clear_after_finish:
                     _clear_vram("after finish", clear_verbose)
                 if verbose:
-                    print("Gibby KSampler (Context): cache hit, reusing sampled result")
+                    _log("cache hit", "reusing sampled result")
                 _log_finish(verbose, decoded_image, out_latent, t_start, ctx.get("vae"))
                 return io.NodeOutput(ctx, out_latent, decoded_image, decoded_audio, ctx.get("vae"), ctx.get("vae_audio") or ctx.get("audio_vae"), options)
 
@@ -1811,33 +1880,15 @@ class GibbyKSamplerContext(io.ComfyNode):
             sigmas_tensor = sigmas
             use_start_end_steps = False
         else:
-            # Check if model is Flux2 - if so, use Flux2Scheduler
-            is_flux2 = _is_flux2(model_obj)
-
-            if is_flux2 and get_schedule is not None:
-                # Use Flux2Scheduler logic
-                # Get width/height from the context (explicit, image, or latent)
-                width, height = ctx_size(ctx)
-                if width == 0 or height == 0:
-                    width, height = 1024, 1024  # Default
-
-                seq_len = (width * height / (16 * 16))
-                sigmas_tensor = get_schedule(steps_value, round(seq_len)).to(comfy.model_management.get_torch_device())
-                
-                # If no start/end step provided and denoise < 1, use low_sigmas
-                has_start_end = start_step != 0.0 or end_step < 10000.0
-                if not has_start_end and denoise_value < 1.0:
-                    steps = max(sigmas_tensor.shape[-1] - 1, 0)
-                    total_steps = round(steps * denoise_value)
-                    sigmas_tensor = sigmas_tensor[-(total_steps + 1):]
-                
-                use_start_end_steps = True
-            else:
-                # Regular scheduler
-                scheduler_name = ctx.get("scheduler", "normal")
-                sampler_name_for_sigmas = ctx.get("sampler", "euler")
-                sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name_for_sigmas, denoise_value)
-                use_start_end_steps = True
+            # The Flux2 schedule and the regular schedulers share the denoise rule:
+            # the schedule is built for the full step count, denoise takes its
+            # low-noise tail, and start/end steps slice the result below
+            scheduler_name = ctx.get("scheduler", "normal")
+            sampler_name_for_sigmas = ctx.get("sampler", "euler")
+            sigmas_width, sigmas_height = ctx_size(ctx)
+            sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name_for_sigmas,
+                                              denoise_value, sigmas_width, sigmas_height)
+            use_start_end_steps = True
 
         # Prompt travel (native): when a raw prompt carries a [before:after:step]
         # group, plan the per-step prompts and encode the unique ones grafted onto
@@ -1883,8 +1934,22 @@ class GibbyKSamplerContext(io.ComfyNode):
                 # Start step beyond available steps, return latent as-is or zeros
                 samples = latent_image if ctx["latent"] is not None else torch.zeros_like(noise)
 
+        # DyPE cascade (PixelRush/FreeScale/HiFlow): the pack samples and cascades
+        # the context's latent itself, so the regular sampling path is skipped
+        dype_latent = None
+        if samples is None and is_dype_cascade(dype_opt):
+            if ctx.get("vae") is None:
+                raise ValueError(f"DyPE {dype_opt.get('method')} needs a VAE - connect one to the context")
+            warn_cascade_overrides(dype_opt, sigmas=sigmas, sampler=sampler, start_step=start_step,
+                                   end_step=end_step, add_noise=add_noise, denoise=denoise_value,
+                                   lora_travel=bool(travel_opts), prompt_travel=prompt_state is not None)
+            dype_latent = run_dype_cascade(dype_opt, model_obj, ctx["vae"], positive, negative,
+                                           ctx["latent"], seed, cfg_value, steps_value)
+            if verbose:
+                _log("DyPE", f"{dype_opt.get('method')} cascaded the latent -> {tuple(dype_latent['samples'].shape)}")
+
         # Sample with the (possibly sliced) sigmas
-        if samples is None:
+        if samples is None and dype_latent is None:
             travel_state = _prepare_lora_travels(model_obj, travel_opts, run_steps)
             # The sliced sub-run starts at the resolved start step: travels are
             # indexed by global step, so shift their range by it
@@ -1892,14 +1957,16 @@ class GibbyKSamplerContext(io.ComfyNode):
             samples = _sample_with_travels(model_obj, travel_state, prompt_state, noise, cfg_value, sampler_obj, sigmas_tensor,
                                             positive, negative, latent_image, noise_mask, callback,
                                             disable_pbar, seed, step_offset)
+        if dype_latent is not None:
+            samples = dype_latent["samples"]
 
         # The model is done after sampling: free it before the decode so the
         # VAE gets the VRAM back (Clear VRAM options).
         if decode and clear_after_model:
             _clear_vram("after model", clear_verbose)
 
-        # Build output latent
-        out_latent = ctx["latent"].copy()
+        # Build output latent (a cascade owns its latent: keep its own ratios)
+        out_latent = dict(dype_latent) if dype_latent is not None else ctx["latent"].copy()
         out_latent.pop("downscale_ratio_spacial", None)
         out_latent.pop("downscale_ratio_temporal", None)
         out_latent["samples"] = samples
@@ -1917,7 +1984,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                     dw, dh, _ = _image_dims(decoded_image)
                     if (dw, dh) != orig_size:
                         if verbose:
-                            print(f"Gibby KSampler (Context): stretched {dw}x{dh} -> {orig_size[0]}x{orig_size[1]}")
+                            _log("stretched", f"{dw}x{dh} ({_mp(dw, dh)} Mp) -> {orig_size[0]}x{orig_size[1]} ({_mp(orig_size[0], orig_size[1])} Mp)")
                         decoded_image = _resize_image(decoded_image, *orig_size)
 
                 # Match the decoded result's color back to the original image
@@ -1927,11 +1994,11 @@ class GibbyKSamplerContext(io.ComfyNode):
             # Decode to audio for context update and output (overrides any existing context.audio)
             if ctx.get("vae_audio") is not None and vae_decode_audio is not None:
                 if verbose:
-                    print("Gibby KSampler (Context): VAE audio decode starting")
+                    _log("VAE audio decode starting")
                 t0 = time.time()
                 decoded_audio = vae_decode_audio(ctx["vae_audio"], out_latent)
                 if verbose:
-                    print(f"Gibby KSampler (Context): VAE audio decode took {time.time() - t0:.2f}s")
+                    _log("VAE audio decode took", f"{time.time() - t0:.2f}s")
 
             if clear_after_vae:
                 _clear_vram("after vae", clear_verbose)
@@ -1978,6 +2045,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             "end_step": end_step,
             "lora_travel": travel_sig,
             "prompt_travel": prompt_sig,
+            "dype": dype_sig,
         }
 
         if clear_after_finish:

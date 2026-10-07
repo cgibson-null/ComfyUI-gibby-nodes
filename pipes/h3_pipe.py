@@ -201,6 +201,9 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
     ref_image_size = pipe.get("ref_image_size", "match")
 
     # Build refs from raw media stored in pipe (encoding happens here)
+    if audio_vae is None and (pipe.get("ref_audios") or pipe.get("ref_video_audios")):
+        raise ValueError("H3 Pipe Apply: the pipe has reference audios but no audio VAE - "
+                         "connect one to the audio_vae input (or provide it in the context)")
     ref_items, ref_blocks = _build_ref_blocks_and_items(
         vae, audio_vae, frame_count, width, height, ref_image_size,
         pipe.get("ref_images", {}), pipe.get("ref_videos", {}),
@@ -401,13 +404,13 @@ class H3PipeApply(io.ComfyNode):
         # Directly-connected clip/vae override context values
         clip = clip if clip is not None else ctx.get("clip")
         vae = vae if vae is not None else ctx.get("vae")
-        audio_vae = audio_vae if audio_vae is not None else ctx.get("audio_vae")
+        audio_vae = audio_vae if audio_vae is not None else ctx.get("vae_audio")
         if clip is not None:
             ctx["clip"] = clip
         if vae is not None:
             ctx["vae"] = vae
         if audio_vae is not None:
-            ctx["audio_vae"] = audio_vae
+            ctx["vae_audio"] = audio_vae
 
         # Prune the pipe per the drop toggles
         pipe = dict(h3_pipe)

@@ -16,7 +16,9 @@ Nodes for talking to a llama.cpp server / llama-swap proxy
   chat API takes stills only. Every run prints a tokens/sec line with the
   time it took. Takes a media pipe (its refs + keyframes are sent, labeled
   as such) and outputs one with the wired refs appended and the generated
-  text as its prompt.
+  text as its prompt. With keep_context on, the previous turns (prompts +
+  replies, text only) are carried into the next run so the model continues
+  the conversation instead of starting fresh.
 
 The HTTP client, reference collection and option filtering live in
 llamacpp_client.py / llamacpp_refs.py / llamacpp_shared.py in this folder.
@@ -49,6 +51,14 @@ _CONNECTIVITY_TYPE = io.Custom("LLAMACPP_CONNECTIVITY")
 _OPTIONS_TYPE = io.Custom("LLAMACPP_OPTIONS")
 
 _CATEGORY = "gibby/llm connect"
+
+# keep_context conversations: (node id, url, model) -> the earlier turns of
+# that node's conversation as OpenAI-style message dicts. Text only --
+# images are re-sent fresh from the connected inputs every run, so they
+# stay out of the stored history. Stored after each successful run;
+# switching keep_context off, or the server/model, starts a fresh
+# conversation.
+_CONVERSATIONS: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
 
 
 def _normalize_stop(options: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -500,7 +510,9 @@ class GibbyGenerate(io.ComfyNode):
                 "server, with auto-growing image and video reference inputs. Videos are "
                 "sampled into evenly-spaced frames -- the chat API accepts stills only. "
                 "Every run prints a tokens/sec line with the time it took to the "
-                "ComfyUI console, so a run in progress isn't a black box."
+                "ComfyUI console, so a run in progress isn't a black box. With "
+                "keep_context on, the previous turns are carried into the next run, "
+                "so the model continues the conversation."
             ),
             inputs=[
                 _CONNECTIVITY_TYPE.Input("connectivity", tooltip=(
@@ -527,6 +539,15 @@ class GibbyGenerate(io.ComfyNode):
                     "Thinking text comes back on the 'thinking' output. Control how much "
                     "it thinks via reasoning_budget/reasoning_effort on a connected "
                     "Sampling Options node.")),
+                io.Boolean.Input("keep_context", default=False, optional=True, tooltip=(
+                    "Continue the conversation: the previous turns (your prompts and the "
+                    "model's replies, text only) are prepended to the next run, so the "
+                    "model remembers what it already said. Kept per node and per "
+                    "server + model; switching it off clears the conversation, a failed "
+                    "run leaves it unchanged, and images are always sent fresh from the "
+                    "connected inputs, never from the history. Re-queueing with "
+                    "unchanged inputs is cached -- change the prompt to ask the next "
+                    "question.")),
                 io.Boolean.Input("clear_vram", default=True, optional=True, tooltip=(
                     "Call torch.cuda.empty_cache() after generation to free unused CUDA "
                     "memory. Useful when switching between LLM and image generation tasks.")),
@@ -558,13 +579,14 @@ class GibbyGenerate(io.ComfyNode):
                 io.String.Output("thinking"),
                 io.Dict.Output(display_name="media_pipe"),
             ],
+            hidden=[io.Hidden.unique_id],
         )
 
     @classmethod
     def execute(cls, connectivity=None, system="You are an AI artist.",
                 prompt="Describe the reference material.", think=True,
-                clear_vram=True, format="text", frames_per_video=4, max_image_size=0,
-                options=None, media_pipe=None, images=None, video=None):
+                keep_context=False, clear_vram=True, format="text", frames_per_video=4,
+                max_image_size=0, options=None, media_pipe=None, images=None, video=None):
         if connectivity is None:
             raise RuntimeError("Gibby Generate: connect a Connectivity node")
         url = connectivity["url"]
@@ -600,7 +622,18 @@ class GibbyGenerate(io.ComfyNode):
 
         user_message = {"role": "user", "content": _content_parts(
             prompt, _pipe_label(pipe, pipe_refs, kf_imgs, len(images_b64)), images_b64)}
-        messages = [{"role": "system", "content": system}, user_message]
+
+        # keep_context: carry this node's earlier turns (text only) into the
+        # request so the model continues the conversation. Off -> drop any
+        # stored conversation for this node + server + model.
+        node_id = getattr(getattr(cls, "hidden", None), "unique_id", None) or "generate"
+        conv_key = (node_id, url, model)
+        if keep_context:
+            history = list(_CONVERSATIONS.get(conv_key, []))
+        else:
+            history = []
+            _CONVERSATIONS.pop(conv_key, None)
+        messages = [{"role": "system", "content": system}, *history, user_message]
 
         if debug_print:
             print(f"""
@@ -612,6 +645,7 @@ system: {system}
 prompt: {prompt}
 images: {len(images_b64)}
 think: {think}
+previous turns: {len(history)}
 options: {request_options}
 format: {format}
 ---------------------------------------------------------
@@ -647,6 +681,16 @@ format: {format}
         print(f"[Gibby-LLM] {model!r}: {speed} in {elapsed_s:.2f}s")
 
         result_text, thinking_text = extract_reply(response, think)
+
+        # Store the turn only after a successful run, so a failure never
+        # corrupts the conversation. The thinking text is deliberately not
+        # stored - it is the model's internal reasoning, not part of the
+        # dialogue.
+        if keep_context:
+            turn: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+            if result_text:
+                turn.append({"role": "assistant", "content": result_text})
+            _CONVERSATIONS[conv_key] = [*history, *turn]
 
         _maybe_unload(url, model, connectivity, debug_print)
 

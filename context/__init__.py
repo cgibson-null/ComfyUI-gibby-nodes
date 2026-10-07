@@ -15,6 +15,8 @@ latent) from what a context already holds; it is shared with Context Loader
 and KSampler (Context).
 """
 
+import datetime
+import os
 import time
 
 import torch
@@ -103,6 +105,69 @@ def _latent_dims(latent, vae=None):
         return None, None, None
     dw, dh = _latent_downscale(vae, s.shape[1])
     return lw * dw, lh * dh, length
+
+
+_console_colors_ready = False
+
+
+def _init_console_colors():
+    """One-time best-effort ANSI enabling for Windows consoles: colorama when
+    importable, else the os.system('') VT trick; a no-op elsewhere."""
+    if os.name != "nt":
+        return
+    try:
+        import colorama
+        colorama.just_fix_windows_console()
+        return
+    except Exception:
+        pass
+    try:
+        os.system("")
+    except Exception:
+        pass
+
+
+def _log(event, rest=""):
+    """One verbose console line: orange [Gibby], the current time (HH:MM:SS.mmm)
+    in plain text, the event name in yellow, then the rest of the message."""
+    global _console_colors_ready
+    if not _console_colors_ready:
+        _init_console_colors()
+        _console_colors_ready = True
+    now = datetime.datetime.now()
+    ts = f"{now.strftime('%H:%M:%S')}.{now.microsecond // 1000:03d}"
+    print(f"\033[38;5;208m[Gibby]\033[0m {ts} \033[33m{event}\033[0m" + (f" {rest}" if rest else ""))
+
+
+def _mp(w, h):
+    """Megapixels of a w x h resolution as a 2-decimal string; '' when either dimension is missing."""
+    if not w or not h:
+        return ""
+    return f"{(w * h) / 1_000_000:.2f}"
+
+
+def _image_count_s(image):
+    """' N frames' for a (B, F, H, W, C) video, ' N images' for a multi-image (B, H, W, C) batch, '' for a single still."""
+    if image is None:
+        return ""
+    if image.dim() == 5:
+        return f" {image.shape[1]} frames"
+    if image.dim() == 4 and image.shape[0] > 1:
+        return f" {image.shape[0]} images"
+    return ""
+
+
+def _latent_count_s(latent):
+    """' N frames' for a video latent's samples, ' N images' for a batch of latents, '' for a single still."""
+    if latent is None:
+        return ""
+    # samples can be a NestedTensor (no .dim()), so use ndim/shape like _latent_dims
+    s = latent["samples"]
+    if s.ndim == 5:
+        return f" {s.shape[2]} frames"
+    if s.ndim == 4 and s.shape[0] > 1:
+        return f" {s.shape[0]} images"
+    return ""
 
 
 def _is_flux2(model_obj):
@@ -223,21 +288,22 @@ def encode_image(vae, image, tiled=False, tile_size=512, overlap=64, temporal_si
     """VAE-encode an image, tiled when the tiled VAE settings are on."""
     if verbose:
         w, h, _ = _image_dims(image)
-        print(f"Gibby: VAE encode starting {w}x{h}")
+        _log("VAE encode starting", f"{w}x{h} ({_mp(w, h)} Mp){_image_count_s(image)}")
     t0 = time.time()
     if tiled:
         latent, = VAEEncodeTiled().encode(vae, image, tile_size, overlap, temporal_size, temporal_overlap)
     else:
         latent, = VAEEncode().encode(vae, image)
     if verbose:
-        print(f"Gibby: VAE encode took {time.time() - t0:.2f}s")
+        _log("VAE encode took", f"{time.time() - t0:.2f}s")
     return latent
 
 
 def decode_latent(vae, latent, tiled=False, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8, verbose=False):
     """VAE-decode a latent, tiled when the tiled VAE settings are on."""
     if verbose:
-        print("Gibby: VAE decode starting")
+        w, h, _ = _latent_dims(latent, vae)
+        _log("VAE decode starting", f"{w}x{h} ({_mp(w, h)} Mp){_latent_count_s(latent)}")
     t0 = time.time()
     if tiled:
         image, = VAEDecodeTiled().decode(vae, latent, tile_size, overlap, temporal_size, temporal_overlap)
@@ -245,7 +311,7 @@ def decode_latent(vae, latent, tiled=False, tile_size=512, overlap=64, temporal_
         image, = VAEDecode().decode(vae, latent)
     if verbose:
         w, h, _ = _image_dims(image)
-        print(f"Gibby: VAE decode took {time.time() - t0:.2f}s {w}x{h}")
+        _log("VAE decode took", f"{time.time() - t0:.2f}s {w}x{h} ({_mp(w, h)} Mp){_image_count_s(image)}")
     return image
 
 

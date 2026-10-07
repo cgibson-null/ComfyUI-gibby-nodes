@@ -66,17 +66,14 @@ const CANONICAL_WIDGETS = [
     "crop_region"
 ];
 
-// Same presets as the backend's aspect ratio mode; used to resolve the
-// "selected" crop box AR.
+// Same presets as the backend's aspect ratio mode (portrait only, named by
+// the ratio); used to resolve the "selected" crop box AR.
 const ASPECT_RATIOS = {
-    "1:1 (Square)": [1, 1],
-    "2:3 (Portrait Photo)": [2, 3],
-    "3:2 (Photo)": [3, 2],
-    "3:4 (Portrait Standard)": [3, 4],
-    "4:3 (Standard)": [4, 3],
-    "9:16 (Portrait Widescreen)": [9, 16],
-    "16:9 (Widescreen)": [16, 9],
-    "21:9 (Ultrawide)": [21, 9],
+    "1:1": [1, 1],
+    "2:3": [2, 3],
+    "3:4": [3, 4],
+    "9:16": [9, 16],
+    "9:21": [9, 21],
 };
 const CLOSEST_RATIO = "closest to image";
 

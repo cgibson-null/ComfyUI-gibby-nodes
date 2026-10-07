@@ -15,6 +15,7 @@ schema, each living in its own self-contained folder:
 - detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
 - llm/: LLM Connect - Connectivity, Sampling Options, Unsloth Load Options and Generate for a llama.cpp / llama-swap / Unsloth server (OpenAI-compatible API), with auto-growing image/video references; Generate also takes a media pipe (refs + keyframes, labeled) and outputs one.
 - tiling.py: Split Tiles (Context) / Combine Tiles (Context) - splits the context image into a batch of uniform overlapping tiles with crop-inpaint masks; recombines the tile batch (at the upscaled size) with a crossfade across the overlaps.
+- ksampler_options/dype.py: DyPE options - the ComfyUI-DyPE pack as a soft dependency (registered only when that pack is installed). dype/sega/spa patch the model for high-resolution generation, pixelrush/freescale/hiflow take sampling over; KSampler (Context) does both through ksampler_context/dype_helper.py, re-patching per sample at the size actually being sampled so the outbound context keeps the original model.
 
 INSTALL:
 Put this whole folder in ComfyUI/custom_nodes/, then restart ComfyUI.
@@ -46,6 +47,8 @@ from .ksampler_options.crop_inpaint import GibbyCropInpaintOptions
 from .ksampler_options.iterative_upscale import GibbyIterativeUpscaleOptions
 from .ksampler_options.lora_travel import GibbyLoraTravelOptions
 from .ksampler_options.tiled_vae import GibbyTiledVaeOptions
+from .ksampler_options.dype import GibbyDypeOptions
+from .ksampler_context.dype_helper import dype_installed
 from .tiling import GibbySplitTiles, GibbyCombineTiles
 from .ksampler_options.merge_ksampler_options import GibbyMergeKSamplerOptions
 from .context.merge_contexts import GibbyMergeContexts
@@ -124,7 +127,11 @@ except Exception as e:
 
 class GibbyNodesExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySplitTiles, GibbyTiledVaeOptions]
+        # DyPE options drive the optional ComfyUI-DyPE pack, so they are only
+        # offered when it is installed. dype_installed() is a filesystem check,
+        # which answers correctly whichever of the two packs imports first.
+        dype_nodes = [GibbyDypeOptions] if dype_installed() else []
+        return [GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, *dype_nodes, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySplitTiles, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

@@ -7,7 +7,7 @@ Four modes (switched by the horizontal mode toggle in resolution_latent.js):
 - keep_ar: resizes the linked media to the megapixels target at its own aspect
   ratio (native Scale Image to Total Pixels math);
 - custom: explicit width x height;
-- aspect_ratio: core Resolution Selector presets + megapixels;
+- aspect_ratio: portrait presets (1:1, 2:3, 3:4, 9:16, 9:21) + megapixels;
 - custom_aspect_ratio: manual x : y floats + megapixels.
 
 Megapixels 0 in the ratio modes: no target pixel count - the media's own size
@@ -73,16 +73,13 @@ from comfy_extras.color_util import hex_to_rgb
 from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, _is_flux2, ctx_from, ctx_set_image, empty_latent, encode_image
 
 
-# Same presets as core's Resolution Selector.
+# Portrait presets only (square plus vertical ratios), named by the ratio.
 ASPECT_RATIOS = {
-    "1:1 (Square)": (1, 1),
-    "2:3 (Portrait Photo)": (2, 3),
-    "3:2 (Photo)": (3, 2),
-    "3:4 (Portrait Standard)": (3, 4),
-    "4:3 (Standard)": (4, 3),
-    "9:16 (Portrait Widescreen)": (9, 16),
-    "16:9 (Widescreen)": (16, 9),
-    "21:9 (Ultrawide)": (21, 9),
+    "1:1": (1, 1),
+    "2:3": (2, 3),
+    "3:4": (3, 4),
+    "9:16": (9, 16),
+    "9:21": (9, 21),
 }
 # Picks the preset closest to the connected media's ratio; 3:4 without media.
 CLOSEST_RATIO = "closest to image"
@@ -359,7 +356,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Int.Input("width", default=1024, min=8, max=16384),
                 io.Int.Input("height", default=1024, min=8, max=16384),
                 # aspect ratio modes.
-                io.Combo.Input("aspect_ratio", options=list(ASPECT_RATIOS) + [CLOSEST_RATIO], default="3:4 (Portrait Standard)"),
+                io.Combo.Input("aspect_ratio", options=list(ASPECT_RATIOS) + [CLOSEST_RATIO], default="3:4"),
                 # custom aspect ratio mode: manual w : h floats.
                 io.Float.Input("x", default=3.0, min=0.1, max=99.0, step=0.01),
                 io.Float.Input("y", default=4.0, min=0.1, max=99.0, step=0.01),
@@ -444,7 +441,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
     @classmethod
     def execute(cls, context=None, connected_image=None, mask=None, enable_preview=False,
                 load_image=False, image=None,
-                crop_image=False, crop_ar="custom", crop_region=None, upscale_model=None, mode="aspect_ratio", width=1024, height=1024, aspect_ratio="3:4 (Portrait Standard)", x=3.0, y=4.0,
+                crop_image=False, crop_ar="custom", crop_region=None, upscale_model=None, mode="aspect_ratio", width=1024, height=1024, aspect_ratio="3:4", x=3.0, y=4.0,
                 megapixels=1.0, swap_dimensions=False, scale_factor=1.0,
                 multiple=8, batch_size=1, flux2_latent=False, upscale_method="lanczos",
                 keep_proportion="stretch", pad_color="#000000", crop_position="center", vae=None) -> io.NodeOutput:
@@ -522,7 +519,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                     if has_media:
                         rw, rh = min(ASPECT_RATIOS.values(), key=lambda r: abs(r[0] / r[1] - SW / SH))
                     else:
-                        rw, rh = ASPECT_RATIOS["3:4 (Portrait Standard)"]
+                        rw, rh = ASPECT_RATIOS["3:4"]
                 else:
                     rw, rh = ASPECT_RATIOS[aspect_ratio]
             else:
