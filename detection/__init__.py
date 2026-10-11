@@ -13,7 +13,11 @@ approach, following the Impact FaceDetailer's box and SAM options:
 - sam3: the SAM3 / SAM3.1 checkpoint selected in the node (checkpoints
   folder), loaded with the native checkpoint loader together with its own
   SAM3 CLIP - text detection from the sam3_prompt (encoded like CLIP Text
-  Encode) and segmentation from the bboxes / point prompts.
+  Encode) and segmentation from the bboxes / point prompts. With tracking on,
+  the per-object masks it detects on the first frame seed the native
+  Run SAM3 Video Track tracker, which propagates them through the whole batch
+  (the mask output then follows the objects frame by frame, keeping the
+  objects object_indices selects).
 
 bbox/segm run through the Impact Subpack's UltralyticsDetectorProvider and
 the Impact Pack's SAM/mask helpers (SAMLoader, make_sam_mask); sam3 runs
@@ -32,23 +36,25 @@ With preview on, the node displays a preview of the detection image with
 the mask tinted in the mask color blended over it (KJNodes
 ImageAndMaskPreview style); the image output and the context keep the
 plain image. A batch of frames (video) previews as a video at
-preview_fps, encoded the way the native Create Video / Save Video nodes
-do it.
+preview_fps, blended and encoded one frame at a time the way the native
+SAM3 Track Preview does it (a display-only artifact, so it skips the
+Save Video encoder settings for a fast x264 preset).
 """
 
 import json
 import os
 import random
+from fractions import Fraction
 
+import av
 import numpy as np
 import torch
 import folder_paths
 import nodes
 import comfy.sd
 import comfy.utils
-from comfy_api.latest import io, ui, Types
+from comfy_api.latest import io, ui
 from comfy_extras.color_util import hex_to_rgb
-from comfy_extras.nodes_video import CreateVideo
 
 from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from
 from ..crop_paste.crop_image_by_mask import _store_crop_info
@@ -338,7 +344,7 @@ def _load_sam3(model_name):
     return _last_sam3[1]
 
 
-def _detect_sam3(image, model, conditioning, per_frame_boxes, pos_coords, neg_coords, threshold, refine_iterations):
+def _detect_sam3(image, model, conditioning, per_frame_boxes, pos_coords, neg_coords, threshold, refine_iterations, individual_masks=False):
     from comfy_extras.nodes_sam3 import SAM3_Detect
 
     bboxes = _boxes_to_sam3(per_frame_boxes)
@@ -348,9 +354,56 @@ def _detect_sam3(image, model, conditioning, per_frame_boxes, pos_coords, neg_co
         model=model, image=image, conditioning=conditioning,
         bboxes=bboxes if any(bboxes) else None,
         positive_coords=pos_coords, negative_coords=neg_coords,
-        threshold=threshold, refine_iterations=refine_iterations, individual_masks=False,
+        threshold=threshold, refine_iterations=refine_iterations, individual_masks=individual_masks,
     )
     return out.result[0]
+
+
+def _track_sam3(image, model, conditioning, initial_mask, detection_threshold, max_objects, detect_interval,
+                object_indices=""):
+    # Run SAM3 Video Track over the batch and flatten the tracks back to one
+    # union mask per frame (SAM3 Track to Mask, fed the resolved indices)
+    from comfy_extras.nodes_sam3 import SAM3_VideoTrack, SAM3_TrackToMask
+
+    track = SAM3_VideoTrack.execute(
+        images=image, model=model, initial_mask=initial_mask, conditioning=conditioning,
+        detection_threshold=detection_threshold, max_objects=max_objects,
+        detect_interval=detect_interval,
+    ).result[0]
+    packed = track.get("packed_masks")
+    n_obj = 0 if packed is None else packed.shape[1]
+    # Track to Mask reads an empty list as "all objects", so a selection that
+    # resolved to nothing gets an index it filters out (n_obj is out of range)
+    indices = ",".join(str(i) for i in _resolve_indices(object_indices, n_obj)) or str(n_obj)
+    return SAM3_TrackToMask.execute(track, object_indices=indices).result[0]
+
+
+def _resolve_indices(spec, n):
+    # SAM3 Track to Mask's "0,2,3" plus single indices and slices: "-1" is the
+    # last tracked object, "1:3" / ":-2" / "::2" are python slices of the object
+    # list. Returns the object indices in track order.
+    if not (spec or "").strip():
+        return list(range(n))
+    picked = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if ":" in part:
+                bounds = part.split(":")
+                if len(bounds) > 3:
+                    raise ValueError
+                nums = [int(b) if b.strip() else None for b in bounds] + [None] * (3 - len(bounds))
+                picked.update(range(*slice(*nums).indices(n)))
+            else:
+                i = int(part)
+                i += n if i < 0 else 0
+                if 0 <= i < n:
+                    picked.add(i)
+        except ValueError:
+            raise ValueError(f"Invalid object_indices entry: {part!r} (indices like '0,2' or a slice like '1:3')")
+    return sorted(picked)
 
 
 def _fix_mask(mask, remove_isolated_pixels, fill_holes):
@@ -370,31 +423,52 @@ def _fix_mask(mask, remove_isolated_pixels, fill_holes):
     return torch.stack(out)
 
 
-def _overlay(image, mask, color):
-    # KJNodes ImageAndMaskPreview style: blend the mask color over the image
-    # where the mask is set, the hex alpha channel acting as the opacity
+def _mask_color(color):
+    # KJNodes ImageAndMaskPreview style: the mask color's hex alpha is the opacity
     if len(color) not in (7, 9) or color[0] != "#":
         raise ValueError("mask_color must be in format #RRGGBB or #RRGGBBAA")
-    r, g, b = hex_to_rgb(color[:7])
+    r, g, b = (c / 255 for c in hex_to_rgb(color[:7]))
     alpha = 1.0 if len(color) == 7 else int(color[7:9], 16) / 255.0
-    m = (mask * alpha).unsqueeze(-1)
-    tint = torch.zeros_like(image)
-    tint[..., 0] = r / 255
-    tint[..., 1] = g / 255
-    tint[..., 2] = b / 255
-    return image * (1 - m) + tint * m
+    return (r, g, b), alpha
 
 
-def _preview_video(images, fps):
-    # The native Create Video -> Save Video path: encode the batch to a
-    # temp mp4 and hand the file to the node preview
-    video = CreateVideo.execute(images, fps=fps).result[0]
+def _overlay(image, mask, color):
+    # The mask color blended over the image where the mask is set
+    (r, g, b), alpha = _mask_color(color)
+    tint = torch.tensor([r, g, b], dtype=image.dtype, device=image.device)
+    out = image.clone()
+    out.lerp_(tint, (mask * alpha).unsqueeze(-1).to(image.device))
+    return out
+
+
+def _preview_video(images, mask, fps, color):
+    # The SAM3 Track Preview path: blend and encode one frame at a time into a
+    # temp mp4 and hand the file to the node preview, instead of building the
+    # tinted batch and running it through Create Video -> Save Video. The
+    # preview is display-only, so it encodes with the fast x264 preset instead
+    # of Save Video's crf 18 / medium.
+    (r, g, b), alpha = _mask_color(color)
+    tint = torch.tensor([r, g, b], dtype=images.dtype, device=images.device)
+    mask = mask.to(images.device)
+    H, W = images.shape[1:3]
+    frame = torch.empty(H, W, 3, dtype=torch.uint8)
+    frame_np = frame.numpy()
+
     prefix = "ComfyUI_temp_" + ''.join(random.choice("abcdefghijklmnopqrstupvxyz") for _ in range(5))
     full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
         prefix, folder_paths.get_temp_directory(), images.shape[3], images.shape[2])
     file = f"{filename}_{counter:05}_.mp4"
-    video.save_to(os.path.join(full_output_folder, file),
-                  format=Types.VideoContainer("mp4"), codec=Types.VideoCodec("h264"))
+    with av.open(os.path.join(full_output_folder, file), mode="w", format="mp4") as output:
+        stream = output.add_stream("h264", rate=Fraction(round(fps * 1000), 1000))
+        stream.width, stream.height, stream.pix_fmt = W, H, "yuv420p"
+        stream.options = {"crf": "23", "preset": "veryfast"}
+        for image, m in zip(images, mask):
+            image = image.clone()
+            image.lerp_(tint, (m * alpha).unsqueeze(-1))
+            frame.copy_(image.clamp_(0, 1).mul_(255).byte())
+            vframe = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
+            output.mux(stream.encode(vframe.reformat(format="yuv420p")))
+        output.mux(stream.encode(None))
     return ui.PreviewVideo([ui.SavedResult(file, subfolder, io.FolderType.temp)])
 
 
@@ -415,6 +489,22 @@ def _bbox_inputs(bbox_models):
                      tooltip="Grow each detected box (negative to shrink)"),
         io.Int.Input("drop_size", default=10, min=1, step=1,
                      tooltip="Drop detections smaller than this many pixels"),
+    ]
+
+
+def _sam3_track_inputs():
+    # The Run SAM3 Video Track widgets; detection_tracking.js hides them again
+    # while the tracking toggle is off
+    return [
+        io.Float.Input("detection_threshold", default=0.5, min=0.0, max=1.0, step=0.01,
+                       tooltip="Score threshold for text-prompted detection of new objects"),
+        io.Int.Input("max_objects", default=4, min=0, max=64,
+                     tooltip="Max tracked objects; the initial masks count toward this limit (0 = the internal cap of 64)"),
+        io.Int.Input("detect_interval", default=1, min=1,
+                     tooltip="Run detection every N frames (1 = every frame, higher saves compute)"),
+        io.String.Input("object_indices", default="",
+                        tooltip="Tracked objects to keep: '0,2', the last one '-1', a slice '1:3' or ':-2' "
+                                "(empty = every tracked object)"),
     ]
 
 
@@ -445,7 +535,10 @@ class GibbyDetection(io.ComfyNode):
             io.Int.Input("sam3_refine_iterations", default=2, min=0, max=5, tooltip="SAM decoder refinement passes"),
             io.String.Input("sam3_prompt", default="", multiline=True,
                              tooltip="Text prompt, encoded by the checkpoint's SAM3 clip like CLIP Text Encode"),
-        ])
+            # detection_tracking.js hides the tracker rows again while this is off
+            io.Boolean.Input("tracking", default=False,
+                             tooltip="Track the first frame's detection through the batch (Run SAM3 Video Track)"),
+        ] + _sam3_track_inputs())
         # bbox/segm need the Impact pack + subpack; offer them only when installed.
         # sam3 is first so it is the default mode
         options = [sam3_option]
@@ -469,7 +562,8 @@ class GibbyDetection(io.ComfyNode):
                 "context one) and stores the resulting image and mask in the context; "
                 "the context's model and clip pass through untouched. A mode selector reveals "
                 "the widgets of the chosen approach: bbox (ultralytics detector), segm (SAM "
-                "refined by the detector's boxes), sam3 (the selected SAM3 checkpoint). With "
+                "refined by the detector's boxes), sam3 (the selected SAM3 checkpoint, which can "
+                "track its first-frame detection through a batch of frames). With "
                 "preview on, the node displays the image with the mask tinted in the mask color. "
                 "Also outputs crop info for pasting results back with Image Paste By Mask "
                 "(Batch) (Context): the image, the mask and each mask's bbox as the paste rect."
@@ -531,9 +625,21 @@ class GibbyDetection(io.ComfyNode):
             conditioning = None
             if (mode.get("sam3_prompt") or "").strip():
                 conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(mode["sam3_prompt"]))
-            mask = _detect_sam3(det_image, model, conditioning, per_frame_boxes,
-                                pos_coords, neg_coords, mode.get("sam3_threshold", 0.5),
-                                mode.get("sam3_refine_iterations", 2))
+            thr, refine = mode.get("sam3_threshold", 0.5), mode.get("sam3_refine_iterations", 2)
+            if mode.get("tracking"):
+                # The tracker is seeded with the objects SAM3 detects on the first
+                # frame (one mask per object) and propagates them over the batch
+                init_mask = _detect_sam3(det_image[0:1], model, conditioning, per_frame_boxes[:1],
+                                         pos_coords, neg_coords, thr, refine, individual_masks=True)
+                mask = _track_sam3(det_image, model, conditioning,
+                                   init_mask if init_mask.shape[0] else None,
+                                   mode.get("detection_threshold", 0.5),
+                                   mode.get("max_objects", 4),
+                                   mode.get("detect_interval", 1),
+                                   mode.get("object_indices", ""))
+            else:
+                mask = _detect_sam3(det_image, model, conditioning, per_frame_boxes,
+                                    pos_coords, neg_coords, thr, refine)
         else:
             raise ValueError(f"Unknown mode: {selected}")
 
@@ -552,8 +658,7 @@ class GibbyDetection(io.ComfyNode):
         info = _store_crop_info(ctx, det_image, mask, rects, drop_stale=image is not None)
         # The preview is display-only; the image output stays plain
         if preview:
-            masked = _overlay(det_image, mask, mask_color)
             if det_image.shape[0] > 1:
-                return io.NodeOutput(ctx, det_image, mask, info, ui=_preview_video(masked, preview_fps))
-            return io.NodeOutput(ctx, det_image, mask, info, ui=ui.PreviewImage(masked))
+                return io.NodeOutput(ctx, det_image, mask, info, ui=_preview_video(det_image, mask, preview_fps, mask_color))
+            return io.NodeOutput(ctx, det_image, mask, info, ui=ui.PreviewImage(_overlay(det_image, mask, mask_color)))
         return io.NodeOutput(ctx, det_image, mask, info)

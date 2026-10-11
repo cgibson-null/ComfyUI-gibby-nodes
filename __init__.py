@@ -88,8 +88,8 @@ try:
     # Groups Muter / Bypasser nodes, group_header_toggles.js for the queue/
     # bypass/mute buttons on group headers, context.js for Context suggestions,
     # resolution_latent.js for Resize Image / Empty Latent (Context)'s mode
-    # switcher and crop preview, and crop_preview.js for the shared crop
-    # preview it uses.
+    # switcher and crop preview, crop_preview.js for the shared crop preview it
+    # uses, and detection_tracking.js for the Mask/Segment tracker rows.
     for _rel in (
         "lora_loader/lora_loader.js",
         "fast_groups.js",
@@ -98,6 +98,7 @@ try:
         "context/context_loader.js",
         "crop_preview.js",
         "resolution_latent/resolution_latent.js",
+        "detection/detection_tracking.js",
         "ksampler_context/ksampler_context.js",
         "llm/llm.js",
         "node_runtime.js",

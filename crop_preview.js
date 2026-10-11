@@ -169,6 +169,9 @@ export function buildCropPreview(node, { getUrl, getRatio = null, onImageLoad = 
             x: Math.round(r.x), y: Math.round(r.y),
             width: Math.round(r.w), height: Math.round(r.h),
         };
+        // Keep the box's own number rows (its linkedWidgets) on the new value;
+        // a programmatic set does not run the widget's callback.
+        w.callback?.(w.value);
         paint();
     }
 

@@ -105,6 +105,43 @@ function setWidgetHidden(widget, hidden) {
     }
 }
 
+// The core BoundingBox input adds the box's own number rows to node.widgets,
+// named x, y, width and height - the same names as this node's size widgets,
+// which the widget store keys rows by (the frontend only disambiguates the
+// duplicates lazily, as x#1/width#1, and only once the node is in a graph).
+// Give them their own names so they can never be read as, or rendered over,
+// the size rows; the box still drives them through its linkedWidgets array.
+const CROP_BOX_ROWS = [
+    ["crop_box_x", "x"],
+    ["crop_box_y", "y"],
+    ["crop_box_w", "w"],
+    ["crop_box_h", "h"],
+];
+
+function renameCropBoxRows(region) {
+    const rows = region?.linkedWidgets || [];
+    rows.forEach((w, i) => {
+        const row = CROP_BOX_ROWS[i];
+        if (!row) return;
+        if (w.name !== row[0]) w.name = row[0];
+        w.label = row[1];
+    });
+    return rows;
+}
+
+// Push the crop_region value into the box's number rows. The frontend restores
+// widget values positionally, and the node's row order (the load/crop group is
+// moved to the bottom) differs from a freshly created node's, so a copy or
+// duplicate lands the neighbouring rows' values in them; the box value is the
+// source of truth (restored by name in configure, rewritten by refitCropBox)
+// and the core box widget's own callback copies it into its rows.
+function syncCropBoxRows(node) {
+    const region = findWidget(node, "crop_region");
+    if (!region?.linkedWidgets?.length) return;
+    if (typeof region.value !== "object" || !region.value) return;
+    region.callback?.(region.value);
+}
+
 // The frontend's Pinia stores, reached through the mounted Vue app. The
 // core's dynamic widgets (the context loader's mode rows) add/remove rows
 // through the widget store, so rows managed the same way behave exactly
@@ -585,6 +622,7 @@ function refitCropBox(node) {
         width: Math.round(nw),
         height: Math.round(nh),
     };
+    syncCropBoxRows(node);
     g.cropPreviewEl._gibbyPaint?.();
 }
 
@@ -673,6 +711,9 @@ function syncLoadGroup(node) {
     if (g.image) setWidgetHidden(g.image, !load);
     if (g.cropPreview) setWidgetHidden(g.cropPreview, !crop);
     if (g.region) setWidgetHidden(g.region, !crop);
+    // The box's number rows belong to its row: hidden with it, or four stray
+    // x/y/width/height rows sit under the size widgets.
+    for (const w of g.cropBox || []) setWidgetHidden(w, !crop);
     // The preview toggle gates only the executed temp preview - the file
     // preview (load) and the crop preview (crop) are the image UI then.
     setWidgetHidden(findWidget(node, "enable_preview"), load || crop);
@@ -695,6 +736,7 @@ function syncLoadGroup(node) {
     }
 
     if (crop) refitCropBox(node);
+    syncCropBoxRows(node);
     // Keep the native toggle in sync with the (serialized) combo value.
     const arToggle = findWidget(node, "gibby_crop_ar");
     if (arToggle) arToggle.value = getWidgetValue(node, "crop_ar") === "selected";
@@ -811,6 +853,7 @@ function setupResolutionNode(node) {
     const cropArW = findWidget(node, "crop_ar");
     const regionW = findWidget(node, "crop_region");
     const uploadW = findWidget(node, "upload");
+    const cropBoxRows = renameCropBoxRows(regionW);
 
     // The crop AR combo row is replaced by the labeled toggle (like the mode
     // combo by its switcher): keep the combo for serialization, hide the row.
@@ -825,6 +868,7 @@ function setupResolutionNode(node) {
         cropPreview: cropDom,
         cropPreviewEl: cropEl,
         region: regionW,
+        cropBox: cropBoxRows,
         byName: {
             load_image: loadW,
             image: imageW,

@@ -106,12 +106,18 @@ app.registerExtension({
             if (!hasAnything) return result;
 
             try {
-                const ctx = this.canvas?.getContext("2d");
+                const canvas = this.canvas;
+                const ctx = canvas?.getContext("2d");
                 if (!ctx) return result;
 
                 ctx.save();
+                // The core sizes the backing store at devicePixelRatio and draws graph
+                // space on top of that base transform; skipping it drifts the overlay
+                // towards the canvas origin (up and left) on scaled displays.
+                const dpr = canvas.clientWidth ? canvas.width / canvas.clientWidth : (window.devicePixelRatio || 1);
                 const ds = this.ds;
-                ctx.setTransform(ds.scale, 0, 0, ds.scale, ds.offset[0] * ds.scale, ds.offset[1] * ds.scale);
+                const s = ds.scale * dpr;
+                ctx.setTransform(s, 0, 0, s, ds.offset[0] * s, ds.offset[1] * s);
 
                 for (const node of nodes) {
                     let parts = [];
