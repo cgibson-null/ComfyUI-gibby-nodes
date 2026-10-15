@@ -10,8 +10,9 @@ on the positive conditioning (and negative if cfg != 1).
 For Qwen Image 2.1 the size is floored to 2x the VAE's downscale ratio so
 every vision slot covers 2x2 latents, and the context prompts are re-encoded
 with the same resized images so the text encoder sees them and the model
-splices the latents at the vision slots; other models (flux2/klein) floor to
-the VAE ratio and take the latents as-is.
+splices the latents at the vision slots; other models (flux2/klein, flux3) floor
+to the VAE ratio and take the latents as-is - flux3's text encoder is text-only
+and its DiT patchifies nothing, so the ratio alone is the whole constraint.
 
 With ref_ctx_img the context's own image is referenced too: always
 when no image input is connected (at its own size, no rescale), and with image

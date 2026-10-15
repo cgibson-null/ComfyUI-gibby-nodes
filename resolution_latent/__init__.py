@@ -10,15 +10,24 @@ Four modes (switched by the horizontal mode toggle in resolution_latent.js):
 - aspect_ratio: portrait presets (1:1, 2:3, 3:4, 9:16, 9:21) + megapixels;
 - custom_aspect_ratio: manual x : y floats + megapixels.
 
+The presets are portrait-only; Swap dimensions is the landscape switch, and
+"closest to image" picks the preset nearest the media's ratio in the media's own
+orientation (a landscape media gets the preset's swapped form, never 1:1).
+
 Megapixels 0 in the ratio modes: no target pixel count - the media's own size
 is used (rescaled by scale_factor) instead, or 1 MP when no media is linked.
+Swap dimensions flips the chosen size spec's orientation (portrait preset to
+landscape) and is ignored whenever the target comes from the media - megapixels
+0, keep AR, or closest to image - because a media-derived target has no
+orientation to swap; swapping it would stretch the media back.
 
 All widgets are always visible; the mode only selects which math drives the
 target size.
 
 Shared across all modes: swap_dimensions, scale_factor (resolution multiplier),
 multiple (round down to this multiple, advanced) and batch_size. The latent type
-toggle picks between the standard 4ch /8x image latent and Flux2's 128ch /16x one.
+toggle picks between the standard 4ch /8x image latent and Flux2's 128ch /16x one
+(Flux2, klein and Flux3 models; the context's model overrides it).
 Outputs the context, empty_latent, encoded_latent and the computed width/height
 for downstream sizing.
 
@@ -70,7 +79,7 @@ from comfy_api.latest import io, ui
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.color_util import hex_to_rgb
 
-from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, _is_flux2, ctx_from, ctx_set_image, empty_latent, encode_image
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, _is_flux2_latent, ctx_from, ctx_set_image, empty_latent, encode_image
 
 
 # Portrait presets only (square plus vertical ratios), named by the ratio.
@@ -81,11 +90,22 @@ ASPECT_RATIOS = {
     "9:16": (9, 16),
     "9:21": (9, 21),
 }
-# Picks the preset closest to the connected media's ratio; 3:4 without media.
+# Picks the preset closest to the connected media's ratio, in the media's own
+# orientation (a landscape media takes the preset's swapped form); 3:4 without media.
 CLOSEST_RATIO = "closest to image"
 
 KEEP_PROPORTIONS = ["stretch", "resize", "pad", "pad_around", "crop", "total_pixels"]
 CROP_POSITIONS = ["center", "top", "bottom", "left", "right"]
+
+
+def _closest_ratio(ar):
+    """The preset nearest an aspect ratio, returned in that ratio's own
+    orientation - the presets are portrait-only, so a landscape media would
+    otherwise collapse onto 1:1 instead of taking the swapped preset."""
+    portrait = ar <= 1
+    target = ar if portrait else 1 / ar
+    rw, rh = min(ASPECT_RATIOS.values(), key=lambda r: abs(math.log(r[0] / r[1] / target)))
+    return (rw, rh) if portrait else (rh, rw)
 
 
 def _resize_to_mp_scale(w, h, megapixels, scale_factor, multiple):
@@ -326,7 +346,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 "or custom aspect ratio (manual w:h + megapixels). Megapixels 0 rescales the media's own size instead, or "
                 "defaults to 1 MP with no media linked. "
                 "Shared: swap dimensions, scale factor, multiple and batch size; latent type toggle for "
-                "standard 8x vs Flux2 16x latents. With an image or mask connected (the context's when "
+                "standard 8x vs Flux2/Flux3 16x latents. With an image or mask connected (the context's when "
                 "nothing is) it is fitted into the target box per keep_proportion (stretch/resize/pad/pad_around/"
                 "crop/total_pixels; pad_around keeps the original size centered and pads the box around it like "
                 "Pad Image for Outpainting) and output resized. "
@@ -370,11 +390,13 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                                tooltip="Pad border color for the pad fit mode; alpha 0 makes the border transparent instead (RGBA output)"),
                 io.Combo.Input("crop_position", options=CROP_POSITIONS, default="center", advanced=True),
                 # shared settings (plain booleans render as pill toggles).
-                io.Boolean.Input("swap_dimensions", display_name="Swap dimensions", default=False),
+                io.Boolean.Input("swap_dimensions", display_name="Swap dimensions", default=False,
+                                  tooltip="Flip the size spec's orientation (a portrait preset or width x height becomes landscape); ignored while the target comes from the media - megapixels 0, keep AR or closest to image"),
                 io.Int.Input("multiple", default=8, min=1, max=256, advanced=True),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
                 # latent format: on = Flux 2's 128ch /16x latent, off = standard 4ch /8x.
-                io.Boolean.Input("flux2_latent", display_name="Flux 2 latent (16x)", default=False),
+                io.Boolean.Input("flux2_latent", display_name="Flux 2 latent (16x)", default=False,
+                                 tooltip="Flux2's 128ch /16x latent format (Flux2, klein and Flux3 use it); off is the standard 4ch /8x image latent. Ignored when the context has a model - it decides the format"),
                 # The executed temp preview in the node (like the core Preview Image):
                 # off by default - off writes no temp file at all. Hidden by the
                 # frontend while load or crop is on, where the preview is always
@@ -497,27 +519,33 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
 
         # The context's model decides the latent format when present, else the toggle
         model_obj = context.get("model") if isinstance(context, dict) else None
-        is_flux2 = _is_flux2(model_obj) if model_obj is not None else flux2_latent
+        is_flux2 = _is_flux2_latent(model_obj) if model_obj is not None else flux2_latent
 
-        # Latent grids must be divisible by 8 (image) or 16 (flux2), so round down to the lcm of multiple and that base.
+        # Latent grids must be divisible by 8 (image) or 16 (Flux2/Flux3), so round down to the lcm of multiple and that base.
         base = 16 if is_flux2 else 8
         step = multiple * base // math.gcd(multiple, base)
 
+        # The swap is the chosen size spec's orientation; a target taken from the
+        # media's own size or ratio has none, and swapping it stretches the media.
+        swap = swap_dimensions
         if mode == "custom":
             w, h, mp = float(width), float(height), 0.0
         elif megapixels == 0 and has_media:
             # 0 megapixels: no target pixel count, rescale the original media's size
             # (before upscale_model), so the upscaled image is fitted back to it.
             w, h, mp = float(OW), float(OH), 0.0
+            swap = False
         else:
             # Resolution Selector math at the selected ratio; keep_ar uses media's ratio or falls back to aspect_ratio.
             if mode == "keep_ar" and has_media:
                 rw, rh = float(SW), float(SH)
+                swap = False
             elif mode == "aspect_ratio" or (mode == "keep_ar" and not has_media):
                 if aspect_ratio == CLOSEST_RATIO:
-                    # Closest preset to the media's own ratio; 3:4 without media.
+                    # Closest preset to the media's own ratio and orientation; 3:4 without media.
                     if has_media:
-                        rw, rh = min(ASPECT_RATIOS.values(), key=lambda r: abs(r[0] / r[1] - SW / SH))
+                        rw, rh = _closest_ratio(SW / SH)
+                        swap = False
                     else:
                         rw, rh = ASPECT_RATIOS["3:4"]
                 else:
@@ -528,7 +556,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
             w, h, mp = rw, rh, megapixels or 1.0
 
         w, h = _resize_to_mp_scale(w, h, mp, scale_factor, step)
-        if swap_dimensions:
+        if swap:
             w, h = h, w
 
         # Media mode: fit the source into the (w x h) box per keep_proportion.

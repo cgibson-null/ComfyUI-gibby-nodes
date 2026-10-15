@@ -15,10 +15,13 @@ import { app } from "../../../scripts/app.js";
 // on suggestion-count changes, which wipes a one-time patch - so the append is
 // re-applied after each rebuild by hooking the core extension's setDefaults.
 //
-// The menu renders list entries as-is and creates the clicked entry as a node
-// - plain class names therefore show as ids (GibbyLoraLoader). Object
-// entries {node: className, title: label} are natively supported by both
-// paths, so entries are converted to that form to show display names instead.
+// Entries are kept as object entries {node: className, title: label}: the title
+// reaches the node created from the entry (createDefaultNodeForSlot). The
+// drag-out menu itself does not show it - LGraphCanvas.showConnectionMenu
+// flattens every entry to entry.node before building the ContextMenu, so the
+// suggestion rows would read as ids (GibbyLoraLoader). ContextMenu.addItem is
+// therefore wrapped to relabel a bare class-name entry with the node's display
+// name; the clicked value stays the class name, so the entry still resolves.
 
 const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO", "GIBBY_TILING_INFO", "LORA_STACK", "LLAMACPP_CONNECTIVITY", "LLAMACPP_OPTIONS"];
 
@@ -34,6 +37,32 @@ function displayEntry(entry) {
         if (display) return {node: entry, title: display};
     }
     return entry;
+}
+
+// The display name a menu row should show, for an entry that carries no label of
+// its own: a bare class name, or an entry the core reduced to {node: className}.
+function displayLabel(entry) {
+    if (typeof entry === "string") return classToDisplay.get(entry);
+    if (entry && typeof entry.node === "string" && entry.title === undefined && entry.content === undefined) {
+        return classToDisplay.get(entry.node);
+    }
+    return undefined;
+}
+
+// Relabel the id rows of every litegraph menu (the drag-out connection menu
+// among them) as they are built. Rows that already carry a title/content - the
+// node palette's category and node entries - are left alone.
+function hookMenuLabels() {
+    const proto = LiteGraph.ContextMenu?.prototype;
+    if (!proto || proto._gibbyLabelled) return;
+    proto._gibbyLabelled = true;
+    const addItem = proto.addItem;
+    proto.addItem = function (label, entry, options) {
+        const element = addItem.call(this, label, entry, options);
+        const display = element && displayLabel(entry);
+        if (display) element.textContent = display;
+        return element;
+    };
 }
 
 // Autogrow inputs (COMFY_AUTOGROW_V3) hide their real type inside
@@ -154,6 +183,7 @@ function hookSlotDefaults() {
 app.registerExtension({
     name: "Gibby.SlotSuggestions",
     setup() {
+        hookMenuLabels();
         hookSlotDefaults();
     },
     beforeRegisterNodeDef(nodeType, nodeData) {

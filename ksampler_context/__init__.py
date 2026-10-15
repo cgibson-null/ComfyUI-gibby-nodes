@@ -15,7 +15,8 @@ Key behaviors:
 - Crop-inpaint with an empty mask has no regions to inpaint: sampling is
   skipped entirely and the image passes through
 - Handles start_step/end_step as offsets from total steps when negative
-- Flux2 models use the Flux2 schedule for the sampled size; denoise takes that
+- Flux2 models use the Flux2 schedule for the sampled size (Flux3 keeps its own
+  constant shift and the context's scheduler); denoise takes that
   schedule's low-noise tail (like the native SplitSigmasDenoise) and start/end
   steps then slice the result
 - Updates context after sampling (removes latent/mask, stores decoded image)
@@ -31,14 +32,10 @@ Key behaviors:
   reference payloads (flux2 reference_latents, h3 minimax refs/keyframes) survive;
   the options output returns the (updated) options for feeding back in
 - DyPE options (soft dependency on the ComfyUI-DyPE pack, see dype_helper.py):
-  dype/sega/spa patch the model, pixelrush/freescale/hiflow take sampling
-  over. A patch is applied per sample at the size actually being sampled, so
-  combined with the iterative upscale every step is patched to its own new
-  resolution; the patch never leaves the step, so the outbound context carries
-  the original unpatched model. A cascade seeds the pack's noise from the seed
-  and keeps the context's mask - everything outside it comes back from the
-  pre-cascade latent - and names the features its own sampler and schedule
-  cannot honour
+  dype/sega patch the model. A patch is applied per sample at the size actually
+  being sampled, so combined with the iterative upscale every step is patched to
+  its own new resolution; the patch never leaves the step, so the outbound
+  context carries the original unpatched model
 """
 
 import gc
@@ -82,8 +79,7 @@ from ..ksampler_options.crop_inpaint import _KSAMPLER_OPTIONS_TYPE
 from ..crop_paste.crop_image_by_mask import _process_mask, _mask_box, _cover_crop
 from ..crop_paste.paste_image_by_mask import _paste_back
 from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox
-from .dype_helper import (DYPE_PATCH_METHODS, apply_dype_patch, is_dype_cascade, run_dype_cascade,
-                          warn_cascade_not_in_step, warn_cascade_overrides)
+from .dype_helper import DYPE_PATCH_METHODS, apply_dype_patch
 
 
 def _find_option(options_list, opt_type):
@@ -1481,8 +1477,9 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
 def _calculate_sigmas(model, scheduler_name, steps, sampler_name="euler", denoise=1.0, width=None, height=None):
     """Calculate sigmas from scheduler name and step count, respecting denoise level.
     A Flux2 model uses the Flux2 schedule (get_schedule) for the size instead, its
-    shift needs the sequence length; denoise always takes the schedule's low-noise
-    tail, like the native SplitSigmasDenoise."""
+    shift needs the sequence length; a Flux3 model has a constant reference shift
+    in its own model sampling, so it stays on the context's scheduler.
+    denoise always takes the schedule's low-noise tail, like the native SplitSigmasDenoise."""
     if _is_flux2(model) and get_schedule is not None:
         if not width or not height:
             width, height = 1024, 1024
@@ -1542,10 +1539,9 @@ def _apply_start_end_steps(sigmas_tensor, steps_value, start_step, end_step, lef
 
 def _dype_model(model_obj, ctx, dype_opt, verbose=False):
     """The model with the DyPE patch applied for the single-sample path
-    (dype/sega/spa). The patch stays on this local clone - the context and
-    the outputs keep the original unpatched model. The cascade methods hijack
-    sampling instead of patching, and a context with no size leaves the model
-    untouched."""
+    (dype/sega). The patch stays on this local clone - the context and
+    the outputs keep the original unpatched model, and a context with no size
+    leaves the model untouched."""
     if dype_opt is None or dype_opt.get("method") not in DYPE_PATCH_METHODS:
         return model_obj
     w, h, _ = _latent_dims(ctx.get("latent"), ctx.get("vae"))
@@ -1583,7 +1579,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             description=(
                 "Samples using parameters from a CONTEXT object. Override model, latent, image, "
                 "mask, sampler, or sigmas as needed. Automatically encodes images and updates context. "
-                "DyPE options patch the model per sample (or cascade the latent) - see DyPE options."
+                "DyPE options patch the model per sample - see DyPE options."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context"),
@@ -1669,8 +1665,8 @@ class GibbyKSamplerContext(io.ComfyNode):
         # evaluate(), which would otherwise encode the image for nothing
         inpaint_opt = _find_option(options_list, "inpaint")
         iterative_opt = _find_option(options_list, "iterative_upscale")
-        # DyPE (soft dependency): patches the model, or takes sampling over when a
-        # cascade method is selected; absent when the options node is not wired
+        # DyPE (soft dependency): patches the model per sample; absent when the
+        # options node is not wired
         dype_opt = _find_option(options_list, "dype")
         # The color match option enables and tunes color matching for
         # crop-inpaint and the iterative upscale; without it no matching runs
@@ -1695,11 +1691,6 @@ class GibbyKSamplerContext(io.ComfyNode):
             if verbose:
                 _log("Crop-Inpaint skipped", "the mask is empty")
             return io.NodeOutput(ctx, None, ctx["image"], None, ctx.get("vae"), ctx.get("vae_audio"), options_list)
-        # A cascade hooks the sampler, not the model, so it cannot run inside the
-        # crop-inpaint / iterative upscale steps that are about to start
-        if is_dype_cascade(dype_opt) and ((inpaint_opt is not None and has_image and has_mask) or
-                                          (iterative_opt is not None and has_vae)):
-            warn_cascade_not_in_step(dype_opt)
         result = None
         if inpaint_opt is not None and iterative_opt is not None and has_image and has_mask and has_vae:
             # Crop first, then pass each crop (image + mask) to the iterative
@@ -1934,22 +1925,8 @@ class GibbyKSamplerContext(io.ComfyNode):
                 # Start step beyond available steps, return latent as-is or zeros
                 samples = latent_image if ctx["latent"] is not None else torch.zeros_like(noise)
 
-        # DyPE cascade (PixelRush/FreeScale/HiFlow): the pack samples and cascades
-        # the context's latent itself, so the regular sampling path is skipped
-        dype_latent = None
-        if samples is None and is_dype_cascade(dype_opt):
-            if ctx.get("vae") is None:
-                raise ValueError(f"DyPE {dype_opt.get('method')} needs a VAE - connect one to the context")
-            warn_cascade_overrides(dype_opt, sigmas=sigmas, sampler=sampler, start_step=start_step,
-                                   end_step=end_step, add_noise=add_noise, denoise=denoise_value,
-                                   lora_travel=bool(travel_opts), prompt_travel=prompt_state is not None)
-            dype_latent = run_dype_cascade(dype_opt, model_obj, ctx["vae"], positive, negative,
-                                           ctx["latent"], seed, cfg_value, steps_value)
-            if verbose:
-                _log("DyPE", f"{dype_opt.get('method')} cascaded the latent -> {tuple(dype_latent['samples'].shape)}")
-
         # Sample with the (possibly sliced) sigmas
-        if samples is None and dype_latent is None:
+        if samples is None:
             travel_state = _prepare_lora_travels(model_obj, travel_opts, run_steps)
             # The sliced sub-run starts at the resolved start step: travels are
             # indexed by global step, so shift their range by it
@@ -1957,16 +1934,13 @@ class GibbyKSamplerContext(io.ComfyNode):
             samples = _sample_with_travels(model_obj, travel_state, prompt_state, noise, cfg_value, sampler_obj, sigmas_tensor,
                                             positive, negative, latent_image, noise_mask, callback,
                                             disable_pbar, seed, step_offset)
-        if dype_latent is not None:
-            samples = dype_latent["samples"]
-
         # The model is done after sampling: free it before the decode so the
         # VAE gets the VRAM back (Clear VRAM options).
         if decode and clear_after_model:
             _clear_vram("after model", clear_verbose)
 
-        # Build output latent (a cascade owns its latent: keep its own ratios)
-        out_latent = dict(dype_latent) if dype_latent is not None else ctx["latent"].copy()
+        # Build output latent
+        out_latent = ctx["latent"].copy()
         out_latent.pop("downscale_ratio_spacial", None)
         out_latent.pop("downscale_ratio_temporal", None)
         out_latent["samples"] = samples

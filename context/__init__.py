@@ -170,16 +170,29 @@ def _latent_count_s(latent):
     return ""
 
 
+def _is_model(model_obj, model_classes):
+    """Whether a model wrapper (ModelPatcher) wraps one of model_classes."""
+    return model_obj is not None and hasattr(model_obj, "model") and isinstance(model_obj.model, model_classes)
+
+
 def _is_flux2(model_obj):
-    """Whether a model wrapper (ModelPatcher) wraps a Flux2 model."""
-    return model_obj is not None and hasattr(model_obj, "model") and isinstance(model_obj.model, comfy.model_base.Flux2)
+    """Whether a model wrapper (ModelPatcher) wraps a Flux2 (or klein) model -
+    the family whose recipe wants the sequence-length-aware Flux2 schedule."""
+    return _is_model(model_obj, comfy.model_base.Flux2)
+
+
+def _is_flux2_latent(model_obj):
+    """Whether a model wrapper (ModelPatcher) wants Flux2's 128ch /16x latents.
+    Flux3 shares the Flux2 latent format but keeps its own constant shift, so
+    the latent format and the schedule ask with different predicates."""
+    return _is_model(model_obj, (comfy.model_base.Flux2, comfy.model_base.Flux3))
 
 
 def empty_latent(width, height, batch_size=1, flux2=None, model_obj=None):
-    """An empty latent dict for width x height: Flux2's 128ch /16x one when flux2
-    (or model_obj is a Flux2 model), else the standard 4ch /8x one."""
+    """An empty latent dict for width x height: the 128ch /16x Flux2 one when
+    flux2 (or model_obj is a Flux2/Flux3 model), else the standard 4ch /8x one."""
     if flux2 is None:
-        flux2 = _is_flux2(model_obj)
+        flux2 = _is_flux2_latent(model_obj)
     if flux2:
         samples = torch.zeros([batch_size, 128, height // 16, width // 16],
                               device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())

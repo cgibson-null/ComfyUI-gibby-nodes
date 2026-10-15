@@ -11,7 +11,7 @@ git clone https://github.com/cgibson-null/ComfyUI-gibby-nodes
 
 The core idea: a **Context** node is a bag with sampling and metadata related values that can be overridden. Has Any slot added with idea of using Any Pipe node. Every field is optional. Spiritual inheritor of [rgthree's](https://github.com/rgthree/rgthree-comfy) Context.
 
-**Context Loader** - loads model(ckpt or diff)/clip(s up to 4)/vae(s - for audio too), sets prompts and sampling params, and outputs a ready-to-use context. The starting point of most workflows. Detects model category and creates appropriate latent for it (flux2). Spiritual inheritor of [Efficient loader](https://github.com/jags111/efficiency-nodes-comfyui).
+**Context Loader** - loads model(ckpt or diff)/clip(s up to 4)/vae(s - for audio too), sets prompts and sampling params, and outputs a ready-to-use context. The starting point of most workflows. Detects model category and creates appropriate latent for it (flux2/flux3). Spiritual inheritor of [Efficient loader](https://github.com/jags111/efficiency-nodes-comfyui).
 
 **Context Override** - provides widgets to override context values. Toggles let you choose which categories to override. Useful when you want to separate setting per sampling stage (steps 1-3 higher cfg, 1st prompt, remaining steps - 1cfg, 2nd prompt; etc)
 
@@ -32,7 +32,7 @@ Use **inputs** to override context values (override happens first, so output con
 **Latent** used in priority:
 - provided latent;
 - encode image and/or audio with provided masks using respective VAE, combine if both;
-- create empty latent based on context width and height, respectin model type (flux2).
+- create empty latent based on context width and height, respectin model type (flux2/flux3).
 
 **Steps:** widget `steps` overrides context's steps and refiner_steps when >0. refiner_steps are used for i2i. start/end inside defined by widget or context step will ignore refiner_steps.
 
@@ -41,7 +41,7 @@ Use **inputs** to override context values (override happens first, so output con
 - `value < 0` - offset from the end (e.g. -5 = last 5 steps)
 - `value ≥ 1` - absolute step number
 
-**Denoise:** only applies when an image is present, otherwise forced to 1.0. Always slices the schedule, so start/end step narrow the denoised range instead of cancelling the denoise. flux2 models sample with the Flux2 schedule for the sampled size, denoise takes its low-noise tail exactly like `Flux2Scheduler` -> `SplitSigmasDenoise` (`low_sigmas`).
+**Denoise:** only applies when an image is present, otherwise forced to 1.0. Always slices the schedule, so start/end step narrow the denoised range instead of cancelling the denoise. flux2 models sample with the Flux2 schedule for the sampled size, denoise takes its low-noise tail exactly like `Flux2Scheduler` -> `SplitSigmasDenoise` (`low_sigmas`); flux3 keeps its own constant shift and the context's scheduler.
 
 **Decode:** on by default. Decodes the output latent to image/audio/both and removes latent from context. An image whose size is not a multiple of the VAE's downscale ratio is pre-scaled to it before encoding, and the decoded image is stretched back to the original size, so the content stays aligned with the original. Disable to skip decoding in case you're chaining ksamplers (wan high pass).
 
@@ -56,7 +56,7 @@ Crop-Inpaint options and Iterative Options are inclusive, meaning can be used to
 
 **Clear VRAM options** frees VRAM like [Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use)'s Clean VRAM Used.
 
-**DyPE options** - needs the [DyPE](https://github.com/wildminder/ComfyUI-DyPE) pack. dype/sega/spa patch the model for high-resolution generation, so every other feature applies to them. pixelrush/freescale/hiflow cascade the context's latent instead of sampling it: the context mask keeps everything outside it from the pre-cascade latent, the seed drives their noise, and 0 on their guidance/steps widgets means the context's value. What a cascade can't hook (its own sampler and schedule) is named on the console: connected sampler or sigmas, start/end step, denoise, lora/prompt travel, and the crop-inpaint / iterative upscale steps.
+**DyPE options** - needs the [DyPE](https://github.com/wildminder/ComfyUI-DyPE) pack. dype/sega patch the model for high-resolution generation, so every other feature applies to them: the patch is re-applied per sample at the size actually being sampled, which makes it combine with the iterative upscale, and it never leaves that step.
 
 **Tiled VAE options** - self-explanatory.
 
@@ -84,7 +84,7 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 **Resize Image / Empty Latent (Context)** - creates empty latent or resizes connectd image/mask allowing to keep proportions. Optional vae overrides the context's vae; encoded_latent outputs the image encoded with it (empty_latent when no image or vae). Always outputs a context - without a context input it creates a new one with width, height and the empty latent. `Enable preview` toggle (off by default, hidden while load image / crop image is on) writes and shows the output image's temp preview in the node on execution; off writes no preview file at all (while load / crop is on the preview is always written - downstream crop views read the context's image from it).
 
-**Reference Latent (Context)** - faster flux2/klein referenes, rescale all to the `megapixels` target then to `scale` (0 = own size), floored to the VAE's downscale ratio (2x for qwen image 2.1, so the latents splice at the vision slots) and the prompts are also re-encoded with the images. `ref_ctx_img` additionally references the context's own image at its own size (always when no image is linked, otherwise only when enabled); with no context image the first image becomes the context image and is stored back on the output context. A media pipe's reference images are referenced too - the wired images append to them in the output pipe. Without a context input it is just a media pipe creator: the wired images append to the pipe and the context passes through empty.
+**Reference Latent (Context)** - faster flux2/klein/flux3 references, rescale all to the `megapixels` target then to `scale` (0 = own size), floored to the VAE's downscale ratio (2x for qwen image 2.1, so the latents splice at the vision slots) and the prompts are also re-encoded with the images. `ref_ctx_img` additionally references the context's own image at its own size (always when no image is linked, otherwise only when enabled); with no context image the first image becomes the context image and is stored back on the output context. A media pipe's reference images are referenced too - the wired images append to them in the output pipe. Without a context input it is just a media pipe creator: the wired images append to the pipe and the context passes through empty.
 
 **Image Saver (Context)** - saves image with a1111 metadata (civit compatible) created from context values. Ripoff from [ImageSaver](https://github.com/alexopus/ComfyUI-Image-Saver) pack.
 

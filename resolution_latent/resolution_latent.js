@@ -574,25 +574,49 @@ function cropImageAR(node) {
     return nat ? nat.w / nat.h : null;
 }
 
+// The preset nearest an image aspect ratio, in the image's own orientation: the
+// presets are portrait-only, so a landscape image takes the swapped preset
+// instead of collapsing onto 1:1 (the backend does the same).
+function closestRatio(imgAR) {
+    const portrait = imgAR <= 1;
+    const target = portrait ? imgAR : 1 / imgAR;
+    let best = null;
+    let bestDist = Infinity;
+    for (const [w, h] of Object.values(ASPECT_RATIOS)) {
+        const dist = Math.abs(Math.log(w / h / target));
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = [w, h];
+        }
+    }
+    return portrait ? best[0] / best[1] : best[1] / best[0];
+}
+
 // The AR the crop box is locked to with "selected": the node's size mode -
 // keep AR the image's, custom the width/height, aspect ratio the preset
-// ("closest to image" the image's), custom AR the manual x/y. Swap
-// dimensions inverts it (the backend does the same). null for the
-// free-form "custom" box.
+// ("closest to image" the preset nearest the image, in the image's orientation),
+// custom AR the manual x/y. Swap dimensions inverts it (the backend does the
+// same) except for the media-driven targets, which take the image's orientation.
+// null for the free-form "custom" box.
 function lockedRatio(node) {
     if (getWidgetValue(node, "crop_ar") !== "selected") return null;
     const mode = getWidgetValue(node, "mode") || "aspect_ratio";
     const imgAR = cropImageAR(node) || 1;
     let ratio;
-    if (mode === "keep_ar") ratio = imgAR;
-    else if (mode === "custom") {
+    let fromMedia = false;
+    if (mode === "keep_ar") {
+        ratio = imgAR;
+        fromMedia = true;
+    } else if (mode === "custom") {
         const w = getWidgetValue(node, "width");
         const h = getWidgetValue(node, "height");
         ratio = h ? w / h : imgAR;
     } else if (mode === "aspect_ratio") {
         const ar = getWidgetValue(node, "aspect_ratio");
-        if (ar === CLOSEST_RATIO) ratio = imgAR;
-        else {
+        if (ar === CLOSEST_RATIO) {
+            ratio = closestRatio(imgAR);
+            fromMedia = true;
+        } else {
             const p = ASPECT_RATIOS[ar];
             ratio = p ? p[0] / p[1] : imgAR;
         }
@@ -601,7 +625,7 @@ function lockedRatio(node) {
         const y = getWidgetValue(node, "y");
         ratio = y ? x / y : imgAR;
     }
-    return getWidgetValue(node, "swap_dimensions") ? 1 / ratio : ratio;
+    return getWidgetValue(node, "swap_dimensions") && !fromMedia ? 1 / ratio : ratio;
 }
 
 // Keep the box's center, fit it to the locked AR within the image.

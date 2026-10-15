@@ -15,7 +15,7 @@ schema, each living in its own self-contained folder:
 - detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
 - llm/: LLM Connect - Connectivity, Sampling Options, Unsloth Load Options and Generate for a llama.cpp / llama-swap / Unsloth server (OpenAI-compatible API), with auto-growing image/video references; Generate also takes a media pipe (refs + keyframes, labeled) and outputs one.
 - tiling.py: Split Tiles (Context) / Combine Tiles (Context) - splits the context image into a batch of uniform overlapping tiles with crop-inpaint masks; recombines the tile batch (at the upscaled size) with a crossfade across the overlaps.
-- ksampler_options/dype.py: DyPE options - the ComfyUI-DyPE pack as a soft dependency (registered only when that pack is installed). dype/sega/spa patch the model for high-resolution generation, pixelrush/freescale/hiflow take sampling over; KSampler (Context) does both through ksampler_context/dype_helper.py, re-patching per sample at the size actually being sampled so the outbound context keeps the original model.
+- ksampler_options/dype.py: DyPE options - the ComfyUI-DyPE pack as a soft dependency (registered only when that pack is installed). dype/sega patch the model for high-resolution generation; KSampler (Context) applies them through ksampler_context/dype_helper.py, re-patching per sample at the size actually being sampled so the outbound context keeps the original model.
 
 INSTALL:
 Put this whole folder in ComfyUI/custom_nodes/, then restart ComfyUI.
@@ -89,7 +89,8 @@ try:
     # bypass/mute buttons on group headers, context.js for Context suggestions,
     # resolution_latent.js for Resize Image / Empty Latent (Context)'s mode
     # switcher and crop preview, crop_preview.js for the shared crop preview it
-    # uses, and detection_tracking.js for the Mask/Segment tracker rows.
+    # uses, detection_tracking.js for the Mask/Segment tracker rows, and
+    # tiling.js for Split Tiles (Context)'s overlap row.
     for _rel in (
         "lora_loader/lora_loader.js",
         "fast_groups.js",
@@ -102,6 +103,7 @@ try:
         "ksampler_context/ksampler_context.js",
         "llm/llm.js",
         "node_runtime.js",
+        "tiling.js",
     ):
         PromptServer.instance.routes.get(
             f"/extensions/{_FOLDER_NAME}/{_rel}"
