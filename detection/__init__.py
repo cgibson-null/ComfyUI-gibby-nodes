@@ -49,6 +49,7 @@ from fractions import Fraction
 import av
 import numpy as np
 import torch
+from scipy import ndimage as ndi
 import folder_paths
 import nodes
 import comfy.sd
@@ -56,7 +57,7 @@ import comfy.utils
 from comfy_api.latest import io, ui
 from comfy_extras.color_util import hex_to_rgb
 
-from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from, parse_index_spec
 from ..crop_paste.crop_image_by_mask import _store_crop_info
 from ..resolution_latent import _mask_bbox
 
@@ -116,16 +117,17 @@ def _sam3_models():
     return opts or all_models or ["(no models found)"]
 
 
-_yolo_detectors = {}  # model_name -> detector (the subpack's doit reloads the weights each call)
+_last_yolo = None  # (model_name, detector) - one entry, like the SAM caches below
 
 
 def _bbox_detector(model_name):
+    global _last_yolo
     provider = nodes.NODE_CLASS_MAPPINGS.get("UltralyticsDetectorProvider")
     if provider is None:
         raise ValueError("bbox/segm detection needs ComfyUI-Impact-Subpack (UltralyticsDetectorProvider)")
-    if model_name not in _yolo_detectors:
-        _yolo_detectors[model_name] = provider().doit(model_name)[0]
-    return _yolo_detectors[model_name]
+    if _last_yolo is None or _last_yolo[0] != model_name:
+        _last_yolo = (model_name, provider().doit(model_name)[0])
+    return _last_yolo[1]
 
 
 def _parse_points(coords):
@@ -379,31 +381,10 @@ def _track_sam3(image, model, conditioning, initial_mask, detection_threshold, m
 
 
 def _resolve_indices(spec, n):
-    # SAM3 Track to Mask's "0,2,3" plus single indices and slices: "-1" is the
-    # last tracked object, "1:3" / ":-2" / "::2" are python slices of the object
-    # list. Returns the object indices in track order.
-    if not (spec or "").strip():
-        return list(range(n))
-    picked = set()
-    for part in spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            if ":" in part:
-                bounds = part.split(":")
-                if len(bounds) > 3:
-                    raise ValueError
-                nums = [int(b) if b.strip() else None for b in bounds] + [None] * (3 - len(bounds))
-                picked.update(range(*slice(*nums).indices(n)))
-            else:
-                i = int(part)
-                i += n if i < 0 else 0
-                if 0 <= i < n:
-                    picked.add(i)
-        except ValueError:
-            raise ValueError(f"Invalid object_indices entry: {part!r} (indices like '0,2' or a slice like '1:3')")
-    return sorted(picked)
+    # SAM3 Track to Mask's "0,2,3" plus single indices, ranges and slices, in
+    # track order; an empty spec is every tracked object.
+    picked = parse_index_spec(spec, n, field="object_indices")
+    return sorted(picked) if picked is not None else list(range(n))
 
 
 def _fix_mask(mask, remove_isolated_pixels, fill_holes):
@@ -411,7 +392,6 @@ def _fix_mask(mask, remove_isolated_pixels, fill_holes):
     # fill_holes: close the holes the mask encloses (KJ Grow Mask With Blur)
     if not remove_isolated_pixels and not fill_holes:
         return mask
-    import scipy.ndimage as ndi
     out = []
     for m in mask:
         arr = m.cpu().numpy().astype(np.float32)
@@ -503,7 +483,7 @@ def _sam3_track_inputs():
         io.Int.Input("detect_interval", default=1, min=1,
                      tooltip="Run detection every N frames (1 = every frame, higher saves compute)"),
         io.String.Input("object_indices", default="",
-                        tooltip="Tracked objects to keep: '0,2', the last one '-1', a slice '1:3' or ':-2' "
+                        tooltip="Tracked objects to keep: '0,2', the last one '-1', a range '0-2', a slice '1:3', ':-2' or '::2' "
                                 "(empty = every tracked object)"),
     ]
 

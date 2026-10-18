@@ -44,6 +44,7 @@ from .llamacpp_client import (
     unsloth_unload,
 )
 from ..pipes.media_pipe import iter_numbered_slots, pipe_add_images
+from ..context import clear_vram as _clear_vram
 from .llamacpp_refs import MAX_REF_SLOTS, _is_frame_batch, collect_reference_images, encode_image_batch
 from .llamacpp_shared import filter_enabled_options
 
@@ -57,8 +58,28 @@ _CATEGORY = "gibby/llm connect"
 # images are re-sent fresh from the connected inputs every run, so they
 # stay out of the stored history. Stored after each successful run;
 # switching keep_context off, or the server/model, starts a fresh
-# conversation.
+# conversation. Both bounds are load-bearing: a conversation that is never
+# trimmed outgrows the server's context window, and a node that is deleted or
+# moved to another model leaves its key behind, so the oldest conversation and
+# its oldest turns are dropped.
+_MAX_CONVERSATIONS = 32
+_MAX_TURNS = 40
 _CONVERSATIONS: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+
+
+def _stored_conversation(conv_key):
+    """The stored turns for this node + server + model, marked the most recent."""
+    history = _CONVERSATIONS.pop(conv_key, None)
+    if history is None:
+        return []
+    _CONVERSATIONS[conv_key] = history
+    return list(history)
+
+
+def _store_conversation(conv_key, turns):
+    _CONVERSATIONS[conv_key] = turns[-_MAX_TURNS:]
+    while len(_CONVERSATIONS) > _MAX_CONVERSATIONS:
+        _CONVERSATIONS.pop(next(iter(_CONVERSATIONS)))
 
 
 def _normalize_stop(options: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -115,24 +136,6 @@ def _maybe_unload(url: str, model: str, connectivity: dict[str, Any] | None, deb
     except LlamaCppError as exc:
         if debug:
             print(f"[Gibby-LLM] keep_alive=0 unload request failed (non-fatal): {exc}")
-
-
-def _clear_comfy_vram(debug: bool = False) -> None:
-    """Free ComfyUI's GPU memory before handing VRAM to the LLM server --
-    same recipe as Easy-Use's 'Clean VRAM Used' node: gc, CUDA sync,
-    unload_all_models, soft_empty_cache."""
-    import gc
-
-    import torch
-    import comfy.model_management as mm
-
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    mm.unload_all_models()
-    mm.soft_empty_cache()
-    if debug:
-        print("[Gibby-LLM] Cleared ComfyUI VRAM.")
 
 
 def _maybe_unsloth_load(url: str, model: str, api_key: str | None, options: dict[str, Any] | None, debug: bool = False) -> str | None:
@@ -629,7 +632,7 @@ class GibbyGenerate(io.ComfyNode):
         node_id = getattr(getattr(cls, "hidden", None), "unique_id", None) or "generate"
         conv_key = (node_id, url, model)
         if keep_context:
-            history = list(_CONVERSATIONS.get(conv_key, []))
+            history = _stored_conversation(conv_key)
         else:
             history = []
             _CONVERSATIONS.pop(conv_key, None)
@@ -652,7 +655,7 @@ format: {format}
 """)
 
         if clear_vram:
-            _clear_comfy_vram(debug_print)
+            _clear_vram("before the LLM server", verbose=debug_print)
 
         # Unsloth keys model lookup to the identity it loaded the model
         # under, so a hub repo id can miss a locally-loaded model (and
@@ -690,7 +693,7 @@ format: {format}
             turn: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
             if result_text:
                 turn.append({"role": "assistant", "content": result_text})
-            _CONVERSATIONS[conv_key] = [*history, *turn]
+            _store_conversation(conv_key, [*history, *turn])
 
         _maybe_unload(url, model, connectivity, debug_print)
 

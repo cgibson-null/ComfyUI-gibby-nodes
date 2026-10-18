@@ -7,29 +7,15 @@
 // the node's crop_region widget, and a W x H label at the bottom.
 // ---------------------------------------------------------------------------
 
-import { app } from "../../scripts/app.js";
+import { liveNode, getWidgetValue } from "./gibby_widgets.js";
 
 // The row's minimum, for the DOM widget's computeLayoutSize: the preview's
 // floor. The widget has no maxHeight, so it absorbs the node's extra height
 // and the preview stretches with the node.
 export const CROP_PREVIEW_MIN_H = 120;
 
-// Resolve the live instance in the graph currently shown: a tab switch
-// rebuilds the graph in place (new instance, same id), so a global registry
-// would go stale and writes would hit a dead instance.
-export function liveNode(id) {
-    const graph =
-        (app.canvas && app.canvas.getCurrentGraph && app.canvas.getCurrentGraph()) ||
-        app.graph;
-    return graph ? graph.getNodeById(id) : null;
-}
-
 function clamp(v, lo, hi) {
     return Math.max(lo, Math.min(hi, v));
-}
-
-function getWidgetValue(node, name) {
-    return node.widgets?.find((w) => w.name === name)?.value;
 }
 
 // The URL without the store's &rand cache-buster (buildImageUrls appends a

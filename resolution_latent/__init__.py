@@ -44,9 +44,10 @@ upscaled result is fitted back into the target box (scale factor, not the
 model's factor, sets the final size).
 
 Load image (Load Image node functionality): loads a file from the input folder
-by path (upload + preview + mask drawing on the preview, like the core Load
-Image - the drawn mask is the file's alpha). The loaded image replaces the
-connected one, and the file's alpha replaces the connected or context mask.
+by path (the upload button, a file dropped on the node, a pasted image,
+preview + mask drawing on the preview, like the core Load Image - the drawn
+mask is the file's alpha). The loaded image replaces the connected one, and the
+file's alpha replaces the connected or context mask.
 
 With an image or a context's image connected, the node shows the output
 image's temp preview in the node on execution (like the core Preview
@@ -71,6 +72,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import folder_paths
 import comfy.model_management
 import comfy.utils
@@ -79,7 +81,7 @@ from comfy_api.latest import io, ui
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
 from comfy_extras.color_util import hex_to_rgb
 
-from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, _is_flux2_latent, ctx_from, ctx_set_image, empty_latent, encode_image
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, _is_flux2_latent, ctx_from, ctx_set_image, ctx_set_latent, empty_latent, encode_image
 
 
 # Portrait presets only (square plus vertical ratios), named by the ratio.
@@ -136,7 +138,6 @@ def _resize_image_to_mp(image, megapixels, scale_factor, multiple, method="bilin
 
 def _resize_mask(mask, w, h, mode="bilinear"):
     """Resize a (B,H,W) or (B,C,H,W) mask to an exact (w, h); nearest modes keep hard edges."""
-    import torch.nn.functional as F
     m = mask.unsqueeze(1) if mask.dim() == 3 else mask
     if mode in ("nearest", "nearest-exact"):
         m = F.interpolate(m, size=(h, w), mode=mode)
@@ -350,8 +351,8 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 "nothing is) it is fitted into the target box per keep_proportion (stretch/resize/pad/pad_around/"
                 "crop/total_pixels; pad_around keeps the original size centered and pads the box around it like "
                 "Pad Image for Outpainting) and output resized. "
-                "Load image loads a file from the input folder (upload, preview and mask drawing like the core "
-                "Load Image) instead of the connected image; its alpha replaces the connected or context mask when non-empty. "
+                "Load image loads a file from the input folder (upload button, drop a file on the node, "
+                "paste, preview and mask drawing like the core Load Image) instead of the connected image; its alpha replaces the connected or context mask when non-empty. "
                 "Crop image is independent of it: it crops the image the resize uses (the loaded file with Load image on, "
                 "else the connected or context image) to the drawn box, the box mask becomes the mask, and the crop info "
                 "is output and stored for pasting back with Image Paste By Mask (Batch) (Context). "
@@ -410,7 +411,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Boolean.Input("load_image", display_name="Load image", default=False, optional=True,
                                  tooltip="Load an image from the input folder instead of the connected one; its alpha (the mask drawn on the preview) replaces the connected or context mask when non-empty"),
                 io.Combo.Input("image", options=files, default=files[0] if files else "", upload=io.UploadType.image, optional=True,
-                               tooltip="The file in the input folder to load (upload a file, or draw a mask on the preview - it is saved as the file's alpha). With Load image off it is where a mask drawn on the node's executed preview lands (the core mask editor), and its alpha is used as the mask"),
+                               tooltip="The file in the input folder to load (the upload button, a file dropped on the node or a pasted image adds it here, or draw a mask on the preview - it is saved as the file's alpha). With Load image off it is where a mask drawn on the node's executed preview lands (the core mask editor), and its alpha is used as the mask"),
                 io.Boolean.Input("crop_image", display_name="Crop image", default=False, optional=True,
                                  tooltip="Crop the image the resize uses (the loaded file with Load image on, else the connected or context image) to the drawn box before the resize; the box mask becomes the mask and the crop info is output and stored in the context"),
                 io.Combo.Input("crop_ar", options=["custom", "selected"], default="custom", optional=True,
@@ -569,7 +570,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 pad_left, pad_right, pad_top, pad_bottom = _pad_amounts(w - out_w, h - out_h, crop_position)
 
             # Crop the source to the target aspect ratio before resizing.
-            x = y = 0
+            crop_x = crop_y = 0
             cw, ch = SW, SH
             if keep_proportion == "crop":
                 new_aspect = w / h
@@ -577,11 +578,11 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                     cw, ch = round(SH * new_aspect), SH
                 else:
                     cw, ch = SW, round(SW / new_aspect)
-                x, y = _crop_offsets(SW, SH, cw, ch, crop_position)
+                crop_x, crop_y = _crop_offsets(SW, SH, cw, ch, crop_position)
 
             # Resize the connected media to match the final dimensions.
             if connected_image is not None:
-                img = _resize_image(connected_image[:, y:y + ch, x:x + cw], out_w, out_h, upscale_method)
+                img = _resize_image(connected_image[:, crop_y:crop_y + ch, crop_x:crop_x + cw], out_w, out_h, upscale_method)
                 if is_pad:
                     bg = _pad_color_tensor(pad_color, connected_image.dtype, connected_image.device)
                     if _color_alpha(pad_color) == 0.0:
@@ -595,7 +596,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
 
             # Masks are [B,H,W]; bilinear keeps them smooth like core resize paths.
             if mask is not None:
-                msk = comfy.utils.common_upscale(mask[:, y:y + ch, x:x + cw].unsqueeze(1), out_w, out_h, "bilinear", "disabled").squeeze(1)
+                msk = comfy.utils.common_upscale(mask[:, crop_y:crop_y + ch, crop_x:crop_x + cw].unsqueeze(1), out_w, out_h, "bilinear", "disabled").squeeze(1)
                 if is_pad:
                     # Replicate edge values into the padding like kijai's pad node.
                     msk = torch.nn.functional.pad(msk, (pad_left, pad_right, pad_top, pad_bottom), mode="replicate")
@@ -650,7 +651,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         if connected_image is not None:
             ctx_set_image(ctx, img)
         else:
-            ctx["latent"] = latent
+            ctx_set_latent(ctx, latent)
         if crop_mask is not None:
             # The box mask is in the original image's space, but the context's
             # image is the resized crop, so the two don't correspond - the

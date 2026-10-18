@@ -10,16 +10,16 @@ height, length, ref_image_size). The same dict also feeds Reference Latent
 """
 import logging
 import math
-import torchaudio
 
 import nodes
 import node_helpers
+import comfy.audio
 from comfy_api.latest import io
 from comfy_extras.nodes_minimax_h3 import (
     _empty_av_latent, _resize, adapt_canvas,
     CANVAS_MULTIPLE, REF_IMAGE_SHORT_EDGE, FPS,
 )
-from ..context import _CONTEXT_TYPE, ctx_from
+from ..context import _CONTEXT_TYPE, ctx_from, ctx_set_latent
 from .media_pipe import iter_numbered_slots
 
 
@@ -38,7 +38,7 @@ def _encode_ref_audio(audio_vae, audio):
     sr = audio["sample_rate"]
     vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
     if sr != vae_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
+        waveform = comfy.audio.resample(waveform, sr, vae_sr)
     z = audio_vae.encode(waveform[:1].movedim(1, -1))
     return z, z.shape[-1]
 
@@ -269,6 +269,8 @@ class H3PipeCreate(io.ComfyNode):
                 io.Int.Input("length", default=124, min=5, max=3600, step=17,
                              tooltip="Frames at 24 fps; snaps to 17k+5.", optional=True),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match", optional=True),
+                io.Boolean.Input("override_config", default=False, optional=True,
+                                 tooltip="Write width, height, length and ref_image_size into a connected pipe even when the widget still holds its default value"),
                 io.Image.Input("first_frame", optional=True),
                 io.Image.Input("last_frame", optional=True),
                 io.Image.Input("keyframes", optional=True,
@@ -297,7 +299,8 @@ class H3PipeCreate(io.ComfyNode):
 
     @classmethod
     def execute(cls, h3_pipe=None, prompt=None, width=None, height=None, length=None,
-                ref_image_size=None, first_frame=None, last_frame=None,
+                ref_image_size=None, override_config=None,
+                first_frame=None, last_frame=None,
                 keyframes=None, indices=None, even_distribution=None, loop=None,
                 ref_images=None, ref_videos=None, ref_video_audios=None,
                 ref_audios=None):
@@ -306,16 +309,22 @@ class H3PipeCreate(io.ComfyNode):
         else:
             pipe = dict(h3_pipe)
 
+        def provided(value, widget_default):
+            """A widget still holding its default means "keep the connected pipe's
+            value" - unless override_config asks for it. Creating a pipe never gets
+            here: the missing key already writes the widget's value."""
+            return value is not None and (override_config or value != widget_default)
+
         # Override config fields only when explicitly provided (non-default/non-empty)
         if not "prompt" in pipe or prompt is not None and str(prompt).strip():
             pipe["prompt"] = prompt
-        if not "width" in pipe or width is not None and width != 1344:
+        if not "width" in pipe or provided(width, 1344):
             pipe["width"] = width
-        if not "height" in pipe or height is not None and height != 768:
+        if not "height" in pipe or provided(height, 768):
             pipe["height"] = height
-        if not "length" in pipe or length is not None and length != 124:
+        if not "length" in pipe or provided(length, 124):
             pipe["length"] = length
-        if ref_image_size is not None and ref_image_size != "match":
+        if provided(ref_image_size, "match"):
             pipe["ref_image_size"] = ref_image_size
 
         # Rebuild the keyframes section when any keyframe input is provided
@@ -439,7 +448,7 @@ class H3PipeApply(io.ComfyNode):
         # The raw prompt the positive was built from, so KSampler (Context) can
         # detect [before:after:step] travel groups in it and re-encode per step.
         ctx["positive_prompt"] = pipe.get("prompt") or ""
-        ctx["latent"] = latent
+        ctx_set_latent(ctx, latent)
         # Bare-minimum h3 re-condition data: the pre-processed ref items / keyframe
         # images, so a prompt re-encode reuses them instead of re-deriving the media.
         ctx["h3_ref_items"] = ref_items

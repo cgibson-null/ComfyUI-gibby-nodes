@@ -15,7 +15,7 @@
 // views read the context's image from it).
 // Rows are shown/hidden per mode via widget.options.hidden (the same flag the
 // new frontend's advanced-widget toggle uses). The load image group
-// (file combo + upload) and the crop group (crop toggle, crop AR toggle,
+// (file combo + upload button + file drop) and the crop group (crop toggle, crop AR toggle,
 // crop preview, crop region) are instead added to and removed from
 // node.widgets physically, with the widget store kept in sync the same way
 // the core's dynamic widgets do (the Vue rows follow the store, not
@@ -34,14 +34,36 @@
 // clears the file combo - the file is a stale copy of the image it was
 // painted on, and the editor prioritizes the combo over the node's current
 // image, so a fresh mask session would otherwise paint onto that copy.
+//
+// The core injects its upload button - and with it the drop, paste and file
+// input handling (Comfy.UploadImage adds an IMAGEUPLOAD input for a media
+// combo) - only for a REQUIRED media combo input, and this node's file combo
+// is optional so pre-feature workflows validate. The load image group
+// therefore brings its own upload: a button row, a file dropped on the node
+// and a pasted image (Ctrl+V, the node menu's Paste), all posted to
+// /upload/image and selected in the file combo the way the core's widget does
+// it. Ctrl+V needs its own capture-phase paste listener: the core's handler
+// routes a clipboard image to the selected node only when isImageNode() says
+// so (previewMediaType / node.imgs, neither of which this node's store-driven
+// preview sets), and otherwise pastes a new Load Image node.
 // ---------------------------------------------------------------------------
 
 import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
 import {
     buildCropPreview,
-    liveNode,
     CROP_PREVIEW_MIN_H,
 } from "../crop_preview.js";
+import {
+    liveNode,
+    findWidget,
+    getWidgetValue,
+    setWidgetValue,
+    setWidgetHidden,
+    refitNode,
+    rerenderWidgetList,
+    markGraphDirty,
+} from "../gibby_widgets.js";
 
 const NODE_TYPE = "Gibby_EmptyLatent_Resolution";
 
@@ -76,34 +98,6 @@ const ASPECT_RATIOS = {
     "9:21": [9, 21],
 };
 const CLOSEST_RATIO = "closest to image";
-
-function findWidget(node, name) {
-    return node.widgets?.find((w) => w.name === name);
-}
-
-// Write through to the standard widget object so prompt serialization and Vue
-// reactivity both see the change.
-function setWidgetValue(node, name, value) {
-    const w = findWidget(node, name);
-    if (w) w.value = value;
-}
-
-function getWidgetValue(node, name) {
-    return findWidget(node, name)?.value;
-}
-
-function setWidgetHidden(widget, hidden) {
-    if (!widget) return;
-    widget.options = widget.options || {};
-    widget.options.hidden = !!hidden;
-    widget.hidden = !!hidden;
-    
-    // Try to find and hide the widget's DOM element
-    if (widget._gibbyDomEl || widget.el || widget.domElement) {
-        const el = widget._gibbyDomEl || widget.el || widget.domElement;
-        el.style.display = hidden ? 'none' : '';
-    }
-}
 
 // The core BoundingBox input adds the box's own number rows to node.widgets,
 // named x, y, width and height - the same names as this node's size widgets,
@@ -383,16 +377,11 @@ function refreshModeVisibility(node) {
     }
 
     // Force a redraw so the layout system re-measures after rows show/hide.
-    try { node.graph?.setDirtyCanvas(true, true); } catch (e) { /* ignore */ }
+    markGraphDirty(node);
     // A mode change shows/hides the size rows; refit the node height.
     refitNode(node);
-
-    // The Vue widget list only reads options.hidden when it re-renders; a
-    // same-tick showAdvanced toggle-and-restore forces that pass without
-    // changing the node's actual advanced state.
-    const prev = node.showAdvanced;
-    node.showAdvanced = !prev;
-    node.showAdvanced = prev;
+    // The Vue widget list only re-reads options.hidden on a re-render.
+    rerenderWidgetList(node);
 }
 
 function clamp(v, lo, hi) {
@@ -415,6 +404,107 @@ function imagePreviewUrl(node) {
     const params = new URLSearchParams({ filename: v, subfolder, type: "input" });
     params.set("_", Date.now().toString());
     return "/view?" + params.toString();
+}
+
+// The core's upload: POST /upload/image with the file and the input folder,
+// and the response names the stored file ("sub/name" when it landed in a
+// subfolder). A fresh upload is not in the combo's registration-time options.
+async function uploadInputImage(file) {
+    const body = new FormData();
+    body.append("image", file);
+    body.append("type", "input");
+    const resp = await api.fetchApi("/upload/image", { method: "POST", body }).catch(() => null);
+    if (!resp || resp.status !== 200) {
+        const store = frontendStore("toast");
+        if (store?.addAlert) {
+            store.addAlert(resp ? `Upload failed: ${resp.status} ${resp.statusText}` : "Upload failed: no response");
+        }
+        return null;
+    }
+    const data = await resp.json();
+    // The core's upload refreshes the input asset library with the new file.
+    frontendStore("assets")?.inputAssets?.invalidate?.();
+    return data.subfolder ? `${data.subfolder}/${data.name}` : data.name;
+}
+
+// The OS file picker behind the upload button (the core's own button opens
+// the same through its file-input composable). A fresh element per click, so
+// picking the same file twice still fires change.
+function openImagePicker(onFile) {
+    const el = document.createElement("input");
+    el.type = "file";
+    el.accept = "image/*";
+    el.style.display = "none";
+    el.addEventListener("change", () => {
+        const f = el.files?.[0];
+        el.remove();
+        if (f) onFile(f);
+    }, { once: true });
+    document.body.appendChild(el);
+    el.click();
+}
+
+// Some sources give a dropped file no MIME type, then its extension decides.
+const IMAGE_EXT = /\.(png|jpe?g|webp|bmp|gif|tiff?|avif|svg|hdr|exr)$/i;
+const isImageLike = (type, name) =>
+    (type || "").startsWith("image/") || IMAGE_EXT.test(name || "");
+
+// The image file a drag holds; null leaves the drop to the core's own handler
+// (a json workflow, a png with metadata, a new Load Image node), like the
+// core Load Image claiming image drops but nothing else. During dragover only
+// dataTransfer.items carries the type, the files list stays empty.
+function droppedImage(e) {
+    return Array.from(e?.dataTransfer?.files || []).find((f) => isImageLike(f.type, f.name)) || null;
+}
+
+function acceptsImageDrop(e) {
+    const dt = e?.dataTransfer;
+    if (!dt) return false;
+    if (dt.files?.length) return !!droppedImage(e);
+    return Array.from(dt.items || []).some((i) => i.kind === "file" && isImageLike(i.type, i.name));
+}
+
+// Select an uploaded file in the combo: add it to the options (syncLoadGroup
+// restores a value the options do not know), turn the load toggle on - a
+// dropped or picked file means load it - and run the combo callback that
+// drives the preview, exactly like the core's upload widget does.
+function applyUploadedFile(node, path) {
+    const g = node._gibbyLoadGroup;
+    if (!g?.image) return;
+    const values = g.image.options?.values;
+    if (Array.isArray(values) && !values.includes(path)) values.push(path);
+    const loadW = findWidget(node, "load_image");
+    if (loadW) loadW.value = true;
+    g.image.value = path;
+    g.image.callback?.(path);
+    syncLoadGroup(node);
+}
+
+// Upload a pasted image file and select it - the core's paste paths (its
+// handler and the node menu's Paste) both hand the clipboard files to the
+// node's pasteFiles hook.
+function pasteImageFile(node, files) {
+    const file = Array.from(files || []).find((f) => isImageLike(f.type, f.name));
+    if (!file) return false;
+    void uploadInputImage(file).then((path) => {
+        if (path) applyUploadedFile(liveNode(node.id) || node, path);
+    });
+    return true;
+}
+
+// The clipboard's image file, if the paste carries one.
+function clipboardImage(e) {
+    for (const item of Array.from(e?.clipboardData?.items || [])) {
+        if ((item.type || "").startsWith("image/")) return item.getAsFile();
+    }
+    return null;
+}
+
+// The selected resize node, picked the way the core's paste handler picks its
+// target node.
+function selectedResizeNode() {
+    const n = app.canvas?.current_node;
+    return n && n.is_selected && n.type === NODE_TYPE ? n : null;
 }
 
 // The file the core mask editor uploads and rewrites the combo to when a
@@ -692,13 +782,6 @@ function syncLoadGroup(node) {
     }
     const widgets = node.widgets || [];
 
-    // The upload button is injected by the core; resolve it lazily in case
-    // it was not there yet when the node was set up.
-    if (!g.upload) {
-        g.upload = findWidget(node, "upload");
-        if (g.upload) g.addable.push(g.upload);
-    }
-
     // The group rows in display order, after the load_image toggle. The
     // image/crop image/region rows are always present (see above) and hidden
     // with their toggle; the upload and AR toggle/preview rows are removed
@@ -765,22 +848,10 @@ function syncLoadGroup(node) {
     const arToggle = findWidget(node, "gibby_crop_ar");
     if (arToggle) arToggle.value = getWidgetValue(node, "crop_ar") === "selected";
 
-    try { node.graph?.setDirtyCanvas(true, true); } catch (e) { /* ignore */ }
+    markGraphDirty(node);
     // Force a Vue widget-list re-render (same trick as refreshModeVisibility).
-    const prev = node.showAdvanced;
-    node.showAdvanced = !prev;
-    node.showAdvanced = prev;
+    rerenderWidgetList(node);
     refitNode(node);
-}
-
-// Refit the node through the core layout pass: it assigns the DOM widgets'
-// positions (widget.y) that their floating elements track, and grows or
-// shrinks the node with the visible rows (the core dynamic widgets' refit).
-function refitNode(node) {
-    if (!node || node._removed || !node.size) return;
-    try {
-        node.size = [node.size[0], node.computeSize([...node.size])[1]];
-    } catch (e) { /* ignore */ }
 }
 
 function setupResolutionNode(node) {
@@ -825,9 +896,9 @@ function setupResolutionNode(node) {
 
     node._gibbyResElements.modeSwitch = modeEl;
 
-    // 2. Load image group: the file combo (native upload button, preview and
-    //    mask editor), the crop toggle, the crop AR toggle and the crop
-    //    preview with its drawable box.
+    // 2. Load image group: the file combo (this node's own upload button, the
+    //    core's preview and mask editor), the crop toggle, the crop AR toggle
+    //    and the crop preview with its drawable box.
     // The crop AR toggle is a native toggle widget (label + Custom/Selected
     // segmented control); the hidden crop_ar combo stays the serialized
     // source of the value.
@@ -876,8 +947,39 @@ function setupResolutionNode(node) {
     const cropImageW = findWidget(node, "crop_image");
     const cropArW = findWidget(node, "crop_ar");
     const regionW = findWidget(node, "crop_region");
-    const uploadW = findWidget(node, "upload");
     const cropBoxRows = renameCropBoxRows(regionW);
+
+    // The upload button row: the core never injects its own here (it scans
+    // the required inputs only, and this file combo is optional), so the
+    // group gets one that opens the file picker.
+    const uploadW = node.addWidget("button", "gibby_upload", "image", () => {
+        openImagePicker(async (file) => {
+            const path = await uploadInputImage(file);
+            if (!path) return;
+            applyUploadedFile(liveNode(node.id) || node, path);
+        });
+    }, { serialize: false });
+    if (uploadW) {
+        uploadW.serialize = false;
+        uploadW.options = { ...(uploadW.options || {}), serialize: false };
+        uploadW.label = "choose file to upload";
+    }
+
+    // Drop a file on the node like the core Load Image does: upload it and
+    // select it. A drag that holds no image is left alone (false) so the
+    // core's own drop handler still runs under it.
+    node.onDragOver = (e) => acceptsImageDrop(e);
+    node.onDragDrop = async (e) => {
+        const file = droppedImage(e);
+        if (!file) return false;
+        const path = await uploadInputImage(file);
+        if (path) applyUploadedFile(liveNode(node.id) || node, path);
+        return true;
+    };
+
+    // The core Load Image's paste hook: the extension's paste listener calls
+    // it for Ctrl+V, and defining it is what offers the node menu's Paste.
+    node.pasteFiles = (files) => pasteImageFile(node, files);
 
     // The crop AR combo row is replaced by the labeled toggle (like the mode
     // combo by its switcher): keep the combo for serialization, hide the row.
@@ -1142,6 +1244,31 @@ app.registerExtension({
     // image) - refresh every resize node's crop preview whenever the store
     // changes.
     setup() {
+        // Ctrl+V with a resize node selected: claim the clipboard image before
+        // the core's bubble-phase handler turns the paste into a new Load
+        // Image node. A capture listener on document runs first, and stopping
+        // propagation there keeps the core's listener from running at all.
+        document.addEventListener(
+            "paste",
+            (e) => {
+                // Ctrl+Shift+V is litegraph's paste-with-connections, and a
+                // paste into a focused field belongs to that field.
+                if (e.shiftKey) return;
+                const t = e.target;
+                if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+                    t.tagName === "SELECT" || t.isContentEditable)) return;
+                if (app.canvas?.selectOnly === true) return;
+                const node = selectedResizeNode();
+                if (!node) return;
+                const file = clipboardImage(e);
+                if (!file) return;
+                e.preventDefault();
+                e.stopPropagation();
+                pasteImageFile(node, [file]);
+            },
+            { capture: true }
+        );
+
         const refreshAll = () => {
             const graph =
                 (app.canvas && app.canvas.getCurrentGraph && app.canvas.getCurrentGraph()) ||

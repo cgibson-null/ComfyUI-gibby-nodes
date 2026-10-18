@@ -1,2 +1,7 @@
 piexif
 requests
+# Both ship with ComfyUI; listed because this pack imports them directly:
+# scipy - mask post-processing and the crop-inpaint mask regions
+# av - the Mask/Segment (Context) video preview encoder
+scipy
+av

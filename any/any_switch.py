@@ -27,12 +27,24 @@ class GibbyAnySwitch(io.ComfyNode):
             outputs=[io.MatchType.Output(any_template, display_name="*")]
         )
 
+    @staticmethod
+    def _slots(inputs) -> dict:
+        """The connected autogrow slots as a name -> value dict.
+
+        ComfyUI hands the group as that dict, with one exception: an empty group
+        in the lazy call arrives wrapped in the same (value, prompt key) tuple
+        the non-empty slots are wrapped in - ({}, "inputs") - so unwrap whatever
+        shape comes in instead of assuming the dict."""
+        if isinstance(inputs, tuple):
+            inputs = next((x for x in inputs if isinstance(x, dict)), None)
+        return inputs or {}
+
     @classmethod
-    def _selected(cls, index: int, inputs: dict) -> str | None:
+    def _selected(cls, index: int, slots: dict) -> str | None:
         """The name of the input to output: the index-th connected one, or the
         first connected one when index is -1. The connected slots are the keys,
         whether or not they have been evaluated yet, and none is None."""
-        names = list(inputs)
+        names = list(slots)
         if not names:
             return None
         if index >= len(names):
@@ -40,18 +52,21 @@ class GibbyAnySwitch(io.ComfyNode):
         return names[0] if index < 0 else names[index]
 
     @classmethod
-    def check_lazy_status(cls, index: int, inputs: dict) -> list[str]:
+    def check_lazy_status(cls, index: int, inputs) -> list[str]:
         """Ask ComfyUI to evaluate the selected input only, which is what keeps
         the other branches from running. The lazy call hands each dynamic slot
         as a (value, prompt key) tuple, value None while unevaluated, and the
-        prompt key is the name to ask for."""
-        name = cls._selected(index, inputs)
+        prompt key is the name to ask for. Nothing connected asks for nothing,
+        which lets execute run and output None."""
+        slots = cls._slots(inputs)
+        name = cls._selected(index, slots)
         if name is None:
             return []
-        value, key = inputs[name]
+        value, key = slots[name]
         return [] if value is not None else [key]
 
     @classmethod
     def execute(cls, index: int, inputs: io.Autogrow.Type) -> io.NodeOutput:
-        name = cls._selected(index, inputs)
-        return io.NodeOutput(None if name is None else inputs[name])
+        slots = cls._slots(inputs)
+        name = cls._selected(index, slots)
+        return io.NodeOutput(None if name is None else slots[name])

@@ -12,38 +12,24 @@
 // ---------------------------------------------------------------------------
 
 import { app } from "../../../scripts/app.js";
+import { liveNode, findWidget, setWidgetHidden, refitNode, rerenderWidgetList, markGraphDirty } from "../gibby_widgets.js";
 
 const NODE_TYPE = "Gibby_Detection";
 const TOGGLE = "tracking";
 const TRACK_ROWS = ["detection_threshold", "max_objects", "detect_interval", "object_indices"];
 
-function liveNode(id) {
-    const graph =
-        (app.canvas && app.canvas.getCurrentGraph && app.canvas.getCurrentGraph()) ||
-        app.graph;
-    return graph ? graph.getNodeById(id) : null;
-}
-
-// The combo's rows are named "<combo>.<key>".
-function findWidget(node, name) {
-    return node.widgets?.find((w) => w.name === name || w.name.endsWith("." + name));
-}
-
-function setWidgetHidden(widget, hidden) {
-    widget.options = widget.options || {};
-    widget.options.hidden = !!hidden;
-    widget.hidden = !!hidden;
-}
+// The tracker rows are DynamicCombo rows: the core names them "<combo>.<key>".
+const comboRow = (node, name) => findWidget(node, name, { dotted: true });
 
 function syncTrackingRows(node) {
     if (!node || node._removed) return;
     // The toggle row itself only exists with sam3 selected; hook it as soon as
     // the combo has created it (a mode change recreates the row).
     hookWidget(node, TOGGLE, syncTrackingRows);
-    const on = !!findWidget(node, TOGGLE)?.value;
+    const on = !!comboRow(node, TOGGLE)?.value;
     let changed = false;
     for (const name of TRACK_ROWS) {
-        const w = findWidget(node, name);
+        const w = comboRow(node, name);
         if (!w) continue;
         changed = changed || !!w.options?.hidden === on;
         setWidgetHidden(w, !on);
@@ -51,19 +37,15 @@ function syncTrackingRows(node) {
     if (!changed) return;
     // The layout pass re-measures the node with the rows shown/hidden; the Vue
     // widget list only re-reads options.hidden when it re-renders.
-    try {
-        node.size = [node.size[0], node.computeSize([...node.size])[1]];
-    } catch (e) { /* ignore */ }
-    const prev = node.showAdvanced;
-    node.showAdvanced = !prev;
-    node.showAdvanced = prev;
-    try { node.graph?.setDirtyCanvas(true, true); } catch (e) { /* ignore */ }
+    refitNode(node);
+    rerenderWidgetList(node);
+    markGraphDirty(node);
 }
 
 // Run fn after the widget's own handler, one tick late so the rows the mode
 // combo adds or removes are already in place.
 function hookWidget(node, name, fn) {
-    const w = findWidget(node, name);
+    const w = comboRow(node, name);
     if (!w || w._gibbyTrackingHooked) return;
     w._gibbyTrackingHooked = true;
     const prev = w.callback;

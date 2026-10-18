@@ -20,9 +20,11 @@ https://github.com/LucianoCirino/ComfyUI-Image-Saver
 """
 
 import json
+import logging
 import os
 import re
-from collections.abc import Collection, Iterator
+from asyncio import get_event_loop
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,19 +41,30 @@ try:
     import piexif.helper
 except ImportError:
     piexif = None
-    print("Gibby Image Saver: piexif is missing - JPEG/WEBP will be saved without EXIF metadata (pip install piexif)")
+    logging.warning("[Gibby Image Saver] piexif is missing - JPEG/WEBP will be saved without EXIF metadata (pip install piexif)")
 
 import folder_paths
 from comfy.sd1_clip import escape_important, unescape_important, token_weights
 from comfy_api.latest import io
 
 from .context import _CONTEXT_TYPE, ctx_from, ctx_size, ctx_set_image
-from .lora_loader import (_civitai_get_json, _format_lora_tag, _get_or_fetch_lora_civitai_info,
+from .lora_loader import (_civitai_get_json, _civitai_model_version_by_hash, _format_lora_tag,
+                          _get_or_fetch_lora_civitai_info,
                            _hash_entry_fresh, _hash_file_sync, _lora_hash_for, _load_json_cache,
                            _remember_hash_entry, _save_json_cache, iter_lora_stack)
 
 
 # --- File path matching (ComfyUI-Image-Saver/utils.py) -----------------------
+
+# The lookups below walk the model folders; the listings are memoized for the
+# duration of one save so a batch with many LoRAs and embeddings walks each
+# folder once instead of once per lookup (_reset_path_list_cache).
+_path_list_cache: dict[tuple, list[Path]] = {}
+
+
+def _reset_path_list_cache():
+    _path_list_cache.clear()
+
 
 def _sanitize_filename(filename: str) -> str:
     """Remove characters that are unsafe for filenames."""
@@ -62,7 +75,7 @@ def _sanitize_filename(filename: str) -> str:
 def _full_embedding_path_for(embedding: str):
     matching_embedding = _get_file_path_match("embeddings", embedding)
     if matching_embedding is None:
-        print(f'Gibby Image Saver: could not find full path to embedding "{embedding}"')
+        logging.warning(f"[Gibby Image Saver] could not find full path to embedding \"{embedding}\"")
         return None
     return folder_paths.get_full_path("embeddings", matching_embedding)
 
@@ -81,16 +94,21 @@ def _full_checkpoint_path_for(model_name: str) -> str:
     if matching_model:
         return folder_paths.get_full_path("diffusion_models", matching_model)
 
-    print(f'Could not find full path to checkpoint "{model_name}"')
+    logging.warning(f'[Gibby Image Saver] Could not find full path to checkpoint "{model_name}"')
     return ''
 
 
 def _get_file_path_iterator(folder_name: str, supported_extensions=None):
-    """Returns an iterator over valid file paths for the specified model folder."""
-    if supported_extensions is None:
-        return (Path(x) for x in folder_paths.get_filename_list(folder_name))
-    else:
-        return _custom_file_path_generator(folder_name, supported_extensions)
+    """Iterator over the valid file paths of a model folder, from the per-save cache."""
+    key = (folder_name, None if supported_extensions is None else tuple(sorted(supported_extensions)))
+    paths = _path_list_cache.get(key)
+    if paths is None:
+        if supported_extensions is None:
+            paths = [Path(x) for x in folder_paths.get_filename_list(folder_name)]
+        else:
+            paths = list(_custom_file_path_generator(folder_name, supported_extensions))
+        _path_list_cache[key] = paths
+    return iter(paths)
 
 
 def _custom_file_path_generator(folder_name: str, supported_extensions: Collection[str]):
@@ -202,7 +220,7 @@ def _get_civitai_sampler_name(sampler_name: str, scheduler: str) -> str:
 
         return civitai_name
     else:
-        if scheduler != 'normal':
+        if scheduler and scheduler != 'normal':
             return f"{sampler_name}_{scheduler}"
         else:
             return sampler_name
@@ -275,36 +293,36 @@ def _get_civitai_metadata(
 def _get_model_civitai_info(filepath: str | None, model_hash: str) -> dict[str, Any] | None:
     """Civitai data for a model/embedding/manual hash via the plugin-root JSON cache."""
     if not model_hash:
-        print("Gibby Image Saver: Error: Missing hash.")
+        logging.warning("[Gibby Image Saver] Missing hash.")
         return None
 
-    try:
-        cache = _load_model_info_cache()
-        # Manual hashes (no local file) are keyed by hash.
-        key = os.path.basename(filepath) if filepath else model_hash.upper()
-        info = cache.get(key, {}).get("civitai")
-        if info is not None:
-            return info
+    # Manual hashes (no local file) are keyed by hash.
+    key = os.path.basename(filepath) if filepath else model_hash.upper()
+    cache = _load_model_info_cache()
+    info = cache.get(key, {}).get("civitai")
+    if info is not None:
+        return info
 
-        content = _download_model_info(model_hash)
-        if content is None:
-            return None
-        cache[key] = cache.get(key, {}) | {"civitai": content}
-        _save_model_info_cache(cache)
-        return content
-    except Exception as e:
-        print(f"Gibby Image Saver: Civitai info error: {e}")
-    return None
+    content = _download_model_info(model_hash)
+    if content is None:
+        return None
+    cache[key] = cache.get(key, {}) | {"civitai": content}
+    _save_model_info_cache(cache)
+    return content
 
 
 def _download_model_info(model_hash: str) -> dict[str, object] | None:
-    print(f"Gibby Image Saver: Downloading model info for '{model_hash}'.")
+    """Raw Civitai model-version data for a hash, with the parent model's fields
+    merged in (the metadata block writes them)."""
+    logging.info(f"[Gibby Image Saver] Downloading model info for '{model_hash}'.")
 
+    content = _civitai_model_version_by_hash(model_hash, f"model hash '{model_hash}'")
+    if content is None:
+        return None
     try:
-        content = _civitai_get_json(f'https://civitai.red/api/v1/model-versions/by-hash/{model_hash.upper()}')
         parent_model = _civitai_get_json(f'https://civitai.red/api/v1/models/{content["modelId"]}')
     except Exception as e:
-        print(f"Gibby Image Saver: Civitai download error for '{model_hash}': {e}")
+        logging.warning(f"[Gibby Image Saver] Civitai parent-model error for '{model_hash}': {e}")
         return None
     if not parent_model:
         parent_model = {}
@@ -369,7 +387,7 @@ def _extract_loras(text: str) -> dict[str, tuple[str, float, str]]:
         # way Lora Loader does and reuses its info cache entries.
         matching_lora = _get_file_path_match("loras", lora[0])
         if not matching_lora:
-            print(f'Gibby Image Saver: could not find full path to lora "{lora[0]}"')
+            logging.warning(f'[Gibby Image Saver] could not find full path to lora "{lora[0]}"')
             continue
         matching_lora = os.path.normpath(matching_lora)
         lora_path = folder_paths.get_full_path("loras", matching_lora)
@@ -447,12 +465,13 @@ def _save_json(image_info: dict[str, Any] | None, filename: str) -> None:
     try:
         workflow = (image_info or {}).get('workflow')
         if workflow is None:
-            print('No image info found, skipping saving of JSON')
+            logging.warning("[Gibby Image Saver] No image info found, skipping saving of JSON")
+            return
         with open(f'{filename}.json', 'w') as workflow_file:
             json.dump(workflow, workflow_file)
-            print(f'Saved workflow to {filename}.json')
+            logging.info(f"[Gibby Image Saver] Saved workflow to {filename}.json")
     except Exception as e:
-        print(f'Failed to save workflow as json due to: {e}, proceeding with the remainder of saving execution')
+        logging.warning(f"[Gibby Image Saver] Failed to save workflow as json due to: {e}, proceeding with the remainder of saving execution")
 
 
 def _make_pathname(filename: str, width: int, height: int, seed: int, modelname: str, counter: int, time_format: str, sampler_name: str, steps: int, cfg: float, scheduler_name: str, denoise: float, custom: str) -> str:
@@ -462,14 +481,16 @@ def _make_pathname(filename: str, width: int, height: int, seed: int, modelname:
     filename = filename.replace("%date", _get_timestamp("%Y-%m-%d"))
     filename = filename.replace("%time", _get_timestamp(time_format))
     filename = filename.replace("%model", _parse_checkpoint_name(modelname))
-    filename = filename.replace("%width", str(width))
-    filename = filename.replace("%height", str(height))
-    filename = filename.replace("%seed", str(seed))
+    # A value the context never carried is replaced with nothing: the filename
+    # gets no number and no invented placeholder for it
+    filename = filename.replace("%width", str(width) if width else "")
+    filename = filename.replace("%height", str(height) if height else "")
+    filename = filename.replace("%seed", str(seed) if seed is not None else "")
     filename = filename.replace("%counter", str(counter))
-    filename = filename.replace("%sampler_name", sampler_name)
-    filename = filename.replace("%steps", str(steps))
-    filename = filename.replace("%cfg", str(cfg))
-    filename = filename.replace("%scheduler_name", scheduler_name)
+    filename = filename.replace("%sampler_name", sampler_name or "")
+    filename = filename.replace("%steps", str(steps) if steps is not None else "")
+    filename = filename.replace("%cfg", str(cfg) if cfg is not None else "")
+    filename = filename.replace("%scheduler_name", scheduler_name or "")
     filename = filename.replace("%basemodelname", _parse_checkpoint_name_without_extension(modelname))
     filename = filename.replace("%denoise", str(denoise))
     filename = filename.replace("%custom", custom)
@@ -489,13 +510,13 @@ class Metadata:
     modelname: str
     positive: str
     negative: str
-    width: int
+    width: int          # 0 when the size is unknown
     height: int
-    seed: int
-    steps: int
-    cfg: float
-    sampler_name: str
-    scheduler_name: str
+    seed: int | None
+    steps: int | None   # None when the context carried no sampling parameter
+    cfg: float | None
+    sampler_name: str | None
+    scheduler_name: str | None
     denoise: float
     custom: str
     additional_hashes: str
@@ -536,7 +557,7 @@ def _parse_manual_hashes(additional_hashes: str, existing_hashes: set[str], down
     for entry in additional_hash_split:
         match = (re_manual_hash_weights if download_civitai_data else re_manual_hash).search(entry)
         if match is None:
-            print(f"Gibby Image Saver: Invalid additional hash string: '{entry}'")
+            logging.warning(f"[Gibby Image Saver] Invalid additional hash string: '{entry}'")
             continue
 
         groups = tuple(group for group in match.groups() if group)
@@ -554,27 +575,27 @@ def _parse_manual_hashes(additional_hashes: str, existing_hashes: set[str], down
         name, hash = groups if len(groups) > 1 else (None, groups[0])
 
         if len(hash) > MAX_HASH_LENGTH:
-            print(f"Gibby Image Saver: Skipping hash. Length exceeds maximum of {MAX_HASH_LENGTH} characters: {hash}")
+            logging.warning(f"[Gibby Image Saver] Skipping hash. Length exceeds maximum of {MAX_HASH_LENGTH} characters: {hash}")
             continue
 
         if any(hash.lower() == existing_hash.lower() for _, _, existing_hash in manual_entries.values()):
-            print(f"Gibby Image Saver: Skipping duplicate hash: {hash}")
+            logging.warning(f"[Gibby Image Saver] Skipping duplicate hash: {hash}")
             continue  # Skip duplicates
 
         if hash.lower() in existing_hashes:
-            print(f"Gibby Image Saver: Skipping manual hash already present in resources: {hash}")
+            logging.warning(f"[Gibby Image Saver] Skipping manual hash already present in resources: {hash}")
             continue
 
         if name is None:
             unnamed_count += 1
             name = f"manual{unnamed_count}"
         elif name in manual_entries:
-            print(f"Gibby Image Saver: Duplicate manual hash name '{name}' is being overwritten.")
+            logging.warning(f"[Gibby Image Saver] Duplicate manual hash name '{name}' is being overwritten.")
 
         manual_entries[name] = (None, weight, hash)
 
         if len(manual_entries) > 29:
-            print("Gibby Image Saver: Reached maximum limit of 30 manual hashes. Skipping the rest.")
+            logging.warning("[Gibby Image Saver] Reached maximum limit of 30 manual hashes. Skipping the rest.")
             break
 
     return manual_entries
@@ -593,6 +614,7 @@ def _clean_prompt(prompt: str, metadata_extractor: PromptMetadataExtractor) -> s
 
 
 def _make_metadata(modelname: str, positive: str, negative: str, width: int, height: int, seed_value: int, steps: int, cfg: float, sampler_name: str, scheduler_name: str, denoise: float, custom: str, additional_hashes: str, download_civitai_data: bool, easy_remix: bool, lora_names: str = "", append_lora_names: bool = False) -> Metadata:
+    _reset_path_list_cache()
     modelname, additional_hashes = _get_multiple_models(modelname, additional_hashes)
 
     ckpt_path = _full_checkpoint_path_for(modelname)
@@ -607,7 +629,7 @@ def _make_metadata(modelname: str, positive: str, negative: str, width: int, hei
     # LoRAs come from the context's lora_stack; tags left in the prompt text
     # still work, and the stack's entries win on name collisions.
     loras = {**metadata_extractor.get_loras(), **_extract_loras(lora_names)}
-    civitai_sampler_name = _get_civitai_sampler_name(sampler_name.replace('_gpu', ''), scheduler_name)
+    civitai_sampler_name = _get_civitai_sampler_name(sampler_name.replace('_gpu', ''), scheduler_name) if sampler_name else None
     basemodelname = _parse_checkpoint_name_without_extension(modelname)
 
     # Get existing hashes from model, loras, and embeddings
@@ -623,15 +645,29 @@ def _make_metadata(modelname: str, positive: str, negative: str, width: int, hei
 
     positive_a111_params = positive.strip()
     negative_a111_params = f"\nNegative prompt: {negative.strip()}"
-    custom_str = f", {custom}" if custom else ""
-    model_hash_str = f", Model hash: {add_model_hash}" if add_model_hash else ""
-    hashes_str = f", Hashes: {json.dumps(hashes, separators=(',', ':'))}" if hashes else ""
 
-    a111_params = (
-        f"{positive_a111_params}{negative_a111_params}\n"
-        f"Steps: {steps}, Sampler: {civitai_sampler_name}, CFG scale: {cfg}, Seed: {seed_value}, "
-        f"Size: {width}x{height}{custom_str}{model_hash_str}, Model: {basemodelname}{hashes_str}, Version: ComfyUI"
-    )
+    # Only the parameters that are actually known are written out
+    params = []
+    if steps is not None:
+        params.append(f"Steps: {steps}")
+    if civitai_sampler_name:
+        params.append(f"Sampler: {civitai_sampler_name}")
+    if cfg is not None:
+        params.append(f"CFG scale: {cfg}")
+    if seed_value is not None:
+        params.append(f"Seed: {seed_value}")
+    if width and height:
+        params.append(f"Size: {width}x{height}")
+    if custom:
+        params.append(custom)
+    if add_model_hash:
+        params.append(f"Model hash: {add_model_hash}")
+    params.append(f"Model: {basemodelname}")
+    if hashes:
+        params.append(f"Hashes: {json.dumps(hashes, separators=(',', ':'))}")
+    params.append("Version: ComfyUI")
+
+    a111_params = f"{positive_a111_params}{negative_a111_params}\n" + ", ".join(params)
 
     # Add Civitai resource listing
     if download_civitai_data and civitai_resources:
@@ -723,15 +759,15 @@ def _save_image(image: Image.Image, filepath: str, extension: str, quality_jpeg_
         if extension == "jpg" or extension == "jpeg":
             MAX_EXIF_SIZE = 65535
             if len(exif_bytes) > MAX_EXIF_SIZE and embed_workflow:
-                print("Gibby Image Saver: Error: Workflow is too large, removing client request prompt.")
+                logging.warning("[Gibby Image Saver] Workflow is too large, removing client request prompt.")
                 prompt_json = {}
                 exif_bytes = get_exif_bytes()
                 if len(exif_bytes) > MAX_EXIF_SIZE:
-                    print("Gibby Image Saver: Error: Workflow is still too large, cannot embed workflow!")
+                    logging.warning("[Gibby Image Saver] Workflow is still too large, cannot embed workflow!")
                     pnginfo_json = {}
                     exif_bytes = get_exif_bytes()
             if len(exif_bytes) > MAX_EXIF_SIZE:
-                print("Gibby Image Saver: Error: Metadata exceeds maximum size for JPEG. Cannot save metadata.")
+                logging.warning("[Gibby Image Saver] Metadata exceeds maximum size for JPEG. Cannot save metadata.")
                 return
 
         piexif.insert(exif_bytes, filepath)
@@ -799,7 +835,7 @@ def _save_images(
     filename_prefix = os.path.basename(filename_prefix)
 
     if not os.path.exists(output_path):
-        print(f'The path `{output_path}` specified doesn\'t exist! Creating directory.')
+        logging.info(f"[Gibby Image Saver] Creating the path `{output_path}`")
         os.makedirs(output_path, exist_ok=True)
 
     result_paths: list[str] = list()
@@ -851,25 +887,29 @@ class GibbyImageSaverContext(io.ComfyNode):
                 ),
                 io.String.Input("path", default='', tooltip="path to save the images (under Comfy's save directory)"),
                 io.Combo.Input("extension", options=['png', 'jpeg', 'jpg', 'webp'], default='png', tooltip="file extension/type to save image as"),
-                io.Boolean.Input("lossless_webp", default=True, tooltip="if True, saved WEBP files will be lossless"),
+                io.Boolean.Input("lossless_webp", default=True, advanced=True, tooltip="if True, saved WEBP files will be lossless"),
                 io.Int.Input("quality_jpeg_or_webp", default=100, min=1, max=100, tooltip="quality setting of JPEG/WEBP"),
-                io.Boolean.Input("optimize_png", default=False, tooltip="if True, saved PNG files will be optimized (can reduce file size but is slower)"),
-                io.Int.Input("counter", default=0, min=0, max=0xffffffffffffffff, tooltip="counter"),
-                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, tooltip="denoise value"),
-                io.String.Input("time_format", default="%Y-%m-%d-%H%M%S", tooltip="timestamp format"),
+                io.Boolean.Input("optimize_png", default=False, advanced=True, tooltip="if True, saved PNG files will be optimized (can reduce file size but is slower)"),
+                io.Int.Input("counter", default=0, min=0, max=0xffffffffffffffff, advanced=True, tooltip="counter"),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, advanced=True, tooltip="denoise value"),
+                io.String.Input("time_format", default="%Y-%m-%d-%H%M%S", advanced=True, tooltip="timestamp format"),
                 io.Boolean.Input("save_workflow_as_json", default=False, tooltip="if True, also saves the workflow as a separate JSON file"),
                 io.Boolean.Input("embed_workflow", default=True, tooltip="if True, embeds the workflow in the saved image files.\nStable for PNG, experimental for WEBP.\nJPEG experimental and only if metadata size is below 65535 bytes"),
                 io.String.Input(
                     "additional_hashes",
                     default="",
+                    advanced=True,
                     tooltip="hashes separated by commas, optionally with names. 'Name:HASH' (e.g., 'MyLoRA:FF735FF83F98')\nWith download_civitai_data set to true, weights can be added as well. (e.g., 'HASH:Weight', 'Name:HASH:Weight')",
                 ),
-                io.Boolean.Input("download_civitai_data", default=False, tooltip="Download and cache data from civitai.red to save correct metadata. Allows LoRA weights to be saved to the metadata."),
-                io.Boolean.Input("append_lora_names", default=False, tooltip="Append the context's lora names to the prompt as <lora:name:weight> tags in the saved metadata. Off: the prompt stays clean, LoRAs are still written to the hashes from the context."),
-                io.Boolean.Input("easy_remix", default=True, tooltip="Strip LoRAs and simplify 'embedding:path' from the prompt to make the Remix option on civitai.red more seamless."),
+                io.Boolean.Input("download_civitai_data", default=False, advanced=True, tooltip="Download and cache data from civitai.red to save correct metadata. Allows LoRA weights to be saved to the metadata."),
+                io.Boolean.Input("append_lora_names", default=False, advanced=True, tooltip="Append the context's lora names to the prompt as <lora:name:weight> tags in the saved metadata. Off: the prompt stays clean, LoRAs are still written to the hashes from the context."),
+                io.Boolean.Input("easy_remix", default=True, advanced=True, tooltip="Strip LoRAs and simplify 'embedding:path' from the prompt to make the Remix option on civitai.red more seamless."),
                 io.Boolean.Input("show_preview", default=True, tooltip="if True, displays saved images in the UI preview"),
-                io.String.Input("custom", default="", tooltip="custom string to add to the metadata, inserted into the a111 string before the model hash"),
+                io.String.Input("custom", default="", advanced=True, tooltip="custom string to add to the metadata, inserted into the a111 string before the model hash"),
                 io.Boolean.Input("save_image", default=True, tooltip="if True, saves the image to disk"),
+                # Appended last: the frontend restores widgets_values by position, so
+                # a widget inserted above would shift every value after it.
+                io.Boolean.Input("save_metadata", default=True, tooltip="if True, writes the a1111/Civitai generation parameters into the saved files. Off writes no parameters block and does no hashing or Civitai lookups; the workflow embed and the JSON sidecar keep their own toggles."),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output(display_name="context"),
@@ -879,10 +919,11 @@ class GibbyImageSaverContext(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, context=None, image=None, filename='%time_%basemodelname_%seed', path='', extension='png',
+    async def execute(cls, context=None, image=None, filename='%time_%basemodelname_%seed', path='', extension='png',
                 lossless_webp=True, quality_jpeg_or_webp=100, optimize_png=False, counter=0, denoise=1.0,
                 time_format="%Y-%m-%d-%H%M%S", save_workflow_as_json=False, embed_workflow=True, additional_hashes='',
-                download_civitai_data=False, append_lora_names=False, easy_remix=True, show_preview=True, custom='', save_image=True) -> io.NodeOutput:
+                download_civitai_data=False, append_lora_names=False, easy_remix=True, show_preview=True, custom='', save_image=True,
+                save_metadata=True) -> io.NodeOutput:
         # Generation settings from the context instead of widgets. Copy before
         # mutating: the engine's output cache can hand the same context object
         # to other consumers and to repeated runs.
@@ -890,42 +931,55 @@ class GibbyImageSaverContext(io.ComfyNode):
         has_context = bool(ctx)
 
         modelname = str(ctx.get("model_name") or '')
-        seed_value = int(ctx.get("seed") or 0)
-        steps = int(ctx.get("steps") or 20)
-        cfg = float(ctx.get("cfg") or 7.0)
-        sampler_name = str(ctx.get("sampler") or '')
-        scheduler_name = str(ctx.get("scheduler") or 'normal')
+        seed_value = int(ctx["seed"]) if ctx.get("seed") is not None else None
+        # No defaults: a parameter the context does not carry stays missing and is
+        # left out of the metadata instead of being invented. A context that really
+        # says 0 steps or cfg 0 gets those numbers.
+        steps = int(ctx["steps"]) if ctx.get("steps") is not None else None
+        cfg = float(ctx["cfg"]) if ctx.get("cfg") is not None else None
+        sampler_name = str(ctx["sampler"]) if ctx.get("sampler") else None
+        scheduler_name = str(ctx["scheduler"]) if ctx.get("scheduler") else None
         positive = str(ctx.get("positive_prompt") or '')
         negative = str(ctx.get("negative_prompt") or '')
-        if cfg <= 1.0:
+        if cfg is not None and cfg <= 1.0:
             negative = ''
 
         if image is not None:
             ctx_set_image(ctx, image)
         images = ctx.get("image")
         if images is None:
-            print("Gibby Image Saver: no images found in context or input, nothing to save.")
+            logging.warning("[Gibby Image Saver] no images found in context or input, nothing to save.")
             return io.NodeOutput(ctx, '', '')
 
-        # Resolve size from the context (explicit, image, or latent); 512 where unknown.
+        # Resolve size from the context (explicit, image, or latent); 0 where unknown,
+        # and the Size field is then omitted
         width, height = ctx_size(ctx)
-        if width == 0:
-            width = 512
-        if height == 0:
-            height = 512
 
         # LoRA names converted from the context's lora_stack with Lora
         # Loader's tag format.
         tags = [_format_lora_tag(name, sm) for name, sm, _sc in iter_lora_stack(ctx.get("lora_stack"))]
         lora_names = ", ".join(tags)
 
-        metadata = _make_metadata(modelname, positive, negative, width, height, seed_value, steps, cfg, sampler_name, scheduler_name, denoise, custom, additional_hashes, download_civitai_data, easy_remix, lora_names, append_lora_names)
+        if save_metadata:
+            # Hashing the checkpoint and the loras reads every byte of them, and
+            # fetching Civitai data waits on the network: keep both off the server's
+            # event loop so the UI and the queue stay responsive (lora_loader
+            # hashes the same way for its routes).
+            metadata = await get_event_loop().run_in_executor(None, lambda: _make_metadata(
+                modelname, positive, negative, width, height, seed_value, steps, cfg, sampler_name,
+                scheduler_name, denoise, custom, additional_hashes, download_civitai_data, easy_remix,
+                lora_names, append_lora_names))
+        else:
+            # Keep the fields the filename pattern uses; the empty a111 block is
+            # what _save_image writes nothing for, and nothing is hashed or fetched.
+            metadata = Metadata(modelname, positive, negative, width, height, seed_value, steps, cfg,
+                                sampler_name, scheduler_name, denoise, custom, additional_hashes, "", "", "")
 
         path = _make_pathname(path, width, height, seed_value, modelname, counter, time_format, sampler_name, steps, cfg, scheduler_name, denoise, custom)
         
         # Only save image if save_image is True
         if not save_image:
-            print("Gibby Image Saver: save_image is False, skipping save.")
+            logging.info("[Gibby Image Saver] save_image is False, skipping save.")
             return io.NodeOutput(ctx, metadata.final_hashes, metadata.a111_params, ui=None)
         
         # When no context, save with generic name and no metadata
@@ -936,11 +990,11 @@ class GibbyImageSaverContext(io.ComfyNode):
                 negative="",
                 width=width,
                 height=height,
-                seed=0,
-                steps=0,
-                cfg=1.0,
-                sampler_name="",
-                scheduler_name="",
+                seed=None,
+                steps=None,
+                cfg=None,
+                sampler_name=None,
+                scheduler_name=None,
                 denoise=1.0,
                 custom="",
                 additional_hashes="",
@@ -948,9 +1002,15 @@ class GibbyImageSaverContext(io.ComfyNode):
                 a111_params="",
                 final_hashes=""
             )
-            filenames, subfolder = _save_images(images, "image", extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, None, None, False, False, counter, time_format, minimal_metadata)
+            filenames, subfolder = await get_event_loop().run_in_executor(
+                None, lambda: _save_images(images, "image", extension, path, quality_jpeg_or_webp, lossless_webp,
+                                           optimize_png, None, None, False, False, counter, time_format, minimal_metadata))
         else:
-            filenames, subfolder = _save_images(images, filename, extension, path, quality_jpeg_or_webp, lossless_webp, optimize_png, cls.hidden.prompt, cls.hidden.extra_pnginfo, save_workflow_as_json, embed_workflow, counter, time_format, metadata)
+            # Encoding and writing the images block the same way
+            filenames, subfolder = await get_event_loop().run_in_executor(
+                None, lambda: _save_images(images, filename, extension, path, quality_jpeg_or_webp, lossless_webp,
+                                           optimize_png, cls.hidden.prompt, cls.hidden.extra_pnginfo,
+                                           save_workflow_as_json, embed_workflow, counter, time_format, metadata))
 
         ui = None
         if show_preview:

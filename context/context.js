@@ -175,9 +175,24 @@ function hookSlotDefaults() {
     const rebuild = slotDefaults.setDefaults;
     slotDefaults.setDefaults = (value) => {
         rebuild.call(slotDefaults, value);
-        applySuggestions();
+        scheduleSuggestions();
     };
     applySuggestions();
+}
+
+// The core rebuilds the drag lists on every node registration, and this pack
+// re-appends its entries after each rebuild, so applying them per registration
+// did the whole pass once per node - hundreds of times over a normal startup.
+// Registrations arrive in synchronous batches, so one pass per batch is enough:
+// the lists are only read when a menu opens.
+let suggestionsPending = false;
+function scheduleSuggestions() {
+    if (suggestionsPending) return;
+    suggestionsPending = true;
+    queueMicrotask(() => {
+        suggestionsPending = false;
+        applySuggestions();
+    });
 }
 
 app.registerExtension({
@@ -192,6 +207,6 @@ app.registerExtension({
         }
         track(nodeType.comfyClass, nodeData);
         hookSlotDefaults();
-        applySuggestions();
+        scheduleSuggestions();
     },
 });

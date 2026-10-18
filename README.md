@@ -32,7 +32,7 @@ Use **inputs** to override context values (override happens first, so output con
 **Latent** used in priority:
 - provided latent;
 - encode image and/or audio with provided masks using respective VAE, combine if both;
-- create empty latent based on context width and height, respectin model type (flux2/flux3).
+- create empty latent based on context width and height, respecting model type (flux2/flux3).
 
 **Steps:** widget `steps` overrides context's steps and refiner_steps when >0. refiner_steps are used for i2i. start/end inside defined by widget or context step will ignore refiner_steps.
 
@@ -45,7 +45,7 @@ Use **inputs** to override context values (override happens first, so output con
 
 **Decode:** on by default. Decodes the output latent to image/audio/both and removes latent from context. An image whose size is not a multiple of the VAE's downscale ratio is pre-scaled to it before encoding, and the decoded image is stretched back to the original size, so the content stays aligned with the original. Disable to skip decoding in case you're chaining ksamplers (wan high pass).
 
-**Options:** connect options nodes to the `options` input - **Crop-Inpaint options**, **Iterative Options**, **Lora Travel options**, **Tiled VAE options**, **Clear VRAM options**, **DyPE options**, or **Merge KSampler Options** (dynamic `option1…option10` inputs that append several options lists into one).
+**Options:** connect options nodes to the `options` input - **Crop-Inpaint options**, **Iterative Options**, **Lora Travel options**, **Tiled VAE options**, **Clear VRAM options**, **Color Match options**, **DyPE options**, or **Merge KSampler Options** (dynamic `option1…option10` inputs that append several options lists into one).
 
 **Crop-Inpaint options** - allows crop area per mask, configure boundaries and resolution, and inpaint it at proper size, then paste back onto original.
 
@@ -55,6 +55,8 @@ Crop-Inpaint options and Iterative Options are inclusive, meaning can be used to
 **Lora Travel options** - dynamically change loras strength per step; str values in node are multipliers for value set in lora loader, unless it's 0 - then they are applied as actual str; can be used per iteration.
 
 **Clear VRAM options** frees VRAM like [Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use)'s Clean VRAM Used.
+
+**Color Match options** - after sampling (a run from a provided image, crop-inpainting, or the final iterative step) the result's color is matched back to the original with Transfer Color (`strength` 0 = no match).
 
 **DyPE options** - needs the [DyPE](https://github.com/wildminder/ComfyUI-DyPE) pack. dype/sega patch the model for high-resolution generation, so every other feature applies to them: the patch is re-applied per sample at the size actually being sampled, which makes it combine with the iterative upscale, and it never leaves that step.
 
@@ -68,13 +70,21 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 [a:b:8:4] - crossfade, a up to step 5, step 5 a at str .875 b - .125, step 6 - a:.75, b:.25, step 8 - both .5, step 9 a:.375, b:.625, step 12 - prompt b
 
-[a:b|3] or [a:b|.1] - iteration like [a:b] but instead of alternating each step, does it each 3 seps or total_steps*.1
+[a:b|3] or [a:b|.1] - iteration like [a:b] but instead of alternating each step, does it each 3 steps or total_steps*.1
+
+Groups nest, and only square brackets travel: `(prompt:1.5)` stays ComfyUI's weight syntax and is passed through untouched, colons and all.
+
+The context conditions with the first prompt of the plan - never the literal `[a:b:3]` text - and only the prompt that travels is encoded; the other keeps the context's own conditioning. Each unique prompt of the plan is encoded once and cached with its text encoder (last 8 per clip), so re-running an unchanged prompt skips the text encoder entirely.
 
 ## Other nodes
 
-**Lora Loader** - spiriual successor of [rgthree's](https://github.com/rgthree/rgthree-comfy) PowerLoraLoader initially made by Divine. Nodes2.0 compatible and extends functionality.
+**Lora Loader** - spiritual successor of [rgthree's](https://github.com/rgthree/rgthree-comfy) PowerLoraLoader initially made by Divine. Nodes2.0 compatible and extends functionality.
 
 **Any Switch** - [rgthree's](https://github.com/rgthree/rgthree-comfy) Any Switch but with dynamic number of inputs.
+
+**Any Batch/List** - dynamic-input batch of any type: `Batch` concatenates the connected inputs the way Batch Images does (tensors along dim 0, conditioning and other lists joined), `List` outputs them as a Python list like `Make List (Any)` from [Impact](https://github.com/ltdrdata/ComfyUI-Impact-Pack).
+
+**Any Count** - how many items a value holds: the batch size of a tensor or latent, the length of a conditioning or a list, 1 for a single object. Nothing connected and a null both count 0, so an optional branch can be measured without being wired - the case [Essentials'](https://github.com/cubiq/ComfyUI_essentials) `Batch Count` can't do, as its input is required.
 
 **Pipe Any** - bundles up to 10 `Any` values into a dict. Mostly inspired by [Crystools'](https://github.com/crystian/ComfyUI-Crystools) one, just unified into single node like context instead of in/out split.
 
@@ -82,11 +92,23 @@ Supports prompt travel/scheduling, whatever it is called, from a1111/forge webui
 
 **Group Header Toggles** - three small buttons (queue / bypass / mute) in the top-right corner of each group header. Active by default, available in settings. Stolen from [rgthree](https://github.com/rgthree/rgthree-comfy).
 
-**Resize Image / Empty Latent (Context)** - creates empty latent or resizes connectd image/mask allowing to keep proportions. Optional vae overrides the context's vae; encoded_latent outputs the image encoded with it (empty_latent when no image or vae). Always outputs a context - without a context input it creates a new one with width, height and the empty latent. `Enable preview` toggle (off by default, hidden while load image / crop image is on) writes and shows the output image's temp preview in the node on execution; off writes no preview file at all (while load / crop is on the preview is always written - downstream crop views read the context's image from it).
+**Resize Image / Empty Latent (Context)** - creates empty latent or resizes connected image/mask allowing to keep proportions. Optional vae overrides the context's vae; encoded_latent outputs the image encoded with it (empty_latent when no image or vae). Always outputs a context - without a context input it creates a new one with width, height and the empty latent. `Enable preview` toggle (off by default, hidden while load image / crop image is on) writes and shows the output image's temp preview in the node on execution; off writes no preview file at all (while load / crop is on the preview is always written - downstream crop views read the context's image from it).
 
-**Reference Latent (Context)** - faster flux2/klein/flux3 references, rescale all to the `megapixels` target then to `scale` (0 = own size), floored to the VAE's downscale ratio (2x for qwen image 2.1, so the latents splice at the vision slots) and the prompts are also re-encoded with the images. `ref_ctx_img` additionally references the context's own image at its own size (always when no image is linked, otherwise only when enabled); with no context image the first image becomes the context image and is stored back on the output context. A media pipe's reference images are referenced too - the wired images append to them in the output pipe. Without a context input it is just a media pipe creator: the wired images append to the pipe and the context passes through empty.
+**Reference Latent (Context)** - faster flux2/klein/flux3 references, rescale all to the `megapixels` target then to `scale` (0 = own size), floored to the VAE's downscale ratio (2x for qwen image 2.1, so the latents splice at the vision slots). `ref_latents` (on) VAE-encodes them and references them on the conditioning - the edit path the edit models were trained for; turn it off for a t2i model that only has the latent-concat path by accident (krea). A text encoder with a vision tower (qwen image, qwen image 2.1, krea2, mage, boogu, ideogram4) also sees the images and the prompts are re-encoded with them, at `vl_megapixels` (0 = the VAE-sized image; qwen image 2.1 always shares one size so every vision slot covers 2x2 latents) - that is how a model with no edit path conditions on a reference at all. Flux3's encoder is text-only by training, so it takes latents alone. HiDream-O1 and SenseNova read the reference as a raw image rather than a latent, so they get the resized image itself and need no VAE. `ref_ctx_img` additionally references the context's own image at its own size (always when no image is linked, otherwise only when enabled); with no context image the first image becomes the context image and is stored back on the output context. A media pipe's reference images are referenced too - the wired images append to them in the output pipe. Without a context input it is just a media pipe creator: the wired images append to the pipe and the context passes through empty.
 
-**Image Saver (Context)** - saves image with a1111 metadata (civit compatible) created from context values. Ripoff from [ImageSaver](https://github.com/alexopus/ComfyUI-Image-Saver) pack.
+**Mask/Segment (Context)** - detects or segments objects on the image (connected image wins over the context one) and stores the resulting image and mask in the context; the context's model and clip pass through untouched. A mode selector reveals the widgets of the chosen approach: `bbox` (ultralytics detector), `segm` (SAM refined by the detector's boxes), `sam3` (the selected SAM3 checkpoint, which can track its first-frame detection through a batch of frames). With preview on, displays the image with the mask tinted in the mask color. Also outputs crop info for pasting results back with **Image Paste By Mask (Batch) (Context)**.
+
+**Image Crop By Mask (Batch) (Context)** - crops each image by its own mask (image i by mask i); every crop is scaled up until it fills the total size, so subjects keep a consistent scale across the batch - when a crop's shape differs from the canvas its edges are trimmed. Optional temporal stabilization for video batches: constant crop size per shot and a smoothed crop center, with cuts detected from mask jumps. Outputs the crop info for pasting back; with a context, its image and mask are used when none are connected and the output context carries the cropped image, mask and crop info.
+
+**Image Paste By Mask (Batch) (Context)** - pastes images back onto the originals by mask: from a crop info (the exact inverse of the crop), or standalone with images_original and masks, where each mask's bbox is the paste area; when the batches differ, the smaller size wins. With composite on it instead pastes like Image Composite Masked: the pasted image is resized to the original's size when it differs and a source-sized mask is applied to it (no mask pastes opaquely).
+
+**Split Tiles (Context)** - splits the context/connected image into a batch of uniform, overlapping tiles (rows x cols, overlap as a fraction of the tile size) and outputs the tiles, a matching batch of masks for the Crop-Inpaint options, and the tiling info. The output context carries the tiling info too. Stills only.
+
+**Combine Tiles (Context)** - recombines a batch of tiles from the tiling info into the image: the layout is scaled to the tiles' size (which may be larger than at the split - the upscaled case) and the tiles are crossfaded across the overlap bands. Pair with Split Tiles to sample or upscale a still tile by tile.
+
+**Image Saver (Context)** - saves image with a1111 metadata (civit compatible) created from context values. `save_metadata` off writes no generation-parameters block and does no hashing or Civitai lookups; the workflow embed and the JSON sidecar keep their own toggles. Ripoff from [ImageSaver](https://github.com/alexopus/ComfyUI-Image-Saver) pack.
+
+**SeedVR2 Upscale (Context)** - the entire [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) upscale in one node: resize, pad, tiled VAE encode, sample with the encoded latent as the conditioning, decode, then align and color-correct the result to the resized input - replaces Pre-Process SeedVR2 Input, Apply SeedVR2 Conditioning, Post-Process SeedVR2 Output, the KSampler and the tiled VAE nodes. Model and VAE lists are filtered to the seedvr files; `None` takes them from the context. Target size is `megapixels` (0 = the input's own size) times `scale_factor`, like **Resize Image / Empty Latent (Context)**, and a `target_size_image` overrides both with its own size, like **Iterative Options**. `chunking_mode` samples a video a temporal chunk at a time (none / auto sized by free VRAM / manual `frames_per_chunk`) with `temporal_overlap` crossfaded at the merge - Split and Merge SeedVR2 Latents. Sampling is euler/simple at cfg 1 and denoise 1.0, `steps` 1 - the step the model was distilled for. The tile widgets are VAE Encode (Tiled)'s and drive the encode and the decode. `clean_vram` frees VRAM before the model loads (off by default).
 
 ## MiniMax H3
 

@@ -7,12 +7,33 @@ Each image is resized to the megapixels target, then scaled by the provided
 scale factor, encoded using the context's VAE, and set as reference_latents
 on the positive conditioning (and negative if cfg != 1).
 
-For Qwen Image 2.1 the size is floored to 2x the VAE's downscale ratio so
-every vision slot covers 2x2 latents, and the context prompts are re-encoded
-with the same resized images so the text encoder sees them and the model
-splices the latents at the vision slots; other models (flux2/klein, flux3) floor
-to the VAE ratio and take the latents as-is - flux3's text encoder is text-only
-and its DiT patchifies nothing, so the ratio alone is the whole constraint.
+Two independent paths, picked by the model and by its text encoder:
+
+- reference latents (ref_latents, on by default): the image is VAE-encoded and
+  set on the conditioning, which is what the edit models were trained to take
+  (flux2/klein, flux3, qwen image edit, qwen 2.1). Off for a model that only has
+  the latent-concat path by accident (krea) - it was never trained on it.
+- the text encoder seeing the images: any model whose encoder runs a vision tower
+  (the Qwen-VL family: qwen image, qwen 2.1, krea2, mage, boogu, ideogram4,
+  joyimage, kandinsky5) re-encodes the context prompts with the images at
+  vl_megapixels, so a t2i model conditions on them with no edit path at all.
+  Flux3 is left out - its Qwen3-VL encoder is text-only by training and its DiT
+  splices nothing. A tokenizer with no image template drops the images and warns
+  about it (MOSS-Image, and the passthrough encoders below).
+
+HiDream-O1 and SenseNova take the reference under reference_latents too, but as
+raw images rather than latents: their encoders are passthroughs that emit token
+ids and the DiT does the encoding. They get the resized image unchanged, which is
+what core's HiDream-O1 Reference Images attaches, and need no VAE. (That node also
+marks the negative prompt_type=negative - an image-only pass - which this one
+leaves to whoever owns the negative.)
+
+Qwen Image 2.1 splices the latents at the vision slots, so it floors the size to
+2x the VAE's downscale ratio - every slot covers 2x2 latents - and shares one size
+between the encoder and the VAE. Everything else floors to the VAE ratio and
+resizes the encoder's copy separately (flux2/klein and flux3 take the latents
+as-is; flux3's text encoder is text-only and its DiT patchifies nothing, so the
+ratio alone is the whole constraint).
 
 With ref_ctx_img the context's own image is referenced too: always
 when no image input is connected (at its own size, no rescale), and with image
@@ -31,9 +52,18 @@ import comfy.model_base
 import node_helpers
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE, recondition_prompts, _latent_downscale, ctx_from
+from .context import _CONTEXT_TYPE, _clip_takes_images, _is_model, recondition_prompts, _latent_downscale, ctx_from, ctx_set_image
 from .pipes.media_pipe import iter_numbered_slots, pipe_add_images
 from .resolution_latent import _resize_image_to_mp
+
+
+def _over_white(image):
+    """The image with its alpha composited over white; the vision tower has no
+    alpha channel, while the VAE keeps all four."""
+    rgb = image[:, :, :, :3]
+    if image.shape[-1] > 3:
+        rgb = rgb * image[:, :, :, 3:] + (1.0 - image[:, :, :, 3:])
+    return rgb
 
 
 class GibbyReferenceLatentContext(io.ComfyNode):
@@ -50,7 +80,10 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                 "Each image is resized to the megapixels target (0 = its own size), "
                 "scaled by the scale factor, encoded with the context VAE, and "
                 "referenced on positive/negative conditioning. "
-                "With Qwen Image 2.1 the prompts are also re-encoded with the images. "
+                "A text encoder with a vision tower also sees the images, at "
+                "vl_megapixels, so a t2i model (krea) conditions on them with "
+                "ref_latents off. HiDream-O1 and SenseNova get the image itself "
+                "rather than a latent, which is what their models read. "
                 "ref_ctx_img also references the context's own image: always when "
                 "no image is connected, otherwise only when enabled - it leads at its own size, "
                 "and with no context image the first image becomes the context image and is stored back. "
@@ -96,6 +129,21 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                     tooltip="Scale factor applied after resizing to the megapixels target"
                 ),
                 io.Boolean.Input(
+                    "ref_latents",
+                    default=True,
+                    optional=True,
+                    tooltip="VAE-encode the images and reference them on the conditioning: on for the edit models (flux2/klein, flux3, qwen image edit, qwen 2.1). Off for a model that was never trained to take them (krea) - its text encoder still sees the images."
+                ),
+                io.Float.Input(
+                    "vl_megapixels",
+                    default=0.15,
+                    min=0.0,
+                    max=20.0,
+                    step=0.01,
+                    optional=True,
+                    tooltip="Size the text encoder sees the images at; 0 reuses the VAE-sized image. Ignored by qwen 2.1, whose encoder and VAE must share one size so every vision slot covers 2x2 latents."
+                ),
+                io.Boolean.Input(
                     "ref_ctx_img",
                     display_name="ref_ctx_img",
                     default=False,
@@ -110,7 +158,7 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, context=None, media_pipe=None, images: io.Autogrow.Type = None, megapixels=1.0, scale=1.0, ref_ctx_img=False) -> io.NodeOutput:
+    def execute(cls, context=None, media_pipe=None, images: io.Autogrow.Type = None, megapixels=1.0, scale=1.0, ref_latents=True, vl_megapixels=0.15, ref_ctx_img=False) -> io.NodeOutput:
         # Without a context there is no VAE to encode with: the node just builds
         # the media pipe from the connected images
         context = context or {}
@@ -136,11 +184,17 @@ class GibbyReferenceLatentContext(io.ComfyNode):
             main, extras = None, explicit
 
         vae = context.get("vae")
-        if (main is None and not extras and not pipe_refs) or vae is None:
+        model = context.get("model")
+        # hidream-o1 and sensenova read raw images off reference_latents and do their
+        # own patch-grid conditioning, so they get the pixels and no VAE at all
+        raw_refs = _is_model(model, (comfy.model_base.HiDreamO1, comfy.model_base.SenseNovaU15))
+        if (main is None and not extras and not pipe_refs) or (vae is None and ref_latents and not raw_refs):
             return io.NodeOutput(ctx_from(context), pipe_add_images(media_pipe, explicit))
 
-        model = context.get("model")
-        is_qwen21 = model is not None and hasattr(model, "model") and isinstance(model.model, comfy.model_base.QwenImage21)
+        is_qwen21 = _is_model(model, comfy.model_base.QwenImage21)
+        # flux3's Qwen3-VL encoder can see images but was trained text-only, and its
+        # DiT splices nothing into the sequence, so it takes the latents alone
+        vl_refs = _clip_takes_images(context.get("clip")) and not _is_model(model, comfy.model_base.Flux3)
         # Floor refs to the VAE's downscale ratio so the encode doesn't truncate them;
         # qwen2.1 uses 2x so every vision slot covers 2x2 latents (Text Encode Qwen Image 2.1)
         dw, _ = _latent_downscale(vae, None)
@@ -150,45 +204,51 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         negative = context.get("negative")
         cfg = context.get("cfg", 1.0)
 
-        ref_latents = []
+        refs = []
         images_vl = []
 
-        def encode_ref(resized):
-            # the vision tower sees alpha over white, the vae keeps all four
-            if is_qwen21:
-                rgb = resized[:, :, :, :3]
-                if resized.shape[-1] > 3:
-                    rgb = rgb * resized[:, :, :, 3:] + (1.0 - resized[:, :, :, 3:])
-                images_vl.append(rgb)
-                return vae.encode(resized)
-            return vae.encode(resized[:, :, :, :3])
+        def add_ref(resized):
+            if vl_refs:
+                # qwen2.1 must see the exact image the VAE encodes; the others take
+                # the much smaller copy core's qwen image edit nodes feed the tower
+                vl = resized if is_qwen21 or vl_megapixels <= 0 else _resize_image_to_mp(resized, vl_megapixels, 1.0, dw)
+                images_vl.append(_over_white(vl))
+            if ref_latents:
+                if raw_refs:
+                    refs.append(resized)
+                else:
+                    refs.append(vae.encode(resized if is_qwen21 else resized[:, :, :, :3]))
 
         # The context image is referenced at its own size; the pipe refs and
         # the wired image_N to the target.
         if main is not None:
             main_resized = _resize_image_to_mp(main, 0.0, 1.0, multiple)
-            ref_latents.append(encode_ref(main_resized))
+            add_ref(main_resized)
         for image in pipe_refs:
-            ref_latents.append(encode_ref(_resize_image_to_mp(image, megapixels, scale, multiple)))
+            add_ref(_resize_image_to_mp(image, megapixels, scale, multiple))
         for image in extras:
-            ref_latents.append(encode_ref(_resize_image_to_mp(image, megapixels, scale, multiple)))
+            add_ref(_resize_image_to_mp(image, megapixels, scale, multiple))
 
-        # qwen2.1 splices the latents at the vision slots, so the text must be encoded with the images
-        if is_qwen21:
-            positive, negative = recondition_prompts(context, context.get("positive_prompt", ""), context.get("negative_prompt", ""), images=images_vl)
+        # qwen2.1 splices the latents at the vision slots, so the text must be encoded
+        # with the images and the tokens dropped; the other encoders keep the tokens and
+        # condition on them, which is all a model without the edit path can do.
+        if images_vl:
+            positive, negative = recondition_prompts(context, context.get("positive_prompt", ""), context.get("negative_prompt", ""), images=images_vl, keep_vision=not (is_qwen21 and ref_latents))
 
         # Copy before mutating: the engine's output cache can hand the same
         # context object to other consumers and to repeated runs.
         ctx = ctx_from(context)
         if main is not None:
-            ctx["image"] = main_resized
+            # The context's image becomes the resized one, so the latent and the
+            # sampler's cached sample built from the unsized image are stale
+            ctx_set_image(ctx, main_resized)
 
         # Update positive conditioning
-        if positive is not None and ref_latents:
-            ctx["positive"] = node_helpers.conditioning_set_values(positive, {"reference_latents": ref_latents})
+        if positive is not None and refs:
+            ctx["positive"] = node_helpers.conditioning_set_values(positive, {"reference_latents": refs})
 
         # Update negative conditioning if cfg != 1
-        if negative is not None and cfg != 1.0 and ref_latents:
-            ctx["negative"] = node_helpers.conditioning_set_values(negative, {"reference_latents": ref_latents})
+        if negative is not None and cfg != 1.0 and refs:
+            ctx["negative"] = node_helpers.conditioning_set_values(negative, {"reference_latents": refs})
 
         return io.NodeOutput(ctx, pipe_add_images(media_pipe, explicit))

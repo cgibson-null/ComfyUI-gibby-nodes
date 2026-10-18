@@ -16,19 +16,25 @@ and KSampler (Context).
 """
 
 import datetime
+import gc
+import logging
 import os
+import re
 import time
+import weakref
+from collections import OrderedDict
 
 import torch
 import comfy.samplers
 import comfy.model_management
 import comfy.model_base
-from nodes import CLIPTextEncode, ConditioningZeroOut, VAEEncode, VAEEncodeTiled, VAEDecode, VAEDecodeTiled, SetLatentNoiseMask
+from nodes import ConditioningZeroOut, VAEEncode, VAEEncodeTiled, VAEDecode, VAEDecodeTiled, SetLatentNoiseMask
 from comfy_extras.nodes_audio import VAEEncodeAudio
 from comfy_extras.nodes_lt import LTXVConcatAVLatent
 from comfy_api.latest import io
 
 from ..lora_loader import _apply_lora, _lora_stack, iter_lora_stack
+from .prompt_travel import _travel_step_text
 
 _CONTEXT_TYPE = io.Custom("CONTEXT")
 # The crop nodes' originals/mask/rects payload, carried in the context's crop_info
@@ -57,6 +63,23 @@ def ctx_set_image(ctx, image):
     them."""
     ctx["image"] = image
     drop_image_derived(ctx)
+
+
+def ctx_set_latent(ctx, latent):
+    """Override the context's latent and drop the cached sample built from the old
+    one, so the sampler samples the new latent instead of returning that result."""
+    ctx["latent"] = latent
+    ctx.pop("_kctx_sampled", None)
+
+
+def ctx_set_sampled_image(ctx, image):
+    """Store a sampled image on the context and drop everything the sample
+    replaced: the latent and cached sample built from the old image, the mask it
+    was sampled with, and the tiling info of the old image."""
+    ctx["image"] = image
+    drop_image_derived(ctx)
+    ctx.pop("mask", None)
+    ctx.pop("tiling_info", None)
 
 
 def set_sampling(ctx, steps, step_refiner, cfg, sampler, scheduler):
@@ -139,6 +162,55 @@ def _log(event, rest=""):
     print(f"\033[38;5;208m[Gibby]\033[0m {ts} \033[33m{event}\033[0m" + (f" {rest}" if rest else ""))
 
 
+def clear_vram(event="", verbose=False):
+    """Free VRAM like Easy-Use's Clean VRAM Used: gc, CUDA sync, unload all models, empty the cache."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    comfy.model_management.unload_all_models()
+    comfy.model_management.soft_empty_cache()
+    if verbose:
+        _log("Clear VRAM", event)
+
+
+_INDEX_RANGE = re.compile(r"(-?\d+)\s*-\s*(-?\d+)")
+
+
+def parse_index_spec(spec, count, field="indices"):
+    """The 0-based indices a user-typed spec selects out of `count` items, in the
+    order written and without duplicates; None when the spec is empty.
+    Accepts indices ("5"), negative indices ("-2" = second to last), inclusive
+    ranges ("0-2"), and python-style slices (":3", "4:6", "-3:", "::2"), mixed
+    in a comma-separated list. Out-of-range indices are dropped; a malformed
+    part raises, naming `field`."""
+    if not (spec or "").strip():
+        return None
+    indices = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if ":" in part:
+                bounds = part.split(":")
+                if len(bounds) > 3:
+                    raise ValueError
+                nums = [int(b) if b.strip() else None for b in bounds] + [None] * (3 - len(bounds))
+                picked = range(*slice(*nums).indices(count))
+            elif match := _INDEX_RANGE.fullmatch(part):
+                a, b = (int(v) for v in match.groups())
+                picked = range(min(a, b), max(a, b) + 1)
+            else:
+                picked = (int(part),)
+        except ValueError:
+            raise ValueError(f"Invalid {field} entry: {part!r} (indices like '0,2', a range like '0-2', or a slice like '1:3')")
+        for i in picked:
+            i += count if i < 0 else 0
+            if 0 <= i < count and i not in indices:
+                indices.append(i)
+    return indices
+
+
 def _mp(w, h):
     """Megapixels of a w x h resolution as a 2-decimal string; '' when either dimension is missing."""
     if not w or not h:
@@ -188,6 +260,17 @@ def _is_flux2_latent(model_obj):
     return _is_model(model_obj, (comfy.model_base.Flux2, comfy.model_base.Flux3))
 
 
+def _clip_takes_images(clip):
+    """Whether a clip's text encoder runs a vision tower - the same contract core
+    uses (sd1_clip.SDClipModel.process_tokens hands image embeds to the
+    transformer's preprocess_embed). True for the Qwen-VL / Qwen3.5 / Gemma3
+    encoders, false for the text-only ones (flux2's mistral, klein's qwen3)."""
+    te = getattr(clip, "cond_stage_model", None)
+    name = getattr(te, "clip", None)
+    inner = getattr(te, name, None) if isinstance(name, str) else None
+    return hasattr(getattr(inner, "transformer", None), "preprocess_embed")
+
+
 def empty_latent(width, height, batch_size=1, flux2=None, model_obj=None):
     """An empty latent dict for width x height: the 128ch /16x Flux2 one when
     flux2 (or model_obj is a Flux2/Flux3 model), else the standard 4ch /8x one."""
@@ -196,7 +279,7 @@ def empty_latent(width, height, batch_size=1, flux2=None, model_obj=None):
     if flux2:
         samples = torch.zeros([batch_size, 128, height // 16, width // 16],
                               device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
-        return {"samples": samples}
+        return {"samples": samples, "downscale_ratio_spacial": 16}
     samples = torch.zeros([batch_size, 4, height // 8, width // 8],
                           device=comfy.model_management.intermediate_device(), dtype=comfy.model_management.intermediate_dtype())
     return {"samples": samples, "downscale_ratio_spacial": 8}
@@ -239,24 +322,36 @@ def _stringify(value):
     return str(value)
 
 
-def _recondition_text(clip, base_cond, text, ctx, images=None):
-    """Re-encode `text` against clip, grafted onto base_cond's values so its
-    reference payloads survive (flux2 reference_latents, h3 minimax_refs/keyframes).
-    For h3 the context carries the pre-processed ref items / keyframe images, and
-    the text is tokenized with them so the Qwen vision tokens stay consistent.
-    With images the text is tokenized with them, so the model splices reference
-    latents at the vision slots (qwen2.1)."""
-    ref_items = ctx.get("h3_ref_items")
-    kf_imgs = ctx.get("h3_kf_imgs")
-    if ref_items:
-        tokens = clip.tokenize(text, minimax_ref_items=ref_items)
-    elif images:
-        tokens = clip.tokenize(text, images=images, keep_vision=False, prevent_empty_text=True)
-    elif kf_imgs:
-        tokens = clip.tokenize(text, images=kf_imgs)
-    else:
-        tokens = clip.tokenize(text)
-    new_conds = clip.encode_from_tokens_scheduled(tokens)
+# Encoded prompts per clip object, oldest first; the clip is a weak key, so the
+# entries of a clip that is unloaded go with it.
+_COND_CACHE = weakref.WeakKeyDictionary()
+_COND_CACHE_LIMIT = 8
+
+
+def _encode_text(clip, text):
+    """Encode a prompt with clip, reusing the encoding made earlier with the same
+    clip object: the same prompt across runs, and the prompt a context's conditioning
+    and its prompt travel plan share. Keyed weakly by the clip, so unloading it drops
+    its entries, and a lora applied to a clip clones it, so a different text encoder
+    misses instead of reusing stale embeddings. A clip keeps its last
+    _COND_CACHE_LIMIT prompts."""
+    entries = _COND_CACHE.get(clip)
+    if entries is None:
+        entries = _COND_CACHE[clip] = OrderedDict()
+    if text in entries:
+        entries.move_to_end(text)
+        return entries[text]
+    encoded = clip.encode_from_tokens_scheduled(clip.tokenize(text))
+    entries[text] = encoded
+    while len(entries) > _COND_CACHE_LIMIT:
+        entries.popitem(last=False)
+    return encoded
+
+
+def _graft_conds(base_cond, new_conds):
+    """The freshly encoded conds with base_cond's values underneath them, so the
+    reference payloads (flux2 reference_latents, h3 minimax_refs/keyframes) survive;
+    the new prompt's own values win."""
     if base_cond is None:
         return new_conds
     out = []
@@ -267,19 +362,62 @@ def _recondition_text(clip, base_cond, text, ctx, images=None):
     return out
 
 
-def recondition_prompts(ctx, positive_text, negative_text, images=None):
+def _images_in_tokens(tokens):
+    """Whether tokenize() actually placed the images. A tokenizer with no image
+    template leaves the vision block out of the text and the images disappear
+    without an error - MOSS-Image's Qwen3.5 tokenizer rewrites the no-template
+    path as text-only, so the encoder's vision tower is never asked."""
+    return any(isinstance(token[0], dict) and token[0].get("type") == "image"
+               for batch in tokens.values() for row in batch for token in row)
+
+
+def _recondition_text(clip, base_cond, text, ctx, images=None, keep_vision=False):
+    """Re-encode `text` against clip, grafted onto base_cond's values so its
+    reference payloads survive (flux2 reference_latents, h3 minimax_refs/keyframes).
+    For h3 the context carries the pre-processed ref items / keyframe images, and
+    the text is tokenized with them so the Qwen vision tokens stay consistent.
+    With images the text is tokenized with them: qwen2.1 drops the vision tokens
+    and splices reference latents into the slots they open (keep_vision=False),
+    every other vision encoder keeps the tokens and conditions on them alone."""
+    ref_items = ctx.get("h3_ref_items")
+    kf_imgs = ctx.get("h3_kf_imgs")
+    if ref_items:
+        tokens = clip.tokenize(text, minimax_ref_items=ref_items)
+        return _graft_conds(base_cond, clip.encode_from_tokens_scheduled(tokens))
+    if images:
+        tokens = clip.tokenize(text, images=images, keep_vision=keep_vision, prevent_empty_text=True)
+        if not _images_in_tokens(tokens):
+            logging.warning(f"{type(clip.tokenizer).__name__} put no images in the tokens: the reference images are dropped and the prompt conditions on text alone.")
+        return _graft_conds(base_cond, clip.encode_from_tokens_scheduled(tokens))
+    if kf_imgs:
+        tokens = clip.tokenize(text, images=kf_imgs)
+        return _graft_conds(base_cond, clip.encode_from_tokens_scheduled(tokens))
+    # Only the plain-text path is cached: tokenizing with ref items or images depends
+    # on tensors that have no cheap identity to key on.
+    return _graft_conds(base_cond, _encode_text(clip, text))
+
+
+def _conditioning_text(ctx, side):
+    """The text one side's conditioning is encoded from: the first prompt of its
+    travel plan when the prompt travels, otherwise the prompt itself."""
+    return _travel_step_text(ctx.get(side + "_prompt") or "", ctx.get("steps"))
+
+
+def recondition_prompts(ctx, positive_text, negative_text, images=None, keep_vision=False):
     """Re-encode positive/negative prompt texts against the context clip, grafted
     onto the context's existing conditionings so their reference payloads survive.
-    Returns (positive, negative); falls back to the existing conditionings when
-    there is no clip or nothing to re-encode."""
+    A prompt that travels is encoded as the first prompt of its travel plan; the
+    sampler swaps in the other steps. Returns (positive, negative); falls back to
+    the existing conditionings when there is no clip or nothing to re-encode."""
     clip = ctx.get("clip")
     if clip is None or (not positive_text and not negative_text):
         return ctx.get("positive"), ctx.get("negative")
-    positive = _recondition_text(clip, ctx.get("positive"), positive_text, ctx, images)
+    steps = ctx.get("steps")
+    positive = _recondition_text(clip, ctx.get("positive"), _travel_step_text(positive_text, steps), ctx, images, keep_vision)
     if ctx.get("cfg") == 1:
         negative, = ConditioningZeroOut().zero_out(positive)
     elif negative_text:
-        negative = _recondition_text(clip, ctx.get("negative"), negative_text, ctx, images)
+        negative = _recondition_text(clip, ctx.get("negative"), _travel_step_text(negative_text, steps), ctx, images, keep_vision)
     else:
         negative = ctx.get("negative")
     return positive, negative
@@ -287,14 +425,15 @@ def recondition_prompts(ctx, positive_text, negative_text, images=None):
 
 def ensure_conditioning(ctx):
     """Fill in the context's missing positive/negative conditioning from its clip,
-    zeroing the negative when cfg=1. Mutates ctx."""
+    zeroing the negative when cfg=1. A prompt that travels conditions with the first
+    prompt of its travel plan; the sampler swaps in the other steps. Mutates ctx."""
     if ctx.get("positive") is None and ctx.get("clip") is not None:
-        ctx["positive"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("positive_prompt", ""))
+        ctx["positive"] = _encode_text(ctx["clip"], _conditioning_text(ctx, "positive"))
     if ctx.get("negative") is None:
         if ctx.get("cfg") == 1 and ctx.get("positive") is not None:
             ctx["negative"], = ConditioningZeroOut().zero_out(ctx["positive"])
         elif ctx.get("clip") is not None:
-            ctx["negative"], = CLIPTextEncode().encode(ctx["clip"], ctx.get("negative_prompt", ""))
+            ctx["negative"] = _encode_text(ctx["clip"], _conditioning_text(ctx, "negative"))
 
 
 def encode_image(vae, image, tiled=False, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8, verbose=False):
@@ -491,17 +630,18 @@ class GibbyContext(io.ComfyNode):
         if ctx.get("latent") is None:
             # Image takes priority - encode it fresh with mask if available.
             if ctx.get("image") is not None and ctx.get("vae") is not None:
-                try:
-                    ctx["latent"] = encode_image(ctx["vae"], ctx["image"], tiled, tile_size, overlap, temporal_size, temporal_overlap)
-                    if ctx.get("mask") is not None:
-                        ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], ctx["mask"])
+                ctx["latent"] = encode_image(ctx["vae"], ctx["image"], tiled, tile_size, overlap, temporal_size, temporal_overlap)
+                if ctx.get("mask") is not None:
+                    ctx["latent"], = SetLatentNoiseMask().set_mask(ctx["latent"], ctx["mask"])
 
-                    # If audio also available, combine into AV latent
-                    if ctx.get("vae_audio") is not None and ctx.get("audio") is not None:
+                # If audio also available, combine into AV latent. A model without
+                # audio slots keeps the image latent instead of failing the run.
+                if ctx.get("vae_audio") is not None and ctx.get("audio") is not None:
+                    try:
                         audio_latent, = VAEEncodeAudio().encode(ctx["vae_audio"], ctx["audio"])
                         ctx["latent"], = LTXVConcatAVLatent().execute(ctx["latent"], audio_latent)
-                except Exception:
-                    ctx["latent"] = None
+                    except Exception as exc:
+                        _log("AV latent skipped", f"{type(exc).__name__}: {exc}")
 
             # If no image but audio + vae_audio available, encode audio-only latent
             elif ctx.get("vae_audio") is not None and ctx.get("audio") is not None:

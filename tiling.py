@@ -27,7 +27,7 @@ from .context import _CONTEXT_TYPE, ctx_from, ctx_set_image
 from .resolution_latent import _resize_image
 
 # Carries how the image was tiled: the per-tile rects and the grid, so the
-# tiles can be recombined (Combine Tiles, KSampler (Context) tiled mode)
+# tiles can be recombined by Combine Tiles (Context)
 _TILING_INFO_TYPE = io.Custom("GIBBY_TILING_INFO")
 
 
@@ -126,6 +126,8 @@ def _combine_tiles(tiles, info, new_tw, new_th):
     rw, rh = new_tw / info["tile_w"], new_th / info["tile_h"]
     places = [(round(x0 * rw), round(y0 * rh), max(1, round(tw * rw)), max(1, round(th * rh)))
               for (x0, y0, tw, th) in rects]
+    # The bands of the scaled layout, so the crossfade uses the same math as split
+    scaled = {**info, "rects": places, "tile_w": new_tw, "tile_h": new_th}
     out_w = max(px + pw for px, _, pw, _ in places)
     out_h = max(py + ph for _, py, _, ph in places)
     acc = torch.zeros(B, out_h, out_w, C, dtype=tiles.dtype, device=tiles.device)
@@ -137,12 +139,8 @@ def _combine_tiles(tiles, info, new_tw, new_th):
             t = tiles[k::n]
             if t.shape[1] != ph or t.shape[2] != pw:
                 t = _resize_image(t, pw, ph, "lanczos")
-            bl = places[k - 1][0] + places[k - 1][2] - px if j > 0 else 0
-            br = px + pw - places[k + 1][0] if j < cols - 1 else 0
-            bt = places[k - cols][1] + places[k - cols][3] - py if i > 0 else 0
-            bb = py + ph - places[k + cols][1] if i < rows - 1 else 0
-            w = _tile_weight(ph, pw, max(0, bl), max(0, br), max(0, bt), max(0, bb),
-                             device=tiles.device)
+            bl, br, bt, bb = _tile_bands(scaled, i, j)
+            w = _tile_weight(ph, pw, bl, br, bt, bb, device=tiles.device)
             acc[:, py:py + ph, px:px + pw, :] += t * w.to(acc.dtype).view(1, ph, pw, 1)
             wsum[:, py:py + ph, px:px + pw] += w
     return acc / wsum.unsqueeze(-1).clamp(min=1e-3)

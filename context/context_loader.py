@@ -20,6 +20,9 @@ Carries the sampling parameters as widgets, and always fills in derived values o
 Use Context to merge or override individual values of this context downstream.
 """
 
+import logging
+import weakref
+
 import torch
 
 import folder_paths
@@ -32,10 +35,10 @@ try:
     from comfy_extras.nodes_model_advanced import ModelAttentionBackend
 except ImportError:
     ModelAttentionBackend = None
-    print("Gibby Context Loader: ModelAttentionBackend is missing - ck_attn is disabled (update ComfyUI)")
+    logging.warning("[Gibby Context Loader] ModelAttentionBackend is missing - ck_attn is disabled (update ComfyUI)")
 
 from ..lora_loader import _apply_lora, iter_lora_stack
-from . import _CONTEXT_TYPE, _lora_stack, ctx_from, ctx_set_image, GibbyContext
+from . import _CONTEXT_TYPE, _lora_stack, ctx_from, ctx_set_image, ctx_set_latent, GibbyContext
 
 def _clip_name_inputs(count):
     clip_options = ["None"] + folder_paths.get_filename_list("text_encoders")
@@ -45,54 +48,67 @@ def _clip_name_inputs(count):
 # execute() runs once per list item when a list input is mapped over, so the
 # model loads are cached: each part is built once per key, not once per item.
 # A single entry per part keeps the cache from holding extra models in memory.
-_last_checkpoint = None  # (ckpt_name, (model, clip, vae))
-_last_unet = None  # (unet_name, weight_dtype, model)
-_last_clip = None  # ((clip_paths, type, device), clip)
-_last_vae = None  # (vae_name, vae)
-_last_vae_audio = None  # (vae_audio_name, vae_audio)
+class _WeakCache:
+    """One load, held weakly by key.
+
+    A list-mapped execute() has to build each part once for the whole list, but
+    the module must not be what keeps the result alive afterwards: a strong
+    reference held the last checkpoint, clip and VAE in host RAM for the rest of
+    the server session, past unload_all_models from the Clear VRAM options. A dead
+    reference is a miss, so the model goes when ComfyUI drops it."""
+
+    def __init__(self):
+        self.key = None
+        self.refs = None
+
+    def get_or_load(self, key, load):
+        """The objects load() returns (a tuple), for this key only."""
+        if self.key == key:
+            values = tuple(ref() for ref in self.refs)
+            if all(values):
+                return values
+        values = tuple(load())
+        self.key = key
+        self.refs = tuple(weakref.ref(value) for value in values)
+        return values
+
+
+_last_checkpoint = _WeakCache()  # ckpt_name -> (model, clip, vae)
+_last_unet = _WeakCache()  # (unet_name, weight_dtype) -> (model,)
+_last_clip = _WeakCache()  # (clip_paths, type, device) -> (clip,)
+_last_vae = _WeakCache()  # vae_name -> (vae,)
+_last_vae_audio = _WeakCache()  # vae_audio_name -> (vae_audio,)
 
 
 def _load_checkpoint(ckpt_name):
-    global _last_checkpoint
-    if _last_checkpoint is None or _last_checkpoint[0] != ckpt_name:
-        _last_checkpoint = (ckpt_name, CheckpointLoaderSimple().load_checkpoint(ckpt_name))
-    return _last_checkpoint[1]
+    return _last_checkpoint.get_or_load(ckpt_name, lambda: CheckpointLoaderSimple().load_checkpoint(ckpt_name))
 
 
 def _load_unet(unet_name, weight_dtype):
-    global _last_unet
-    if _last_unet is None or _last_unet[:2] != (unet_name, weight_dtype):
-        model, = UNETLoader().load_unet(unet_name, weight_dtype)
-        _last_unet = (unet_name, weight_dtype, model)
-    return _last_unet[2]
+    model, = _last_unet.get_or_load((unet_name, weight_dtype), lambda: UNETLoader().load_unet(unet_name, weight_dtype))
+    return model
 
 
 def _load_clip(clip_paths, type_, device):
-    global _last_clip
-    key = (tuple(clip_paths), type_, device)
-    if _last_clip is None or _last_clip[0] != key:
+    def load():
         clip_type = getattr(comfy.sd.CLIPType, type_.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         model_options = {}
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
-        _last_clip = (key, comfy.sd.load_clip(ckpt_paths=clip_paths, embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options))
-    return _last_clip[1]
+        return comfy.sd.load_clip(ckpt_paths=clip_paths, embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options),  # the CLIP itself, unlike the loaders above
+
+    model, = _last_clip.get_or_load((tuple(clip_paths), type_, device), load)
+    return model
 
 
 def _load_vae(vae_name):
-    global _last_vae
-    if _last_vae is None or _last_vae[0] != vae_name:
-        vae, = VAELoader().load_vae(vae_name)
-        _last_vae = (vae_name, vae)
-    return _last_vae[1]
+    vae, = _last_vae.get_or_load(vae_name, lambda: VAELoader().load_vae(vae_name))
+    return vae
 
 
 def _load_vae_audio(vae_audio_name):
-    global _last_vae_audio
-    if _last_vae_audio is None or _last_vae_audio[0] != vae_audio_name:
-        vae_audio, = VAELoader().load_vae(vae_audio_name)
-        _last_vae_audio = (vae_audio_name, vae_audio)
-    return _last_vae_audio[1]
+    vae_audio, = _last_vae_audio.get_or_load(vae_audio_name, lambda: VAELoader().load_vae(vae_audio_name))
+    return vae_audio
 
 
 class GibbyContextLoader(io.ComfyNode):
@@ -236,7 +252,7 @@ class GibbyContextLoader(io.ComfyNode):
         if model_name is not None:
             ctx["model_name"] = model_name
         if latent is not None:
-            ctx["latent"] = latent
+            ctx_set_latent(ctx, latent)
         if image is not None:
             # A new image invalidates the latent and cached sample built from
             # the context's old one.

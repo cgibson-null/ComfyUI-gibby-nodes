@@ -1,4 +1,5 @@
 import { app } from "../../../scripts/app.js";
+import { findWidget } from "../gibby_widgets.js";
 
 // Gibby Nodes - LLM Connect
 // -------------------------
@@ -12,10 +13,6 @@ import { app } from "../../../scripts/app.js";
 // (COMFY_AUTOGROW_V3) - no JS needed for those.
 
 const CONNECTIVITY_NODE = "GibbyConnectivity";
-
-function findWidget(node, name) {
-  return node.widgets?.find((w) => w.name === name);
-}
 
 async function fetchModels(url, apiKey) {
   const resp = await fetch("/gibby_llm/get_models", {

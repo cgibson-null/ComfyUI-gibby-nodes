@@ -4,7 +4,7 @@ Pipe Any node
 Creates a pipe dict from multiple Any inputs, or overrides an existing pipe.
 
 Similar to ImageBatchMulti but for Any type:
-- count input controls the number of any_1, any_2, etc. inputs
+- the ten any_N slots are all optional; the Nth value lands at key "any_N"
 - Top input/output: pipe (dict) for existing pipes to override
 - If pipe is provided and any inputs are connected, those override pipe elements
 - Outputs the resulting pipe dict plus all individual Any outputs
@@ -23,9 +23,9 @@ class PipeAny(io.ComfyNode):
             display_name="Pipe Any",
             category="gibby",
             description=(
-                "Creates a pipe dict from multiple Any inputs. "
-                "If an existing pipe is provided, connected inputs override it at their positions. "
-                "Set count and click update to change the number of inputs/outputs."
+                "Creates a pipe dict from the connected any_N inputs, keyed 'any_1'...'any_10'. "
+                "With a pipe connected, the connected inputs override it at their keys. "
+                "Each output passes its key's value on."
             ),
             inputs=[
                 # Top: existing pipe to override
@@ -76,4 +76,4 @@ class PipeAny(io.ComfyNode):
                 result[key] = value
 
         # Return outputs: pipe dict first, then any_1 through any_10 from the result
-        return (result,) + tuple(result.get(f"any_{i}") for i in range(1, 11))
+        return io.NodeOutput(result, *(result.get(f"any_{i}") for i in range(1, 11)))

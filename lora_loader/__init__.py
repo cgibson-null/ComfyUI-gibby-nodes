@@ -233,6 +233,18 @@ def _fetch_civitai_by_hash(digest):
     return _civitai_get_json(f"https://civitai.red/api/v1/model-versions/by-hash/{digest.upper()}")
 
 
+def _civitai_model_version_by_hash(digest, label):
+    """Raw Civitai model-version data for a hash - the one by-hash call every
+    consumer here uses - or None with a warning naming `label`."""
+    try:
+        return _fetch_civitai_by_hash(digest)
+    except urllib.error.HTTPError as e:
+        logging.warning(f"[Gibby] Civitai error ({e.code}) for {label}")
+    except Exception as e:
+        logging.warning(f"[Gibby] Could not reach Civitai for {label}: {e}")
+    return None
+
+
 def _get_excluded_words():
     """Get excluded words from ComfyUI settings (normalized to lowercase)."""
     return {w.lower() for w in _civitai_settings.get("exclude_words", []) if isinstance(w, str)}
@@ -333,13 +345,8 @@ def _lora_name_for_path(filepath):
 
 def _fetch_lora_civitai_info(lora_name, digest):
     """Fetch and cache Civitai info for a lora by hash; returns it or None."""
-    try:
-        data = _fetch_civitai_by_hash(digest)
-    except urllib.error.HTTPError as e:
-        logging.warning(f"[Lora Loader] Civitai error ({e.code}) fetching info for '{lora_name}'")
-        return None
-    except Exception as e:
-        logging.warning(f"[Lora Loader] Could not reach Civitai for '{lora_name}': {e}")
+    data = _civitai_model_version_by_hash(digest, f"lora '{lora_name}'")
+    if data is None:
         return None
 
     civitai_info = _civitai_info_from_api(data)
@@ -604,9 +611,11 @@ class GibbyLoraLoader(io.ComfyNode):
             if not strength:
                 continue
 
-            # Skip loras that don't exist on disk
+            # Skip loras that don't exist on disk - a missing file would
+            # otherwise silently change the result.
             lora_path = folder_paths.get_full_path("loras", lora_name)
             if not lora_path or not os.path.isfile(lora_path):
+                logging.warning(f"[Lora Loader] '{lora_name}' not found in the loras folder - skipped")
                 continue
 
             # Apply LoRAs to whichever of model/clip are connected (independently).

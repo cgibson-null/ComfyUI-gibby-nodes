@@ -38,13 +38,13 @@ Key behaviors:
   context carries the original unpatched model
 """
 
-import gc
 import os
-import re
 import time
+import weakref
 
 import folder_paths
 import torch
+from scipy import ndimage as ndi
 import comfy.samplers
 import comfy.sample
 import comfy.model_management
@@ -69,11 +69,14 @@ except ImportError:
 import comfy.utils as _comfy_utils
 from nodes import SetLatentNoiseMask
 from comfy_extras.nodes_upscale_model import ImageUpscaleWithModel
+from comfy_extras.nodes_differential_diffusion import DifferentialDiffusion
 from comfy_extras.nodes_post_processing import ColorTransfer
 from ..context import (_CONTEXT_TYPE, GibbyContext, _recondition_text, _latent_downscale,
-                       _image_dims, _latent_dims, _is_flux2, ctx_from, ctx_size,
-                       ensure_conditioning, encode_image, decode_latent,
+                       _image_dims, _latent_dims, _is_flux2, clear_vram, ctx_from, ctx_size,
+                       ctx_set_sampled_image, ctx_set_image, ctx_set_latent, drop_image_derived, ensure_conditioning, encode_image, decode_latent,
+                       parse_index_spec,
                     _mp, _image_count_s, _latent_count_s, _log)
+from ..context.prompt_travel import _has_travel_group, _plan_prompt_travel
 from ..lora_loader import iter_lora_stack
 from ..ksampler_options.crop_inpaint import _KSAMPLER_OPTIONS_TYPE
 from ..crop_paste.crop_image_by_mask import _process_mask, _mask_box, _cover_crop
@@ -97,17 +100,6 @@ def _with_color_match(opt, color_opt):
     o["color_match_method"] = color_opt.get("color_match_method", "mkl_lab")
     o["color_match_strength"] = color_opt.get("color_match_strength", 1.0)
     return o
-
-
-def _clear_vram(event, verbose=False):
-    """Free VRAM like Easy-Use's Clean VRAM Used: gc, CUDA sync, unload all models, empty the cache."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    comfy.model_management.unload_all_models()
-    comfy.model_management.soft_empty_cache()
-    if verbose:
-        _log("Clear VRAM", event)
 
 
 def _tiled_settings(options_list):
@@ -147,6 +139,7 @@ def _load_lora_state(lora_name):
     """The lora's state dict from disk, via the LoraLoader path; None when the file is missing."""
     path = folder_paths.get_full_path("loras", lora_name)
     if not path or not os.path.isfile(path):
+        _log("Lora Travel", f"'{lora_name}' not found in the loras folder - skipped")
         return None
     return _comfy_utils.load_torch_file(path, safe_load=True)
 
@@ -332,214 +325,18 @@ def _sample_with_lora_travels(travel_state, noise, cfg_value, sampler_obj, sigma
                                       callback=callback, disable_pbar=disable_pbar, seed=seed)
 
 
-def _find_matching(text, start, open_ch, close_ch):
-    """The index of the closing char matching the opening char at start; -1 when unbalanced."""
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == open_ch:
-            depth += 1
-        elif text[i] == close_ch:
-            depth -= 1
-            if depth == 0:
-                return i
-    return -1
-
-
-def _split_travel(text):
-    """Split a [...] group content on the top-level colons: colons inside () and [] stay in their part."""
-    parts, cur, depth = [], [], 0
-    for ch in text:
-        if ch in "([":
-            depth += 1
-        elif ch in "])":
-            depth -= 1
-        if ch == ":" and depth == 0:
-            parts.append("".join(cur))
-            cur = []
-        else:
-            cur.append(ch)
-    parts.append("".join(cur))
-    return parts
-
-
-def _parse_travel_group(content):
-    """The parsed contents of a [...] group:
-    - [before:after:step] -> a (before, after, step) switch; before is active until
-      the step, after from it on (step with a dot=fraction of steps, without=absolute).
-    - [before:after:step:radius] -> a ("blend", before, after, step, radius) crossfade:
-      the prompts mix linearly around the step, radius is how many steps each side
-      stays pure (with a dot a fraction of the steps).
-    - [before:after] or [before:after|period] -> an ("alt", before, after, period)
-      alternate that flips between before and after; period is how many steps each
-      side stays active (default 1, with a dot a fraction of the steps).
-    Otherwise the content is plain text."""
-    parts = _split_travel(content)
-    if len(parts) == 2:
-        after_text, period = parts[1], ""
-        if "|" in after_text:
-            after_text, _, period = after_text.partition("|")
-            try:
-                float(period)
-            except ValueError:
-                return content
-        return ("alt", _parse_travel_expr(parts[0]), _parse_travel_expr(after_text), period)
-    if len(parts) < 3:
-        return content
-    try:
-        float(parts[-1])
-    except ValueError:
-        return content
-    if len(parts) >= 4:
-        try:
-            float(parts[-2])
-        except ValueError:
-            pass
-        else:
-            return ("blend", _parse_travel_expr(":".join(parts[:-3])), _parse_travel_expr(parts[-3]),
-                    parts[-2], parts[-1])
-    return (_parse_travel_expr(":".join(parts[:-2])), _parse_travel_expr(parts[-2]), parts[-1])
-
-
-def _parse_travel_expr(text):
-    """Parse a travel prompt into a tree: plain text is a string, a sequence is a
-    list, a [before:after:step] group a (before, after, step) switch, and a
-    [before:after] group an ("alt", ...) alternate. An unbalanced bracket stays
-    as-is, and () groups are atomic weight syntax."""
-    nodes, i, n = [], 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch in "([":
-            j = _find_matching(text, i, ch, ")" if ch == "(" else "]")
-            if j == -1:
-                nodes.append(ch)
-                i += 1
-            elif ch == "(":
-                nodes.append(text[i:j + 1])
-                i = j + 1
-            else:
-                nodes.append(_parse_travel_group(text[i + 1:j]))
-                i = j + 1
-        else:
-            j = i
-            while j < n and text[j] not in "([":
-                j += 1
-            nodes.append(text[i:j])
-            i = j
-    out = []
-    for node in nodes:
-        if isinstance(node, str) and out and isinstance(out[-1], str):
-            out[-1] += node
-        else:
-            out.append(node)
-    return out[0] if len(out) == 1 else out
-
-
-def _resolve_travel_step(node, steps_value):
-    """Resolve every switch step, blend step/radius and alternate period of a travel
-    tree against the total step count (a value with a dot is a fraction of the steps,
-    without one an absolute count) and clamp it into range."""
-    if isinstance(node, str):
-        return node
-    if isinstance(node, list):
-        return [_resolve_travel_step(n, steps_value) for n in node]
-    if node[0] == "alt":
-        _, before, after, period = node
-        if period:
-            val = int(float(period) * steps_value) if "." in period else int(float(period))
-            period = max(1, val)
-        else:
-            period = 1
-        return ("alt", _resolve_travel_step(before, steps_value),
-                _resolve_travel_step(after, steps_value), period)
-    if node[0] == "blend":
-        _, before, after, center, radius = node
-        c = int(float(center) * steps_value) if "." in center else int(float(center))
-        r = int(float(radius) * steps_value) if "." in radius else int(float(radius))
-        return ("blend", _resolve_travel_step(before, steps_value),
-                _resolve_travel_step(after, steps_value),
-                max(0, min(steps_value, c)), max(1, r))
-    before, after, step = node
-    val = int(float(step) * steps_value) if "." in step else int(float(step))
-    return (_resolve_travel_step(before, steps_value), _resolve_travel_step(after, steps_value),
-            max(0, min(steps_value, val)))
-
-
-def _pieces(item):
-    """A rendered prompt piece as (text, weight) endpoints: a plain string is a
-    single full-strength endpoint, a ("mix", ...) item its endpoints."""
-    return [(item, 1.0)] if isinstance(item, str) else item[1]
-
-
-def _mix_pieces(a, b, w):
-    """Blend two prompt pieces at weight w of the second: the endpoints of both
-    pieces, scaled by their side's weight."""
-    return [(t, wt * (1.0 - w)) for t, wt in _pieces(a)] + [(t, wt * w) for t, wt in _pieces(b)]
-
-
-def _fold_pieces(items):
-    """Join a sequence of prompt pieces into one prompt: the endpoints are the
-    cartesian product of the pieces' endpoints with multiplied weights; a single
-    endpoint collapses back to a plain string."""
-    out = [("", 1.0)]
-    for item in items:
-        out = [(t + t2, wt * wt2) for t, wt in out for t2, wt2 in _pieces(item)]
-    return out[0][0] if len(out) == 1 else ("mix", out)
-
-
-def _render_travel(node, step):
-    """The prompt of a travel tree at a (global) step index: a string for plain and
-    switching prompts, a ("mix", [(text, weight), ...]) item where a crossfade
-    mixes the endpoints (step is the 1-based step number the weight is measured at)."""
-    if isinstance(node, str):
-        return node
-    if isinstance(node, list):
-        return _fold_pieces([_render_travel(n, step) for n in node])
-    if node[0] == "alt":
-        _, before, after, period = node
-        return _render_travel(before if (step // period) % 2 == 0 else after, step)
-    if node[0] == "blend":
-        _, before, after, center, radius = node
-        w = (step + 1 - center + radius) / (2.0 * radius)
-        if w <= 0.0:
-            return _render_travel(before, step)
-        if w >= 1.0:
-            return _render_travel(after, step)
-        return ("mix", _mix_pieces(_render_travel(before, step), _render_travel(after, step), w))
-    before, after, start = node
-    return _render_travel(after if step >= start else before, step)
-
-
-def _plan_prompt_travel(text, steps_value):
-    """The per-step prompts for a travel prompt text, one per global step index: a
-    string for plain and switching prompts, a ("mix", [(text, weight), ...]) item
-    in the crossfade window."""
-    tree = _resolve_travel_step(_parse_travel_expr(text), steps_value)
-    return [_render_travel(tree, i) for i in range(steps_value)]
-
-
-def _has_travel_group(text):
-    """True when the prompt text contains at least one travel group: a
-    [before:after:step] switch, a [before:after:step:radius] crossfade or a
-    [before:after] alternate."""
-    if not text:
-        return False
-    def has(node):
-        if isinstance(node, tuple):
-            return True
-        if isinstance(node, list):
-            return any(has(n) for n in node)
-        return False
-    return has(_parse_travel_expr(text))
-
-
 def _prepare_prompt_travels(ctx, pos_text, neg_text, steps_value, verbose):
     """Plan the per-step prompts from the context's raw prompts and encode every
     unique prompt once, grafted onto the context's conditionings so their reference
     payloads (flux2 reference_latents, h3 minimax_refs/keyframes) survive. Only runs
-    when a prompt carries a travel group; constant prompts are set on the context and
-    sampled normally, switching ones come back as a state for the per-step loop.
+    when a prompt carries a travel group; a prompt without one keeps the context's
+    own conditioning - it is that prompt's encoding already - so only the traveling
+    side is ever encoded. Constant prompts are set on the context and sampled
+    normally, switching ones come back as a state for the per-step loop.
     Returns the state (None when there is nothing to travel)."""
-    if not _has_travel_group(pos_text) and not _has_travel_group(neg_text):
+    pos_travels = _has_travel_group(pos_text)
+    neg_travels = _has_travel_group(neg_text)
+    if not pos_travels and not neg_travels:
         return None
     if not pos_text.strip() and not neg_text.strip():
         return None
@@ -567,7 +364,12 @@ def _prepare_prompt_travels(ctx, pos_text, neg_text, steps_value, verbose):
             return ("mix", [(encode(t, base), w) for t, w in item[1]])
         return encode(item, base)
 
-    pos_conds = [cond_for(t, base_pos) for t in pos_plan]
+    def conds_for(plan, base, travels):
+        if not travels and base is not None:
+            return [base] * len(plan)
+        return [cond_for(item, base) for item in plan]
+
+    pos_conds = conds_for(pos_plan, base_pos, pos_travels)
     if ctx.get("cfg") == 1:
         zero_cache = {}
         def zero_out(cond):
@@ -578,7 +380,7 @@ def _prepare_prompt_travels(ctx, pos_text, neg_text, steps_value, verbose):
             return zero_cache[id(cond)]
         neg_conds = [zero_out(c) for c in pos_conds]
     else:
-        neg_conds = [cond_for(t, base_neg) for t in neg_plan]
+        neg_conds = conds_for(neg_plan, base_neg, neg_travels)
 
     if all(c is pos_conds[0] for c in pos_conds) and all(c is neg_conds[0] for c in neg_conds):
         ctx["positive"] = pos_conds[0]
@@ -803,6 +605,50 @@ def _prompt_travel_signature(pos_text, neg_text, steps_value):
     return (pos_text, neg_text)
 
 
+# The objects a cached sample was built from. Every node that swaps one of them
+# (Lora Loader the model, Reference Latent the conditioning, Context Loader the
+# checkpoint) copies the context, so the cached sample rides along and has to
+# notice it went stale.
+_SAMPLE_INPUTS = ("model", "positive", "negative", "vae")
+
+
+def _sample_inputs(ctx):
+    """Weak references to the context's model and conditioning, taken before
+    evaluate() fills in the derived values so a re-run of this node compares the
+    same objects. Weak references keep nothing alive - a strong reference to the
+    model or the VAE would pin gigabytes the context has already dropped - and a
+    dead reference is a miss, never a false hit. A conditioning list takes no weak
+    reference, so it travels by reference: the conditioning nodes replace the whole
+    list, which is exactly what has to be noticed. The latent and the image are not
+    here because they invalidate themselves (ctx_set_latent, ctx_set_image and the
+    input overrides below drop the cached sample)."""
+    inputs = {}
+    for key in _SAMPLE_INPUTS:
+        value = ctx.get(key)
+        if value is None:
+            continue
+        try:
+            inputs[key] = weakref.ref(value)
+        except TypeError:
+            inputs[key] = value
+    return inputs
+
+
+def _referent(value):
+    return value() if isinstance(value, weakref.ReferenceType) else value
+
+
+def _same_sample_inputs(cached, inputs):
+    """Whether the cached sample was built from these very same objects."""
+    refs = cached.get("inputs")
+    if refs is None or refs.keys() != inputs.keys():
+        return False
+    for key, old in refs.items():
+        if _referent(old) is not _referent(inputs[key]):
+            return False
+    return True
+
+
 def _steps_display(steps_value, start_step, end_step):
     """Total steps, or 'start-end/total' when a start/end sub-range is active."""
     if steps_value is None or steps_value <= 0:
@@ -826,7 +672,7 @@ def _log_start(verbose, ctx, seed, steps_value, denoise, start_step=0.0, end_ste
     res = f"{w}x{h} ({_mp(w, h)} Mp)" if w and h else "unknown"
     length_s = f" length={length} frames" if length else ""
     _log("start:", f"model={model_name} steps={_steps_display(steps_value, start_step, end_step)} "
-          f"cfg={ctx.get('cfg', 8.0)} sampler={ctx.get('sampler', 'euler')} scheduler={ctx.get('scheduler', 'normal')} "
+          f"cfg={ctx.get('cfg')} sampler={ctx.get('sampler')} scheduler={ctx.get('scheduler')} "
           f"denoise={denoise} seed={seed} resolution={res}{length_s}")
 
 
@@ -864,43 +710,6 @@ def _normalize_mask(mask):
     return mask
 
 
-def _scale_mask(mask, scale):
-    """Rescale mask: scale<1 shrinks white area, scale>1 expands. scale=1 is no-op."""
-    if scale == 1.0:
-        return mask
-    import torch.nn.functional as F
-    # Resize mask to scale size, then back — with threshold to keep hard edges
-    b, h, w = mask.shape
-    m4 = mask.unsqueeze(1).float()
-    small_h = max(2, int(h * scale))
-    small_w = max(2, int(w * scale))
-    m4 = F.interpolate(m4, size=(small_h, small_w), mode="bilinear", align_corners=False)
-    m4 = F.interpolate(m4, size=(h, w), mode="bilinear", align_corners=False)
-    return m4.squeeze(1).to(mask.dtype)
-
-
-def _parse_mask_indices(mask_indices, count):
-    """Parse a mask_indices string into the valid 0-based indices, in order and
-    without duplicates; None when the string is empty. Accepts indices ("5"),
-    inclusive ranges ("0-2" includes both ends) and slice expressions:
-    ":3" = 0-3, "4:6" = 4-6, "-3:" = the last 3, "-2" = second to last."""
-    if not mask_indices:
-        return None
-    indices = []
-    for m in re.finditer(r'(-?\d+)?\s*:\s*(-?\d+)?|(\d+)\s*-\s*(\d+)|(-?\d+)', mask_indices):
-        if ':' in m.group(0):
-            a = int(m.group(1)) if m.group(1) is not None else 0
-            b = int(m.group(2)) if m.group(2) is not None else count - 1
-        elif m.group(5) is not None:
-            a = b = int(m.group(5))
-        else:
-            a, b = int(m.group(3)), int(m.group(4))
-        a += count if a < 0 else 0
-        b += count if b < 0 else 0
-        indices.extend(range(min(a, b), max(a, b) + 1))
-    return list(dict.fromkeys(i for i in indices if 0 <= i < count))
-
-
 def _inpaint_regions(image, mask, opts):
     """Resize the mask to the image, process it (grow, invert) and compute crop
     regions per the crop-inpaint options with the crop node's methods (Image Crop
@@ -924,28 +733,24 @@ def _inpaint_regions(image, mask, opts):
 
     regions = []
     if mask_mode == "split":
-        # Find disconnected regions using contour detection
-        import cv2
-        import numpy as np
-        mask_2d = (mask.squeeze(0).cpu().numpy() * 255).astype(np.uint8) if mask.dim() == 3 else (mask.cpu().numpy() * 255).astype(np.uint8)
-        mask_2d_float = mask.squeeze(0) if mask.dim() == 3 else mask
-        contours, hierarchy = cv2.findContours(mask_2d, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if hierarchy is not None:
-            for j, contour in enumerate(contours):
-                if hierarchy[0][j][3] != -1:
-                    continue
-                x, y, w, h = cv2.boundingRect(contour)
-                if w < 4 or h < 4:
-                    continue
-                cx, cy, x0, y0, cw, ch = _mask_box((x, y, w, h), img_w, img_h, crop_factor)
-                # Isolate this segment so other segments inside the crop
-                # window are not inpainted together with it
-                seg = np.zeros((img_h, img_w), dtype=np.uint8)
-                cv2.drawContours(seg, [contour], -1, 1, -1)
-                seg_mask = mask_2d_float * torch.from_numpy(seg > 0).to(mask.device)
-                regions.append((x0, y0, x0 + cw, y0 + ch, cx, cy, cw, ch, seg_mask, None))
+        # Find disconnected regions: label the mask's connected components (8-
+        # connectivity, so diagonally touching areas stay one region) and take
+        # each one's bounding box (scipy ships with ComfyUI)
+        mask_2d = mask.squeeze(0) if mask.dim() == 3 else mask
+        labels, _ = ndi.label((mask_2d > 0.5).cpu().numpy(),
+                              structure=ndi.generate_binary_structure(2, 2))
+        for k, sl in enumerate(ndi.find_objects(labels), start=1):
+            y, x = sl[0], sl[1]
+            h, w = y.stop - y.start, x.stop - x.start
+            if w < 4 or h < 4:
+                continue
+            cx, cy, x0, y0, cw, ch = _mask_box((x.start, y.start, w, h), img_w, img_h, crop_factor)
+            # Isolate this segment so other segments inside the crop
+            # window are not inpainted together with it
+            seg_mask = mask_2d * torch.from_numpy(labels == k).to(mask.device)
+            regions.append((x0, y0, x0 + cw, y0 + ch, cx, cy, cw, ch, seg_mask, None))
         # Filter by mask_indices if provided: "0-2, 5, 7" -> 0, 1, 2, 5, 7
-        selected = _parse_mask_indices(opts.get("mask_indices", ""), len(regions))
+        selected = parse_index_spec(opts.get("mask_indices", ""), len(regions))
         if selected is not None:
             regions = [regions[i] for i in selected]
     else:
@@ -956,7 +761,7 @@ def _inpaint_regions(image, mask, opts):
             regions.append((x0, y0, x0 + w, y0 + h, cx, cy, w, h, None, None))
         # A batch mask with mask_indices: each selected item is its own region
         # (its own mask's box) instead of the whole batch
-        selected = _parse_mask_indices(opts.get("mask_indices", ""), mask.shape[0])
+        selected = parse_index_spec(opts.get("mask_indices", ""), mask.shape[0])
         if mask.shape[0] > 1 and selected:
             regions = []
             for k in selected:
@@ -1013,7 +818,6 @@ def _make_noise_mask(model_obj, crop_latent, crop_mask, inpaint_mode, mask_scale
     if isinstance(masked, tuple):
         masked = masked[0]
     noise_mask = masked.get("noise_mask")
-    from comfy_extras.nodes_differential_diffusion import DifferentialDiffusion
     model_obj = DifferentialDiffusion.execute(model_obj, strength=1.0)[0]
     return noise_mask, model_obj
 
@@ -1087,12 +891,12 @@ def _encode_sample_decode(image, mask, vae, model_obj, seed, steps_value, cfg_va
     # The model is done after sampling: free it before the decode so large
     # resolutions don't choke the VAE (Clear VRAM options)
     if clear_after_model:
-        _clear_vram("after model", clear_verbose)
+        clear_vram("after model", clear_verbose)
     if not decode:
         return None, model_obj
     image = decode_latent(vae, {"samples": samples}, tiled, tile_size, overlap, temporal_size, temporal_overlap, verbose)
     if clear_after_vae:
-        _clear_vram("after vae", clear_verbose)
+        clear_vram("after vae", clear_verbose)
     return image, model_obj
 
 
@@ -1131,7 +935,7 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
             _log("Crop-Inpaint", f"mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
         # The sigmas are sized to this crop: a Flux2 model gets its schedule
         # (get_schedule) from it
-        sigmas_tensor = _calculate_sigmas(model_obj, ctx.get("scheduler", "normal"), steps_value, ctx.get("sampler", "euler"),
+        sigmas_tensor = _calculate_sigmas(model_obj, ctx["scheduler"], steps_value, ctx["sampler"],
                                           denoise, target_w, target_h)
         refined_crop, model_obj = _encode_sample_decode(crop_img, crop_mask, vae, model_obj, seed, steps_value,
                                                         cfg_value, sampler_obj, sigmas_tensor, positive, negative, opts,
@@ -1150,14 +954,11 @@ def _crop_inpaint(ctx, opts, model_obj, seed, steps_value,
 
     # Without a decode the VAE is done after the last region's encode: free it.
     if clear_after_vae and not (decode and vae is not None):
-        _clear_vram("after vae", clear_verbose)
+        clear_vram("after vae", clear_verbose)
 
-    # Update context: the image was replaced, so the tiling info of the old
-    # one (if any) is stale
-    ctx["image"] = result_image
-    ctx.pop("latent", None)
-    ctx.pop("mask", None)
-    ctx.pop("tiling_info", None)
+    # Update context: the image was replaced, so the latent, mask and tiling
+    # info built from the old one are stale
+    ctx_set_sampled_image(ctx, result_image)
 
     return io.NodeOutput(ctx, None, result_image, None, vae, ctx.get("vae_audio"), options_list)
 
@@ -1231,10 +1032,8 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     # VAEs round-trip exactly only at multiples of their spatial downscale
     # ratio - align the per-step target sizes to it
     w_ratio, h_ratio = _latent_downscale(vae, None)
-    scheduler_name = ctx.get("scheduler", "normal")
-    sampler_name = ctx.get("sampler", "euler")
-    if sampler_name not in comfy.samplers.KSampler.SAMPLERS:
-        sampler_name = comfy.samplers.KSampler.SAMPLERS[0]
+    scheduler_name = ctx["scheduler"]
+    sampler_name = ctx["sampler"]
 
     factor = float(opts.get("upscale_factor", 2.0))
     # The target size image overrides the upscale factor: the final
@@ -1400,9 +1199,9 @@ def _iterative_upscale(ctx, opts, options_list, model_obj, seed, steps_value,
     else:
         ctx["mask"] = mask
     if image is not None:
-        ctx.pop("latent", None)
-        # The image was replaced, so the tiling info of the old one (if any)
-        # is stale
+        # The image was replaced: the latent, the cached sample, and the tiling
+        # info of the old one are all stale now.
+        drop_image_derived(ctx)
         ctx.pop("tiling_info", None)
 
     return io.NodeOutput(ctx, None, image, None, vae, ctx.get("vae_audio"), options_list)
@@ -1446,7 +1245,7 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
         if opt_verbose:
             _log("Crop-Inpaint", f"mask {idx + 1}/{len(regions)} crop size={x1 - x0}x{y1 - y0} -> {target_w}x{target_h}")
         crop_ctx = {"image": crop_img, "mask": crop_mask, "vae": vae,
-                    "scheduler": ctx.get("scheduler", "normal"), "sampler": ctx.get("sampler", "euler")}
+                    "scheduler": ctx["scheduler"], "sampler": ctx["sampler"]}
         # Pass the crop (image + mask) to the iterative upscale
         out = _iterative_upscale(crop_ctx, iterative_opts, options_list, model_obj, seed,
                                  steps_value, cfg_value, sampler_obj, positive, negative,
@@ -1464,17 +1263,14 @@ def _iterative_inpaint_upscale(ctx, inpaint_opts, iterative_opts, options_list, 
     if opt_verbose:
         _log("Crop-Inpaint", f"composited {len(regions)} region(s) into {full.shape[2]}x{full.shape[1]} (final image)")
 
-    # Update context: the image was replaced, so the tiling info of the old
-    # one (if any) is stale
-    ctx["image"] = full
-    ctx.pop("latent", None)
-    ctx.pop("mask", None)
-    ctx.pop("tiling_info", None)
+    # Update context: the image was replaced, so the latent, mask and tiling
+    # info built from the old one are stale
+    ctx_set_sampled_image(ctx, full)
 
     return io.NodeOutput(ctx, None, full, None, vae, ctx.get("vae_audio"), out_options)
 
 
-def _calculate_sigmas(model, scheduler_name, steps, sampler_name="euler", denoise=1.0, width=None, height=None):
+def _calculate_sigmas(model, scheduler_name, steps, sampler_name, denoise=1.0, width=None, height=None):
     """Calculate sigmas from scheduler name and step count, respecting denoise level.
     A Flux2 model uses the Flux2 schedule (get_schedule) for the size instead, its
     shift needs the sequence length; a Flux3 model has a constant reference shift
@@ -1493,9 +1289,6 @@ def _calculate_sigmas(model, scheduler_name, steps, sampler_name="euler", denois
             sigmas = sigmas[-(total_steps + 1):]
         return sigmas
 
-    if scheduler_name not in comfy.samplers.KSampler.SCHEDULERS:
-        scheduler_name = comfy.samplers.KSampler.SCHEDULERS[0]
-    
     device = comfy.model_management.get_torch_device()
     sampler_obj = comfy.samplers.KSampler(model, steps, device, sampler=sampler_name)
     sampler_obj.scheduler = scheduler_name
@@ -1550,6 +1343,34 @@ def _dype_model(model_obj, ctx, dype_opt, verbose=False):
     return apply_dype_patch(model_obj, dype_opt, int(w), int(h))
 
 
+def _require_sampling_params(steps_value, cfg_value, sampler_name, scheduler_name,
+                            need_steps=True, need_sampler=True, need_scheduler=True):
+    """Check the sampling parameters resolved from the context. This node has no
+    defaults: a context that carries none is an error naming what to connect,
+    instead of a silent 20-step euler run.
+    need_* is False when a SAMPLER/SIGMAS object input replaces that parameter."""
+    missing = []
+    if need_steps and not steps_value:
+        missing.append("steps")
+    if cfg_value is None:
+        missing.append("cfg")
+    if need_sampler and not sampler_name:
+        missing.append("sampler")
+    if need_scheduler and not scheduler_name:
+        missing.append("scheduler")
+    if missing:
+        raise ValueError(f"The context has no {' or '.join(missing)}. Sampling parameters come from the "
+                         f"context: connect a Context, Context Loader, or Sampling Parameters node "
+                         f"(this node's steps widget can supply steps on its own).")
+    if need_sampler and sampler_name not in comfy.samplers.KSampler.SAMPLERS:
+        raise ValueError(f"The context's sampler '{sampler_name}' is not a sampler ComfyUI offers. "
+                         f"Pick one of the Context node's sampler options.")
+    if need_scheduler and scheduler_name not in comfy.samplers.KSampler.SCHEDULERS:
+        raise ValueError(f"The context's scheduler '{scheduler_name}' is not a scheduler ComfyUI offers. "
+                         f"Pick one of the Context node's scheduler options.")
+    return steps_value, cfg_value, sampler_name, scheduler_name
+
+
 def _resolve_early_params(ctx, steps):
     """Resolve steps/cfg/sampler for the pre-evaluate sampling paths."""
     base_steps = ctx.get("steps") or 0
@@ -1558,11 +1379,9 @@ def _resolve_early_params(ctx, steps):
     elif ctx.get("step_refiner", 0) > 0:
         steps_value = ctx["step_refiner"]
     else:
-        steps_value = base_steps if base_steps > 0 else 20
-    cfg_value = ctx.get("cfg", 8.0)
-    sampler_name = ctx.get("sampler", "euler")
-    if sampler_name not in comfy.samplers.KSampler.SAMPLERS:
-        sampler_name = comfy.samplers.KSampler.SAMPLERS[0]
+        steps_value = base_steps
+    steps_value, cfg_value, sampler_name, _ = _require_sampling_params(
+        steps_value, ctx.get("cfg"), ctx.get("sampler"), ctx.get("scheduler"))
     sampler_obj = comfy.samplers.sampler_object(sampler_name)
     return steps_value, cfg_value, sampler_name, sampler_obj
 
@@ -1626,7 +1445,7 @@ class GibbyKSamplerContext(io.ComfyNode):
         clear_after_vae = clear_opt.get("after_vae", True) if clear_opt else False
         clear_verbose = clear_opt.get("verbose", False) if clear_opt else False
         if clear_at_start:
-            _clear_vram("at start", clear_verbose)
+            clear_vram("at start", clear_verbose)
 
         # Start with a copy of the context (never mutate the input) and apply overrides
         ctx = ctx_from(context)
@@ -1638,17 +1457,18 @@ class GibbyKSamplerContext(io.ComfyNode):
             ctx["model"] = model
 
         if latent is not None:
-            ctx["latent"] = latent
+            # A connected latent replaces the context's, so the cached sample was
+            # built from a different one
+            ctx_set_latent(ctx, latent)
 
         if image is not None:
-            ctx["image"] = image
-            # A connected image takes priority over a latent inherited from
-            # the context (a directly-connected latent still wins): clear it
-            # so the image is encoded fresh downstream, and drop the cached
-            # sample that was built from the old latent
-            if latent is None and ctx.get("latent") is not None:
-                ctx.pop("latent", None)
-                ctx.pop("_kctx_sampled", None)
+            # A connected image takes priority over a latent inherited from the
+            # context: drop that latent and the sample cached from the old image so
+            # the image is encoded and sampled fresh, and put a directly-connected
+            # latent input back on top - it still wins over the inherited latent
+            ctx_set_image(ctx, image)
+            if latent is not None:
+                ctx["latent"] = latent
 
         # A directly-connected mask overrides the context's before evaluation.
         # The input is untrusted (an image can be bridged into it) - keep only
@@ -1656,6 +1476,11 @@ class GibbyKSamplerContext(io.ComfyNode):
         mask = _normalize_mask(mask)
         if mask is not None:
             ctx["mask"] = mask
+
+        # Remember which objects the sample is about to be built from for the
+        # result cache; taken here, before evaluate() encodes or conditions
+        # anything, so a re-run of this node compares the same values
+        sample_inputs = _sample_inputs(ctx)
 
         # Tiled VAE settings come from the options list (Tiled VAE options node):
         # encode/decode use the tiled variants for sizes at or above above_megapixels
@@ -1687,7 +1512,7 @@ class GibbyKSamplerContext(io.ComfyNode):
             ctx.pop("latent", None)
             ctx.pop("mask", None)
             if clear_after_finish:
-                _clear_vram("after finish", clear_verbose)
+                clear_vram("after finish", clear_verbose)
             if verbose:
                 _log("Crop-Inpaint skipped", "the mask is empty")
             return io.NodeOutput(ctx, None, ctx["image"], None, ctx.get("vae"), ctx.get("vae_audio"), options_list)
@@ -1742,7 +1567,7 @@ class GibbyKSamplerContext(io.ComfyNode):
                                    travel_state=travel_state, prompt_state=prompt_state, dype_opt=dype_opt)
         if result is not None:
             if clear_after_finish:
-                _clear_vram("after finish", clear_verbose)
+                clear_vram("after finish", clear_verbose)
             _log_finish(verbose, result[2], result[1], t_start, ctx.get("vae"))
             return result
 
@@ -1766,6 +1591,12 @@ class GibbyKSamplerContext(io.ComfyNode):
             steps_value = ctx["step_refiner"]
         else:
             steps_value = ctx.get("steps")
+
+        # A SAMPLER object input replaces the context's sampler, and a SIGMAS object
+        # replaces the schedule, so those parameters are not needed then
+        steps_value, cfg_value, sampler_name, scheduler_name = _require_sampling_params(
+            steps_value, ctx.get("cfg"), ctx.get("sampler"), ctx.get("scheduler"),
+            need_steps=sigmas is None, need_sampler=sampler is None, need_scheduler=sigmas is None)
 
         # Lora Travel options: the traveling clip loras are applied once, at the
         # strength the loras enter with, before the conditioning is encoded from clip
@@ -1817,10 +1648,10 @@ class GibbyKSamplerContext(io.ComfyNode):
         w, h, _ = _latent_dims(ctx.get("latent"), ctx.get("vae"))
         tiled_decode = _tiled_for(w, h, tiled_above) if w else False
 
-        # Cache check: if this context already has a sampled result with matching
-        # parameters, return it instead of re-sampling. This handles the case where
-        # the latent output wasn't connected during the first run (result discarded
-        # by the engine) but is connected now.
+        # Cache check: if this context already has a sampled result built from
+        # these very same objects and parameters, return it instead of re-sampling.
+        # This handles the case where the latent output wasn't connected during the
+        # first run (result discarded by the engine) but is connected now.
         travel_sig = _travel_signature(travel_opts, run_steps)
         # DyPE: scalars only, so the comparison never touches a model object
         dype_sig = None if dype_opt is None else {k: v for k, v in dype_opt.items()
@@ -1828,7 +1659,8 @@ class GibbyKSamplerContext(io.ComfyNode):
         prompt_sig = _prompt_travel_signature(pos_prompt_text, neg_prompt_text, run_steps)
         cached = ctx.get("_kctx_sampled")
         if cached is not None:
-            if (cached.get("seed") == seed and cached.get("steps") == steps_value
+            if (_same_sample_inputs(cached, sample_inputs)
+                    and cached.get("seed") == seed and cached.get("steps") == steps_value
                     and cached.get("denoise") == denoise_value
                     and cached.get("add_noise") == add_noise
                     and cached.get("leftover_noise") == leftover_noise
@@ -1847,13 +1679,11 @@ class GibbyKSamplerContext(io.ComfyNode):
                 decoded_image = ctx.get("image")
                 decoded_audio = ctx.get("audio")
                 if clear_after_finish:
-                    _clear_vram("after finish", clear_verbose)
+                    clear_vram("after finish", clear_verbose)
                 if verbose:
                     _log("cache hit", "reusing sampled result")
                 _log_finish(verbose, decoded_image, out_latent, t_start, ctx.get("vae"))
                 return io.NodeOutput(ctx, out_latent, decoded_image, decoded_audio, ctx.get("vae"), ctx.get("vae_audio") or ctx.get("audio_vae"), options)
-
-        cfg_value = ctx.get("cfg")
 
         # Resolve sampler and sigmas
         if sampler is not None:
@@ -1861,11 +1691,8 @@ class GibbyKSamplerContext(io.ComfyNode):
             sampler_obj = sampler
         else:
             # Create sampler from context's sampler string
-            sampler_name = ctx.get("sampler", "euler")
-            if sampler_name not in comfy.samplers.KSampler.SAMPLERS:
-                sampler_name = comfy.samplers.KSampler.SAMPLERS[0]
             sampler_obj = comfy.samplers.sampler_object(sampler_name)
-        
+
         if sigmas is not None:
             # Use provided SIGMAS tensor directly (ignore start/end steps)
             sigmas_tensor = sigmas
@@ -1874,10 +1701,8 @@ class GibbyKSamplerContext(io.ComfyNode):
             # The Flux2 schedule and the regular schedulers share the denoise rule:
             # the schedule is built for the full step count, denoise takes its
             # low-noise tail, and start/end steps slice the result below
-            scheduler_name = ctx.get("scheduler", "normal")
-            sampler_name_for_sigmas = ctx.get("sampler", "euler")
             sigmas_width, sigmas_height = ctx_size(ctx)
-            sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name_for_sigmas,
+            sigmas_tensor = _calculate_sigmas(model_obj, scheduler_name, steps_value, sampler_name,
                                               denoise_value, sigmas_width, sigmas_height)
             use_start_end_steps = True
 
@@ -1937,7 +1762,7 @@ class GibbyKSamplerContext(io.ComfyNode):
         # The model is done after sampling: free it before the decode so the
         # VAE gets the VRAM back (Clear VRAM options).
         if decode and clear_after_model:
-            _clear_vram("after model", clear_verbose)
+            clear_vram("after model", clear_verbose)
 
         # Build output latent
         out_latent = ctx["latent"].copy()
@@ -1975,11 +1800,11 @@ class GibbyKSamplerContext(io.ComfyNode):
                     _log("VAE audio decode took", f"{time.time() - t0:.2f}s")
 
             if clear_after_vae:
-                _clear_vram("after vae", clear_verbose)
+                clear_vram("after vae", clear_verbose)
         elif clear_after_model or clear_after_vae:
             # No decode: the VAE is done with the pre-sample encode, so both
             # are free to go.
-            _clear_vram("after model and vae", clear_verbose)
+            clear_vram("after model and vae", clear_verbose)
 
         # Update context after sampling: the image is replaced, so the tiling
         # info of the old one (if any) is stale
@@ -2004,6 +1829,7 @@ class GibbyKSamplerContext(io.ComfyNode):
         # Store sampled result in context for cache reuse
         ctx["_kctx_sampled"] = {
             "out_latent": out_latent,
+            "inputs": sample_inputs,
             "seed": seed,
             "steps": steps_value,
             "denoise": denoise_value,
@@ -2023,7 +1849,7 @@ class GibbyKSamplerContext(io.ComfyNode):
         }
 
         if clear_after_finish:
-            _clear_vram("after finish", clear_verbose)
+            clear_vram("after finish", clear_verbose)
 
         _log_finish(verbose, decoded_image, out_latent, t_start, ctx.get("vae"))
         return io.NodeOutput(ctx, out_latent, decoded_image, decoded_audio, ctx.get("vae"), ctx.get("vae_audio") or ctx.get("audio_vae"), options)

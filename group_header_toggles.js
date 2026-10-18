@@ -294,11 +294,32 @@ function installPatches() {
 
     // Track the latest pointer event for hover-mode button display.
     const originalAdjustMouseEvent = proto.adjustMouseEvent;
+    let hoverGroup = null;    // the group the buttons were last drawn for
     proto.adjustMouseEvent = function (e) {
         const result = originalAdjustMouseEvent.call(this, e);
         lastMouse = e;
+        // In hover mode the buttons follow the cursor and the canvas only redraws
+        // when it is dirty, so dirty it when the cursor crosses a group border -
+        // moving inside a group moves nothing, and a timer that dirtied the whole
+        // canvas four times a second redrew every graph forever.
+        if (!showAlways() && this.graph) {
+            const group = this.graph.getGroupOnPos(e.canvasX, e.canvasY) || null;
+            if (group !== hoverGroup) {
+                hoverGroup = group;
+                this.setDirty(true, true);
+            }
+        }
         return result;
     };
+
+    // No pointer event arrives once the cursor has left, so the buttons of the
+    // last group it hovered would stay drawn over the empty canvas.
+    app.canvas.canvas.addEventListener("pointerleave", () => {
+        if (hoverGroup === null) return;
+        hoverGroup = null;
+        lastMouse = null;
+        app.canvas.setDirty(true, true);
+    });
 
     // Button clicks: the native mousedown listener is bound to its method when the
     // canvas is constructed, so patching the prototype is bypassed for the live
@@ -315,14 +336,6 @@ function installPatches() {
         drawToggles(this, ctx);
         return result;
     };
-
-    // In hover mode the buttons follow the cursor, so the canvas needs a redraw as
-    // it moves - nudge it periodically so they appear on hover.
-    setInterval(() => {
-        if (app.canvas) {
-            app.canvas.setDirty(true, true);
-        }
-    }, 250);
 }
 
 app.registerExtension({

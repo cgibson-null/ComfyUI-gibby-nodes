@@ -16,6 +16,7 @@
 // ---------------------------------------------------------------------------
 
 import { app } from "../../../scripts/app.js";
+import { setWidgetValue } from "../gibby_widgets.js";
 
 const NODE_TYPE = "Gibby_KSampler_Context";
 
@@ -28,11 +29,6 @@ function roundStepValue(node, widgetName) {
         // Round to whole number
         widget.value = Math.round(val);
     }
-}
-
-function setWidget(node, name, value) {
-    const w = node.widgets?.find((w) => w.name === name);
-    if (w) w.value = value;
 }
 
 // Create a row of nodes to the right of the source node and lay them out.
@@ -71,11 +67,11 @@ function addSecondPassUpscale(node) {
     if (!resize || !sampler || !compare) return;
 
     // Keep AR at 0 megapixels rescales the image to its own size x scale factor 2.
-    setWidget(resize, "mode", "keep_ar");
-    setWidget(resize, "megapixels", 0);
-    setWidget(resize, "scale_factor", 2);
+    setWidgetValue(resize, "mode", "keep_ar");
+    setWidgetValue(resize, "megapixels", 0);
+    setWidgetValue(resize, "scale_factor", 2);
     // Second pass refines the upscaled image at 0.6 denoise.
-    setWidget(sampler, "denoise", 0.6);
+    setWidgetValue(sampler, "denoise", 0.6);
 
     node.connect(0, resize, 0);  // context -> context
     resize.connect(0, sampler, 0);  // context -> context
