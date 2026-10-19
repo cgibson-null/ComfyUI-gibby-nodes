@@ -15,6 +15,7 @@ schema, each living in its own self-contained folder:
 - pipes/: media_pipe.py (the media pipe dict shared between nodes - ref images, keyframes with positions, videos, audios - h3_pipe is it plus the h3 params), h3_pipe.py (H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe, raw refs + keyframes stored, encoded at apply time) and pipe_any.py (Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe).
 - reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to the megapixels target, scaled, encoded with context VAE when ref_latents is on); a text encoder with a vision tower also sees the images at vl_megapixels and the prompts are re-encoded with them, so a t2i model like krea conditions on a reference without any edit path; hidream-o1 and sensenova get the resized image itself instead of a latent, which is what their models read; optionally references the context's own image at its own size; references a media pipe's images and passes the pipe through, appending the wired images to it; without a context it just builds the pipe from the wired images.
 - detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
+- mask_edit/: Mask Edit (Context) - the mask manipulation the detection and crop nodes used to carry (grow, invert, edge feather, isolated-pixel removal, hole filling, background removal) plus the mask tinted preview.
 - llm/: LLM Connect - Connectivity, Sampling Options, Unsloth Load Options and Generate for a llama.cpp / llama-swap / Unsloth server (OpenAI-compatible API), with auto-growing image/video references; Generate also takes a media pipe (refs + keyframes, labeled) and outputs one.
 - tiling.py: Split Tiles (Context) / Combine Tiles (Context) - splits the context image into a batch of uniform overlapping tiles with crop-inpaint masks; recombines the tile batch (at the upscaled size) with a crossfade across the overlaps.
 - ksampler_options/dype.py: DyPE options - the ComfyUI-DyPE pack as a soft dependency (registered only when that pack is installed). dype/sega patch the model for high-resolution generation; KSampler (Context) applies them through ksampler_context/dype_helper.py, re-patching per sample at the size actually being sampled so the outbound context keeps the original model.
@@ -46,6 +47,7 @@ from .reference_latent_context import GibbyReferenceLatentContext
 from .pipes.pipe_any import PipeAny
 from .crop_paste.crop_image_by_mask import GibbyCropImageByMaskBatch
 from .crop_paste.paste_image_by_mask import GibbyPasteImageByMaskBatch
+from .mask_edit import GibbyMaskEdit
 from .ksampler_options.clear_vram import GibbyClearVramOptions
 from .ksampler_options.color_match import GibbyColorMatchOptions
 from .ksampler_options.crop_inpaint import GibbyCropInpaintOptions
@@ -125,7 +127,7 @@ class GibbyNodesExtension(ComfyExtension):
         # offered when it is installed. dype_installed() is a filesystem check,
         # which answers correctly whichever of the two packs imports first.
         dype_nodes = [GibbyDypeOptions] if dype_installed() else []
-        return [GibbyAnyBatchList, GibbyAnyCount, GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, *dype_nodes, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySeedvr2Upscale, GibbySplitTiles, GibbyTiledVaeOptions]
+        return [GibbyAnyBatchList, GibbyAnyCount, GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, *dype_nodes, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMaskEdit, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySeedvr2Upscale, GibbySplitTiles, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

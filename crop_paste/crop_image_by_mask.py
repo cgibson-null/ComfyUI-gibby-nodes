@@ -1,10 +1,9 @@
 import torch
-import nodes
 from comfy_api.latest import io
 from comfy_extras.nodes_mask import GrowMask, InvertMask
 
 from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from, ctx_set_image
-from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox, _pad_color_tensor, _color_alpha
+from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox
 
 
 # Two consecutive crop regions count as a shot change when they barely overlap
@@ -142,7 +141,7 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
             display_name="Image Crop By Mask (Batch) (Context)",
             category="gibby/image",
             search_aliases=["crop", "mask", "batch"],
-            description="Crops each image by its own mask (image i by mask i); every crop is scaled up until it fills the total size, so subjects keep a consistent scale across the batch - when a crop's shape differs from the canvas its edges are trimmed. Optional temporal stabilization for video batches: constant crop size per shot and a smoothed crop center, with cuts detected from mask jumps. Also outputs the crop info for pasting results back with Image Paste By Mask (Batch) (Context). Optional context in/out: its image and mask are used when none are connected; the output context carries the cropped image and mask plus the crop info (which holds the originals).",
+            description="Crops each image by its own mask (image i by mask i); every crop is scaled up until it fills the total size, so subjects keep a consistent scale across the batch - when a crop's shape differs from the canvas its edges are trimmed. Optional temporal stabilization for video batches: constant crop size per shot and a smoothed crop center, with cuts detected from mask jumps. The mask is cropped as it arrives: grow, invert, clean up, or knock the background out of the crop with Mask Edit (Context). Also outputs the crop info for pasting results back with Image Paste By Mask (Batch) (Context). Optional context in/out: its image and mask are used when none are connected; the output context carries the cropped image and mask plus the crop info (which holds the originals).",
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True,
                                      tooltip="Base context; its image and mask are used when none are connected"),
@@ -156,20 +155,12 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
                                tooltip="Resolution multiplier for the cropped area (1.0=off). Applied after crop_factor."),
                 io.Int.Input("multiple", default=32, min=1, max=256, step=1,
                              tooltip="Round the cropped size down to this multiple so sampling won't re-adjust it"),
-                io.Int.Input("mask_grow", default=0, min=-nodes.MAX_RESOLUTION, max=nodes.MAX_RESOLUTION, step=1,
-                             tooltip="Grows the mask by this many pixels before cropping (negative shrinks it), like the native Grow Mask with tapered corners"),
-                io.Boolean.Input("mask_invert", default=False,
-                                 tooltip="Inverts the mask after growing and before cropping, like the native Invert Mask"),
                 io.Boolean.Input("enable_smoothing", default=False,
                                  tooltip="Stabilize the crop across the batch: constant size per shot, smoothed center, cuts from mask jumps; empty and noise masks hold the previous crop"),
                 io.Float.Input("center_smoothing", default=0.8, min=0.0, max=1.0, step=0.05,
                                tooltip="Weight of the previous frame's crop center (0=off); resets at detected cuts"),
                 io.Combo.Input("size_source", default="shot_max", options=["shot_max", "clip_max"],
                                tooltip="shot_max: constant size per shot. clip_max: one size for the whole clip."),
-                io.Boolean.Input("remove_bg", default=False,
-                                 tooltip="Replaces the unmasked area with the color"),
-                io.Color.Input("color", optional=True, socketless=False, default="#000000",
-                               tooltip="Background color for remove_bg; connect the hex output of a Color Picker. Alpha 0 makes the background transparent instead (RGBA output)"),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output("context"),
@@ -181,9 +172,7 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
 
     @classmethod
     def execute(cls, context=None, image=None, mask=None, crop_factor=1.5, megapixels=1.0, scale_factor=1.0, multiple=32,
-                mask_grow=0, mask_invert=False, enable_smoothing=False,
-                center_smoothing=0.8, size_source="shot_max",
-                remove_bg=False, color="#000000"):
+                enable_smoothing=False, center_smoothing=0.8, size_source="shot_max"):
         ctx = ctx_from(context)
         # Connected image/mask override the context's
         image = image if image is not None else ctx.get("image")
@@ -196,13 +185,7 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
         if mask.shape[1:] != (H, W):
             mask = _resize_mask(mask, W, H, "nearest-exact")
         mask = mask.round()
-        # Grow first, then invert: the crop region and the output mask follow the processed mask
-        mask = _process_mask(mask, mask_grow, mask_invert)
         BM = mask.shape[0]
-
-        bg = _pad_color_tensor(color, image.dtype, image.device)
-        # A fully transparent color makes the unmasked area transparent instead of colored
-        transparent = remove_bg and _color_alpha(color) == 0.0
 
         # Bounding box per mask; None when the mask is empty. A mask that fills less than
         # _MIN_FILL of its bbox, or is smaller than _MIN_SIZE of a frame dimension, is noise.
@@ -251,13 +234,6 @@ class GibbyCropImageByMaskBatch(io.ComfyNode):
         for i, idx, cx, cy, x0, y0, w, h in regions:
             region, m, rect = _cover_crop(image[i:i + 1], mask[idx:idx + 1], cx, cy, w, h, max_w, max_h)
             rects.append(rect)
-            if remove_bg:
-                mb = m.clamp(0, 1).unsqueeze(-1).to(image.dtype)
-                if transparent:
-                    # Join Image with Alpha's method: keep the RGB, the mask becomes the alpha
-                    region = torch.cat((region[..., :3], mb), dim=-1)
-                else:
-                    region = region * mb + bg * (1 - mb)
             out.append(region.squeeze(0))
             out_mask.append(m.squeeze(0))
 
