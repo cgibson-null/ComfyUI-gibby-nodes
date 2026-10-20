@@ -21,6 +21,10 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
                 io.Boolean.Input("verbose", default=False, tooltip="Print each step's index, scale, image size and denoise to the console"),
                 io.UpscaleModel.Input("upscale_model", optional=True, tooltip="Optional upscale model (Load Upscale Model) used on each step"),
                 io.Image.Input("target_size_image", optional=True, tooltip="Optional image defining the final size: the per-step scale path runs to this image's size instead of upscale_factor"),
+                # Declared last: an input inserted before upscale_model or
+                # target_size_image would move their slots and silently re-route the
+                # links saved to them.
+                io.Boolean.Input("latent_upscale", default=False, optional=True, tooltip="Grow the latent between steps instead of decoding it, scaling the image and encoding it back: the VAE then runs at the ends of the run instead of once per step. The upscale model is an image model, so it is not used; the resize uses the upscale_method above (lanczos is an image resizer, so the latent takes bicubic)."),
             ],
             outputs=[
                 _KSAMPLER_OPTIONS_TYPE.Output("options"),
@@ -30,7 +34,7 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
     @classmethod
     def execute(cls, upscale_factor=2.0, steps=2, start_denoise=0.6, target_denoise=0.3,
                 upscale_method="lanczos", mode=True, verbose=False, upscale_model=None,
-                target_size_image=None):
+                target_size_image=None, latent_upscale=False):
         target_h, target_w = (target_size_image.shape[1], target_size_image.shape[2]) if target_size_image is not None else (None, None)
         option = {
             "type": "iterative_upscale",
@@ -40,6 +44,7 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
             "target_denoise": target_denoise,
             "upscale_method": upscale_method,
             "mode": "total" if mode else "single",
+            "latent_upscale": latent_upscale,
             "verbose": verbose,
             "upscale_model": upscale_model,
             "target_w": target_w,

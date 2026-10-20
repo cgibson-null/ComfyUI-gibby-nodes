@@ -43,13 +43,15 @@ Use **inputs** to override context values (override happens first, so output con
 
 **Denoise:** only applies when an image is present, otherwise forced to 1.0. Always slices the schedule, so start/end step narrow the denoised range instead of cancelling the denoise. flux2 models sample with the Flux2 schedule for the sampled size, denoise takes its low-noise tail exactly like `Flux2Scheduler` -> `SplitSigmasDenoise` (`low_sigmas`); flux3 keeps its own constant shift and the context's scheduler.
 
+**CFG schedule:** optional link-only float input that replaces the context's cfg on every sampling step - one value per step of the context's steps, from `String to Float List`, a float batch, or a single float. Past its end the last value is held for the remaining steps, so `3, 2, 1` over 5 steps samples 3, 2, 1, 1, 1; extra values are ignored. Like the travels, it follows the context's step numbers, so start/end step shift it with the steps they slice (`2, 1` with start_step 1 samples at 1); each crop-inpaint crop samples it from the first value. The context's cfg is left alone, so the verbose log and saved metadata keep it.
+
 **Decode:** on by default. Decodes the output latent to image/audio/both and removes latent from context. An image whose size is not a multiple of the VAE's downscale ratio is pre-scaled to it before encoding, and the decoded image is stretched back to the original size, so the content stays aligned with the original. Disable to skip decoding in case you're chaining ksamplers (wan high pass).
 
 **Options:** connect options nodes to the `options` input - **Crop-Inpaint options**, **Iterative Options**, **Lora Travel options**, **Tiled VAE options**, **Clear VRAM options**, **Color Match options**, **DyPE options**, or **Merge KSampler Options** (dynamic `option1…option10` inputs that append several options lists into one).
 
 **Crop-Inpaint options** - allows crop area per mask, configure boundaries and resolution, and inpaint it at proper size, then paste back onto original.
 
-**Iterative Options** - sample for set amount iterations, can upscale; an optional target size image overrides the upscale factor and sets the final size.
+**Iterative Options** - sample for set amount iterations, can upscale; an optional target size image overrides the upscale factor and sets the final size. `latent_upscale` grows the latent between steps instead of decode -> upscale -> encode, so the VAE runs at the ends of the run; the upscale model is an image model and is not used then.
 
 Crop-Inpaint options and Iterative Options are inclusive, meaning can be used together. Both ideas from [Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)
 **Lora Travel options** - dynamically change loras strength per step; str values in node are multipliers for value set in lora loader, unless it's 0 - then they are applied as actual str; can be used per iteration.
