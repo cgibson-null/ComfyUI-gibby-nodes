@@ -11,11 +11,11 @@ Two independent paths, picked by the model and by its text encoder:
 
 - reference latents (ref_latents, on by default): the image is VAE-encoded and
   set on the conditioning, which is what the edit models were trained to take
-  (flux2/klein, flux3, qwen image edit, qwen 2.1). Off for a model that only has
+  (flux2/klein, flux3, fibo2, qwen image edit, qwen 2.1). Off for a model that only has
   the latent-concat path by accident (krea) - it was never trained on it.
 - the text encoder seeing the images: any model whose encoder runs a vision tower
   (the Qwen-VL family: qwen image, qwen 2.1, krea2, mage, boogu, ideogram4,
-  joyimage, kandinsky5) re-encodes the context prompts with the images at
+  joyimage, kandinsky5, fibo2) re-encodes the context prompts with the images at
   vl_megapixels, so a t2i model conditions on them with no edit path at all.
   Flux3 is left out - its Qwen3-VL encoder is text-only by training and its DiT
   splices nothing. A tokenizer with no image template drops the images and warns
@@ -30,16 +30,31 @@ leaves to whoever owns the negative.)
 
 Qwen Image 2.1 splices the latents at the vision slots, so it floors the size to
 2x the VAE's downscale ratio - every slot covers 2x2 latents - and shares one size
-between the encoder and the VAE. Everything else floors to the VAE ratio and
+between the encoder and the VAE. Fibo 2.0 shares it too for the opposite reason:
+its tokenizer resizes for its own tower the way training did - thumbnail to 768 a
+side, then Qwen3-VL's 32px grid - so a pre-shrunk copy would only cost it the
+resolution it reads at. Everything else floors to the VAE ratio and
 resizes the encoder's copy separately (flux2/klein and flux3 take the latents
 as-is; flux3's text encoder is text-only and its DiT patchifies nothing, so the
 ratio alone is the whole constraint).
+
+With the context's cfg at 1 a negative it carries is kept as it is (it only gains
+the references): cfg 1 never runs the negative, so a turbo model (fibo2) pays for no
+re-encode of it and a negative built outside the prompts survives the node. Only a
+negative that exists as prompt text alone becomes the zeroed positive, the way
+KSampler (Context) makes it.
 
 With ref_ctx_img the context's own image is referenced too: always
 when no image input is connected (at its own size, no rescale), and with image
 inputs connected only when the toggle is on - then it leads the reference list
 at its own size, and when the context has no image the first image input becomes
 the context image and is stored back on the output context.
+
+A reference is encoded whole unless tiled_vae_options carries the pack's Tiled
+VAE options: a reference at or above above_megapixels then goes through the tiled
+VAE, the same rule KSampler (Context) follows for the image it encodes, which is
+what a huge image costs when megapixels is 0 or ref_ctx_img references the
+context's image at its own size. Only that option of the list is read.
 
 A media pipe's reference images are referenced too - the wired images append
 to them in the output pipe; keyframes/videos/audios pass through untouched.
@@ -50,9 +65,12 @@ append to the pipe and the context passes through empty.
 
 import comfy.model_base
 import node_helpers
+from nodes import ConditioningZeroOut
 from comfy_api.latest import io
 
-from .context import _CONTEXT_TYPE, _clip_takes_images, _is_model, recondition_prompts, _latent_downscale, ctx_from, ctx_set_image
+from .context import (_CONTEXT_TYPE, _clip_takes_images, _is_model, recondition_prompts, _latent_downscale,
+                      ctx_from, ctx_set_image, encode_image, _tiled_settings, _tiled_for)
+from .ksampler_options.crop_inpaint import _KSAMPLER_OPTIONS_TYPE
 from .pipes.media_pipe import iter_numbered_slots, pipe_add_images
 from .resolution_latent import _resize_image_to_mp
 
@@ -79,7 +97,8 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                 "Sets reference latents on conditioning from provided images. "
                 "Each image is resized to the megapixels target (0 = its own size), "
                 "scaled by the scale factor, encoded with the context VAE, and "
-                "referenced on positive/negative conditioning. "
+                "referenced on positive/negative conditioning; a negative the "
+                "context carries survives cfg 1 unchanged. "
                 "A text encoder with a vision tower also sees the images, at "
                 "vl_megapixels, so a t2i model (krea) conditions on them with "
                 "ref_latents off. HiDream-O1 and SenseNova get the image itself "
@@ -87,6 +106,8 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                 "ref_ctx_img also references the context's own image: always when "
                 "no image is connected, otherwise only when enabled - it leads at its own size, "
                 "and with no context image the first image becomes the context image and is stored back. "
+                "tiled_vae_options encodes a reference at or above above_megapixels in tiles, "
+                "like KSampler (Context). "
                 "A media pipe's reference images are referenced too - the wired images "
                 "append to them in the output pipe. Without a context the node is just "
                 "a media pipe creator: the wired images append to the pipe."
@@ -141,7 +162,7 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                     max=20.0,
                     step=0.01,
                     optional=True,
-                    tooltip="Size the text encoder sees the images at; 0 reuses the VAE-sized image. Ignored by qwen 2.1, whose encoder and VAE must share one size so every vision slot covers 2x2 latents."
+                    tooltip="Size the text encoder sees the images at; 0 reuses the VAE-sized image. Ignored by qwen 2.1, whose encoder and VAE must share one size so every vision slot covers 2x2 latents, and by fibo 2.0, whose tokenizer does its own training-time resize."
                 ),
                 io.Boolean.Input(
                     "ref_ctx_img",
@@ -150,6 +171,12 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                     optional=True,
                     tooltip="Also reference the context's own image at its own size (no rescale): always when no image is connected, otherwise only when enabled. With no context image the first image becomes the context image and is stored back on the output context."
                 ),
+                _KSAMPLER_OPTIONS_TYPE.Input("tiled_vae_options", optional=True, tooltip=(
+                    "The Tiled VAE options node, the same one KSampler (Context) takes: a "
+                    "reference at or above above_megapixels is encoded in tiles instead of "
+                    "whole, which is what a huge image costs when megapixels is 0 or "
+                    "ref_ctx_img references the context's image at its own size. "
+                    "Only the tiled_vae option in the list is read - the rest are ignored.")),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output(display_name="context"),
@@ -158,7 +185,7 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, context=None, media_pipe=None, images: io.Autogrow.Type = None, megapixels=1.0, scale=1.0, ref_latents=True, vl_megapixels=0.15, ref_ctx_img=False) -> io.NodeOutput:
+    def execute(cls, context=None, media_pipe=None, images: io.Autogrow.Type = None, megapixels=1.0, scale=1.0, ref_latents=True, vl_megapixels=0.15, ref_ctx_img=False, tiled_vae_options=None) -> io.NodeOutput:
         # Without a context there is no VAE to encode with: the node just builds
         # the media pipe from the connected images
         context = context or {}
@@ -192,6 +219,7 @@ class GibbyReferenceLatentContext(io.ComfyNode):
             return io.NodeOutput(ctx_from(context), pipe_add_images(media_pipe, explicit))
 
         is_qwen21 = _is_model(model, comfy.model_base.QwenImage21)
+        is_fibo2 = _is_model(model, comfy.model_base.Fibo2)
         # flux3's Qwen3-VL encoder can see images but was trained text-only, and its
         # DiT splices nothing into the sequence, so it takes the latents alone
         vl_refs = _clip_takes_images(context.get("clip")) and not _is_model(model, comfy.model_base.Flux3)
@@ -199,6 +227,9 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         # qwen2.1 uses 2x so every vision slot covers 2x2 latents (Text Encode Qwen Image 2.1)
         dw, _ = _latent_downscale(vae, None)
         multiple = 2 * dw if is_qwen21 else dw
+        # the sampler's tiled VAE rule, applied per reference: only the tiled_vae
+        # option of the list means anything here
+        tiled_above, tile_size, tile_overlap, temporal_size, temporal_overlap = _tiled_settings(tiled_vae_options)
 
         positive = context.get("positive")
         negative = context.get("negative")
@@ -209,15 +240,18 @@ class GibbyReferenceLatentContext(io.ComfyNode):
 
         def add_ref(resized):
             if vl_refs:
-                # qwen2.1 must see the exact image the VAE encodes; the others take
-                # the much smaller copy core's qwen image edit nodes feed the tower
-                vl = resized if is_qwen21 or vl_megapixels <= 0 else _resize_image_to_mp(resized, vl_megapixels, 1.0, dw)
+                # qwen2.1 must see the exact image the VAE encodes, fibo2 resizes its
+                # own copy to the trained grid; the others take the much smaller copy
+                # core's qwen image edit nodes feed the tower
+                vl = resized if is_qwen21 or is_fibo2 or vl_megapixels <= 0 else _resize_image_to_mp(resized, vl_megapixels, 1.0, dw)
                 images_vl.append(_over_white(vl))
             if ref_latents:
                 if raw_refs:
                     refs.append(resized)
                 else:
-                    refs.append(vae.encode(resized if is_qwen21 else resized[:, :, :, :3]))
+                    pixels = resized if is_qwen21 else resized[:, :, :, :3]
+                    tiled = _tiled_for(pixels.shape[2], pixels.shape[1], tiled_above)
+                    refs.append(encode_image(vae, pixels, tiled, tile_size, tile_overlap, temporal_size, temporal_overlap)["samples"])
 
         # The context image is referenced at its own size; the pipe refs and
         # the wired image_N to the target.
@@ -245,10 +279,18 @@ class GibbyReferenceLatentContext(io.ComfyNode):
 
         # Update positive conditioning
         if positive is not None and refs:
-            ctx["positive"] = node_helpers.conditioning_set_values(positive, {"reference_latents": refs})
+            positive = node_helpers.conditioning_set_values(positive, {"reference_latents": refs})
+            ctx["positive"] = positive
 
-        # Update negative conditioning if cfg != 1
-        if negative is not None and cfg != 1.0 and refs:
-            ctx["negative"] = node_helpers.conditioning_set_values(negative, {"reference_latents": refs})
+        # cfg 1 never runs the negative, so a negative the context carries is kept
+        # as it is and only gains the refs - it can be conditioning a graph built
+        # outside the prompts. A negative that exists only as prompt text becomes the
+        # zeroed positive, since a turbo model (fibo2) at cfg 1 would throw the
+        # re-encode away
+        if refs:
+            if negative:
+                ctx["negative"] = node_helpers.conditioning_set_values(negative, {"reference_latents": refs})
+            elif cfg == 1.0 and positive is not None:
+                ctx["negative"], = ConditioningZeroOut().zero_out(positive)
 
         return io.NodeOutput(ctx, pipe_add_images(media_pipe, explicit))

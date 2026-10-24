@@ -255,9 +255,9 @@ def _is_flux2(model_obj):
 
 def _is_flux2_latent(model_obj):
     """Whether a model wrapper (ModelPatcher) wants Flux2's 128ch /16x latents.
-    Flux3 shares the Flux2 latent format but keeps its own constant shift, so
-    the latent format and the schedule ask with different predicates."""
-    return _is_model(model_obj, (comfy.model_base.Flux2, comfy.model_base.Flux3))
+    Flux3 and Fibo 2.0 share the Flux2 latent format but keep their own constant
+    shift, so the latent format and the schedule ask with different predicates."""
+    return _is_model(model_obj, (comfy.model_base.Flux2, comfy.model_base.Flux3, comfy.model_base.Fibo2))
 
 
 def _clip_takes_images(clip):
@@ -273,7 +273,7 @@ def _clip_takes_images(clip):
 
 def empty_latent(width, height, batch_size=1, flux2=None, model_obj=None):
     """An empty latent dict for width x height: the 128ch /16x Flux2 one when
-    flux2 (or model_obj is a Flux2/Flux3 model), else the standard 4ch /8x one."""
+    flux2 (or model_obj is a Flux2/Flux3/Fibo2 model), else the standard 4ch /8x one."""
     if flux2 is None:
         flux2 = _is_flux2_latent(model_obj)
     if flux2:
@@ -286,19 +286,21 @@ def empty_latent(width, height, batch_size=1, flux2=None, model_obj=None):
 
 
 def ctx_size(ctx):
-    """(width, height) from the context: the explicit width/height when both are
-    set, else the image's, else the latent's scaled by the VAE's downscale ratio.
-    (0, 0) when there is nothing to measure."""
+    """(width, height) in pixels from the context: the explicit width/height when
+    both are set, else the image's, else the latent's scaled by the VAE's downscale
+    ratio. Frames of a video batch measure at their own size, like every other
+    reader of these tensors. (0, 0) when there is nothing to measure."""
     width, height = ctx.get("width") or 0, ctx.get("height") or 0
     if width > 0 and height > 0:
         return int(width), int(height)
     if ctx.get("image") is not None:
-        img_h, img_w = ctx["image"].shape[1], ctx["image"].shape[2]
-        return int(img_w), int(img_h)
+        img_w, img_h, _ = _image_dims(ctx["image"])
+        if img_w and img_h:
+            return int(img_w), int(img_h)
     if ctx.get("latent") is not None:
-        lat_h, lat_w = ctx["latent"]["samples"].shape[2], ctx["latent"]["samples"].shape[3]
-        dw, dh = _latent_downscale(ctx.get("vae"), ctx["latent"]["samples"].shape[1])
-        return lat_w * dw, lat_h * dh
+        lat_w, lat_h, _ = _latent_dims(ctx["latent"], ctx.get("vae"))
+        if lat_w and lat_h:
+            return int(lat_w), int(lat_h)
     return 0, 0
 
 
@@ -407,19 +409,24 @@ def recondition_prompts(ctx, positive_text, negative_text, images=None, keep_vis
     """Re-encode positive/negative prompt texts against the context clip, grafted
     onto the context's existing conditionings so their reference payloads survive.
     A prompt that travels is encoded as the first prompt of its travel plan; the
-    sampler swaps in the other steps. Returns (positive, negative); falls back to
-    the existing conditionings when there is no clip or nothing to re-encode."""
+    sampler swaps in the other steps. A negative the context carries is never
+    replaced at cfg 1 - the negative does not run there, so it is neither re-encoded
+    nor zeroed out. Returns (positive, negative); falls back to the existing
+    conditionings when there is no clip or nothing to re-encode."""
     clip = ctx.get("clip")
     if clip is None or (not positive_text and not negative_text):
         return ctx.get("positive"), ctx.get("negative")
     steps = ctx.get("steps")
     positive = _recondition_text(clip, ctx.get("positive"), _travel_step_text(positive_text, steps), ctx, images, keep_vision)
+    negative = ctx.get("negative")
+    # cfg 1 never runs the negative: a negative the graph provided is kept exactly
+    # as it is, and one that exists only as prompt text is not encoded - the zeroed
+    # positive says the same thing for nothing.
     if ctx.get("cfg") == 1:
-        negative, = ConditioningZeroOut().zero_out(positive)
+        if not negative and negative_text:
+            negative, = ConditioningZeroOut().zero_out(positive)
     elif negative_text:
-        negative = _recondition_text(clip, ctx.get("negative"), _travel_step_text(negative_text, steps), ctx, images, keep_vision)
-    else:
-        negative = ctx.get("negative")
+        negative = _recondition_text(clip, negative, _travel_step_text(negative_text, steps), ctx, images, keep_vision)
     return positive, negative
 
 
@@ -431,9 +438,41 @@ def ensure_conditioning(ctx):
         ctx["positive"] = _encode_text(ctx["clip"], _conditioning_text(ctx, "positive"))
     if ctx.get("negative") is None:
         if ctx.get("cfg") == 1 and ctx.get("positive") is not None:
+            # A missing negative still has to be a conditioning for the sampler, and
+            # at cfg 1 it is never run, so this costs no encode. Not the cfg-1
+            # zero-out: that one replaces a negative the context already has.
             ctx["negative"], = ConditioningZeroOut().zero_out(ctx["positive"])
         elif ctx.get("clip") is not None:
             ctx["negative"] = _encode_text(ctx["clip"], _conditioning_text(ctx, "negative"))
+
+
+def _find_option(options_list, opt_type):
+    """The first option of opt_type in a KSampler options list, else None."""
+    if options_list is None:
+        return None
+    for o in options_list:
+        if o.get("type") == opt_type:
+            return o
+    return None
+
+
+def _tiled_settings(options_list):
+    """Tiled VAE settings from a KSampler options list: (above_megapixels, tile_size, overlap, temporal_size, temporal_overlap).
+    above_megapixels is None when the option is absent (never tiled) and 0.0 for always tiled."""
+    opts = _find_option(options_list, "tiled_vae")
+    if opts is None:
+        return None, 512, 64, 64, 8
+    return opts.get("above_megapixels", 1.0), opts.get("tile_size", 512), opts.get("overlap", 64), opts.get("temporal_size", 64), opts.get("temporal_overlap", 8)
+
+
+def _tiled_for(w, h, above_megapixels):
+    """Whether the tiled VAE is used for a w x h image: never without the option,
+    always with a 0 threshold, otherwise for sizes at or above the threshold in MP."""
+    if above_megapixels is None:
+        return False
+    if above_megapixels <= 0:
+        return True
+    return (w * h) / 1_000_000 >= above_megapixels
 
 
 def encode_image(vae, image, tiled=False, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8, verbose=False):

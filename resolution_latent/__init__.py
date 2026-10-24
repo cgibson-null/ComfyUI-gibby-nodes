@@ -27,7 +27,7 @@ target size.
 Shared across all modes: swap_dimensions, scale_factor (resolution multiplier),
 multiple (round down to this multiple, advanced) and batch_size. The latent type
 toggle picks between the standard 4ch /8x image latent and Flux2's 128ch /16x one
-(Flux2, klein and Flux3 models; the context's model overrides it).
+(Flux2, klein, Flux3 and Fibo 2.0 models; the context's model overrides it).
 Outputs the context, empty_latent, encoded_latent and the computed width/height
 for downstream sizing.
 
@@ -347,7 +347,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 "or custom aspect ratio (manual w:h + megapixels). Megapixels 0 rescales the media's own size instead, or "
                 "defaults to 1 MP with no media linked. "
                 "Shared: swap dimensions, scale factor, multiple and batch size; latent type toggle for "
-                "standard 8x vs Flux2/Flux3 16x latents. With an image or mask connected (the context's when "
+                "standard 8x vs Flux2/Flux3/Fibo2 16x latents. With an image or mask connected (the context's when "
                 "nothing is) it is fitted into the target box per keep_proportion (stretch/resize/pad/pad_around/"
                 "crop/total_pixels; pad_around keeps the original size centered and pads the box around it like "
                 "Pad Image for Outpainting) and output resized. "
@@ -397,7 +397,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
                 # latent format: on = Flux 2's 128ch /16x latent, off = standard 4ch /8x.
                 io.Boolean.Input("flux2_latent", display_name="Flux 2 latent (16x)", default=False,
-                                 tooltip="Flux2's 128ch /16x latent format (Flux2, klein and Flux3 use it); off is the standard 4ch /8x image latent. Ignored when the context has a model - it decides the format"),
+                                 tooltip="Flux2's 128ch /16x latent format (Flux2, klein, Flux3 and Fibo 2.0 use it); off is the standard 4ch /8x image latent. Ignored when the context has a model - it decides the format"),
                 # The executed temp preview in the node (like the core Preview Image):
                 # off by default - off writes no temp file at all. Hidden by the
                 # frontend while load or crop is on, where the preview is always
@@ -522,7 +522,7 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
         model_obj = context.get("model") if isinstance(context, dict) else None
         is_flux2 = _is_flux2_latent(model_obj) if model_obj is not None else flux2_latent
 
-        # Latent grids must be divisible by 8 (image) or 16 (Flux2/Flux3), so round down to the lcm of multiple and that base.
+        # Latent grids must be divisible by 8 (image) or 16 (Flux2/Flux3/Fibo2), so round down to the lcm of multiple and that base.
         base = 16 if is_flux2 else 8
         step = multiple * base // math.gcd(multiple, base)
 

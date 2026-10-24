@@ -10,7 +10,7 @@ class GibbyTiledVaeOptions(io.ComfyNode):
             display_name="Tiled VAE options",
             category="gibby/flow",
             search_aliases=["tiled", "vae", "tile", "options", "config"],
-            description="Outputs tiled VAE options. Feed into KSampler (Context) options input - encode/decode use the tiled VAE for sizes at or above above_megapixels.",
+            description="Outputs tiled VAE options. Feed into KSampler (Context)'s options input or Reference Latent (Context)'s tiled_vae_options - encode/decode use the tiled VAE for sizes at or above above_megapixels.",
             inputs=[
                 io.Float.Input("above_megapixels", default=1.0, min=0.0, max=100.0, step=0.1, tooltip="Tiled VAE is used for sizes at or above this many megapixels (0 = always), below - normal encode/decode"),
                 io.Int.Input("tile_size", default=512, min=64, max=4096, step=32),

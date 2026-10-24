@@ -7,12 +7,19 @@ from ..resolution_latent import _resize_image, _resize_mask, _mask_bbox
 
 def _paste_back(full, pasted, mask, x0, y0, w, h):
     """Blend pasted (B, H, W, C) back into full's (x0, y0, w, h) rect, weighted by
-    the mask (B, H, W) - both resized to the rect when they differ. full is
-    modified in place."""
+    the mask (B, H, W) - both resized to the rect when they differ and matched to
+    full's channel count. full is modified in place."""
     if pasted.shape[1] != h or pasted.shape[2] != w:
         pasted = _resize_image(pasted, w, h, "lanczos")
     if mask.shape[-2:] != (h, w):
         mask = _resize_mask(mask, w, h, "bilinear")
+    # A 4-channel decode (qwen image 2.1's RGBA VAE) over an RGB source drops the
+    # alpha; a 3-channel paste over an RGBA source gets a transparent alpha
+    c = full.shape[-1]
+    if pasted.shape[-1] != c:
+        p = pasted.shape[-1]
+        pasted = pasted[..., :c] if p > c else torch.cat(
+            [pasted, pasted.new_zeros(pasted.shape[:-1] + (c - p,))], -1)
     m = mask.clamp(0, 1).unsqueeze(-1).to(full.dtype)
     full[:, y0:y0 + h, x0:x0 + w, :] = pasted * m + full[:, y0:y0 + h, x0:x0 + w, :] * (1 - m)
 
@@ -72,7 +79,7 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
             mask = masks if masks is not None else crop_info["mask"]
 
         # Soft masks (e.g. the crop mask expanded with blur) blend as-is
-        B, H, W, C = original.shape
+        B, H, W = original.shape[:3]
         if mask is not None:
             if not composite and mask.shape[1:] != (H, W):
                 mask = _resize_mask(mask, W, H, "nearest-exact")
@@ -82,12 +89,6 @@ class GibbyPasteImageByMaskBatch(io.ComfyNode):
         # batch reuses its last frame, like Image Composite Masked), otherwise the
         # smaller size wins
         n = B if composite else min(B, images_to_paste.shape[0])
-
-        # Match the originals' channel count (e.g., an RGBA paste over RGB drops the alpha)
-        if images_to_paste.shape[-1] != C:
-            c = images_to_paste.shape[-1]
-            images_to_paste = images_to_paste[..., :C] if c > C else torch.cat(
-                [images_to_paste, images_to_paste.new_zeros(images_to_paste.shape[:-1] + (C - c,))], -1)
 
         out = original[:n].clone()
         if composite:

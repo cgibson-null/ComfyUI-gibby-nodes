@@ -75,7 +75,7 @@ from comfy_extras.nodes_post_processing import ColorTransfer
 from ..context import (_CONTEXT_TYPE, GibbyContext, _recondition_text, _latent_downscale,
                        _image_dims, _latent_dims, _is_flux2, clear_vram, ctx_from, ctx_size,
                        ctx_set_sampled_image, ctx_set_image, ctx_set_latent, drop_image_derived, ensure_conditioning, encode_image, decode_latent,
-                       parse_index_spec,
+                       parse_index_spec, _find_option, _tiled_settings, _tiled_for,
                     _mp, _image_count_s, _latent_count_s, _log)
 from ..context.prompt_travel import _has_travel_group, _plan_prompt_travel
 from ..lora_loader import iter_lora_stack
@@ -86,40 +86,12 @@ from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask
 from .dype_helper import DYPE_PATCH_METHODS, apply_dype_patch
 
 
-def _find_option(options_list, opt_type):
-    if options_list is None:
-        return None
-    for o in options_list:
-        if o.get("type") == opt_type:
-            return o
-    return None
-
-
 def _with_color_match(opt, color_opt):
     """Copy of the option dict carrying the color match option's settings."""
     o = dict(opt)
     o["color_match_method"] = color_opt.get("color_match_method", "mkl_lab")
     o["color_match_strength"] = color_opt.get("color_match_strength", 1.0)
     return o
-
-
-def _tiled_settings(options_list):
-    """Tiled VAE settings from the options list: (above_megapixels, tile_size, overlap, temporal_size, temporal_overlap).
-    above_megapixels is None when the option is absent (never tiled) and 0.0 for always tiled."""
-    opts = _find_option(options_list, "tiled_vae")
-    if opts is None:
-        return None, 512, 64, 64, 8
-    return opts.get("above_megapixels", 1.0), opts.get("tile_size", 512), opts.get("overlap", 64), opts.get("temporal_size", 64), opts.get("temporal_overlap", 8)
-
-
-def _tiled_for(w, h, above_megapixels):
-    """Whether the tiled VAE is used for a w x h image: never without the option,
-    always with a 0 threshold, otherwise for sizes at or above the threshold in MP."""
-    if above_megapixels is None:
-        return False
-    if above_megapixels <= 0:
-        return True
-    return (w * h) / 1_000_000 >= above_megapixels
 
 
 def _resolve_step(steps_value, v):
@@ -336,7 +308,8 @@ def _prepare_prompt_travels(ctx, pos_text, neg_text, steps_value, verbose, cfg_v
     normally, switching ones come back as a state for the per-step loop.
     Returns the state (None when there is nothing to travel).
     cfg_varies: a cfg schedule can lift cfg above 1, so the negative is used even
-    when the context's cfg is 1 and has to be a real conditioning."""
+    when the context's cfg is 1 and has to be a real conditioning.
+    A negative the context carries is never zeroed out or re-encoded at cfg 1."""
     pos_travels = _has_travel_group(pos_text)
     neg_travels = _has_travel_group(neg_text)
     if not pos_travels and not neg_travels:
@@ -374,14 +347,22 @@ def _prepare_prompt_travels(ctx, pos_text, neg_text, steps_value, verbose, cfg_v
 
     pos_conds = conds_for(pos_plan, base_pos, pos_travels)
     if ctx.get("cfg") == 1 and not cfg_varies:
-        zero_cache = {}
-        def zero_out(cond):
-            if isinstance(cond, tuple):
-                return ("mix", [(zero_out(c), w) for c, w in cond[1]])
-            if id(cond) not in zero_cache:
-                zero_cache[id(cond)], = ConditioningZeroOut().zero_out(cond)
-            return zero_cache[id(cond)]
-        neg_conds = [zero_out(c) for c in pos_conds]
+        if base_neg:
+            # cfg 1 never runs the negative, so the context's own is kept untouched -
+            # it can be conditioning a graph built outside the prompts - and no
+            # per-step prompt is encoded for it either
+            neg_conds = [base_neg] * len(neg_plan)
+        else:
+            # nothing to keep: the zeroed positive stands in for the negative prompt
+            # without encoding it
+            zero_cache = {}
+            def zero_out(cond):
+                if isinstance(cond, tuple):
+                    return ("mix", [(zero_out(c), w) for c, w in cond[1]])
+                if id(cond) not in zero_cache:
+                    zero_cache[id(cond)], = ConditioningZeroOut().zero_out(cond)
+                return zero_cache[id(cond)]
+            neg_conds = [zero_out(c) for c in pos_conds]
     else:
         neg_conds = conds_for(neg_plan, base_neg, neg_travels)
 
