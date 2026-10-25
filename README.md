@@ -11,7 +11,7 @@ git clone https://github.com/cgibson-null/ComfyUI-gibby-nodes
 
 The core idea: a **Context** node is a bag with sampling and metadata related values that can be overridden. Has Any slot added with idea of using Any Pipe node. Every field is optional. Spiritual inheritor of [rgthree's](https://github.com/rgthree/rgthree-comfy) Context.
 
-**Context Loader** - loads model(ckpt or diff)/clip(s up to 4)/vae(s - for audio too), sets prompts and sampling params, and outputs a ready-to-use context. The starting point of most workflows. Detects model category and creates appropriate latent for it (flux2/flux3/fibo2). Spiritual inheritor of [Efficient loader](https://github.com/jags111/efficiency-nodes-comfyui).
+**Context Loader** - loads model(ckpt or diff)/clip/vae(s - for audio too), sets prompts and sampling params, and outputs a ready-to-use context. The starting point of most workflows. Detects model category and creates appropriate latent for it (flux2/flux3/fibo2). Spiritual inheritor of [Efficient loader](https://github.com/jags111/efficiency-nodes-comfyui).
 
 **Context Override** - provides widgets to override context values. Toggles let you choose which categories to override. Useful when you want to separate setting per sampling stage (steps 1-3 higher cfg, 1st prompt, remaining steps - 1cfg, 2nd prompt; etc)
 

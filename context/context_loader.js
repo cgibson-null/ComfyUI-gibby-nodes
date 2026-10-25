@@ -52,20 +52,6 @@ app.registerExtension({
                                 widget.options.values.splice(0, widget.options.values.length, ...spec[1].options);
                                 widget._state?.options?.values?.splice(0, widget._state.options.values.length, ...spec[1].options);
                             }
-                        } else if (spec[0] === "COMFY_DYNAMICCOMBO_V3") {
-                            // Nested dynamic combo (e.g. clip_count)
-                            for (const subOpt of spec[1]?.options || []) {
-                                const subInputs = subOpt?.inputs?.required || {};
-                                const subOptInputs = subOpt?.inputs?.optional || {};
-                                for (const [subName, subSpec] of [...Object.entries(subInputs), ...Object.entries(subOptInputs)]) {
-                                    if (!Array.isArray(subSpec) || subSpec[0] !== "COMBO") continue;
-                                    const widget = this.widgets?.find((w) => w.name === `mode.${name}.${subName}`);
-                                    if (widget?.options?.values) {
-                                        widget.options.values.splice(0, widget.options.values.length, ...subSpec[1].options);
-                                        widget._state?.options?.values?.splice(0, widget._state.options.values.length, ...subSpec[1].options);
-                                    }
-                                }
-                            }
                         }
                     }
                 }

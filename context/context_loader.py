@@ -4,7 +4,6 @@ Context Loader node
 A self-contained context source with a mode selector for the loading category:
 
 - diffusion model: separate unet/clip/vae selectors, each left on "None" to skip.
-  The clips row count (1-4) works like Clip Loader - Dual/Triple/Quad.
 - checkpoint: loads a full checkpoint like Load Checkpoint.
 
 With a context connected, its values carry through for anything the node
@@ -40,11 +39,6 @@ except ImportError:
 from ..lora_loader import _apply_lora, iter_lora_stack
 from . import _CONTEXT_TYPE, _lora_stack, ctx_from, ctx_set_image, ctx_set_latent, GibbyContext
 
-def _clip_name_inputs(count):
-    clip_options = ["None"] + folder_paths.get_filename_list("text_encoders")
-    return [io.Combo.Input(f"clip_name{i}", options=clip_options, default="None") for i in range(1, count + 1)]
-
-
 # execute() runs once per list item when a list input is mapped over, so the
 # model loads are cached: each part is built once per key, not once per item.
 # A single entry per part keeps the cache from holding extra models in memory.
@@ -75,7 +69,7 @@ class _WeakCache:
 
 _last_checkpoint = _WeakCache()  # ckpt_name -> (model, clip, vae)
 _last_unet = _WeakCache()  # (unet_name, weight_dtype) -> (model,)
-_last_clip = _WeakCache()  # (clip_paths, type, device) -> (clip,)
+_last_clip = _WeakCache()  # (clip_path, type, device) -> (clip,)
 _last_vae = _WeakCache()  # vae_name -> (vae,)
 _last_vae_audio = _WeakCache()  # vae_audio_name -> (vae_audio,)
 
@@ -89,15 +83,15 @@ def _load_unet(unet_name, weight_dtype):
     return model
 
 
-def _load_clip(clip_paths, type_, device):
+def _load_clip(clip_path, type_, device):
     def load():
         clip_type = getattr(comfy.sd.CLIPType, type_.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
         model_options = {}
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
-        return comfy.sd.load_clip(ckpt_paths=clip_paths, embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options),  # the CLIP itself, unlike the loaders above
+        return comfy.sd.load_clip(ckpt_paths=[clip_path], embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options),  # the CLIP itself, unlike the loaders above
 
-    model, = _last_clip.get_or_load((tuple(clip_paths), type_, device), load)
+    model, = _last_clip.get_or_load((clip_path, type_, device), load)
     return model
 
 
@@ -137,16 +131,7 @@ class GibbyContextLoader(io.ComfyNode):
                         io.DynamicCombo.Option("diffusion_model", [
                             io.Combo.Input("unet_name", options=["None"] + folder_paths.get_filename_list("diffusion_models"), default="None"),
                             io.Combo.Input("weight_dtype", options=["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"], default="default", advanced=True),
-                            io.DynamicCombo.Input(
-                                "clip_count",
-                                display_name="clips",
-                                options=[
-                                    io.DynamicCombo.Option("1", _clip_name_inputs(1)),
-                                    io.DynamicCombo.Option("2", _clip_name_inputs(2)),
-                                    io.DynamicCombo.Option("3", _clip_name_inputs(3)),
-                                    io.DynamicCombo.Option("4", _clip_name_inputs(4)),
-                                ],
-                            ),
+                            io.Combo.Input("clip_name", options=["None"] + folder_paths.get_filename_list("text_encoders"), default="None"),
                             io.Combo.Input("type", options=CLIPLoader.INPUT_TYPES()["required"]["type"][0], default="krea2"),
                             io.Combo.Input("device", options=["default", "cpu"], default="default", advanced=True),
                             io.Combo.Input("vae_name", options=["None"] + VAELoader.vae_list(VAELoader), default="None"),
@@ -222,16 +207,10 @@ class GibbyContextLoader(io.ComfyNode):
                 model_name = unet_name
                 model = _load_unet(unet_name, weight_dtype)
 
-            # Clip(s): native ComfyUI loading; multiple paths like Clip Loader - Dual/Triple/Quad.
-            clips = mode.get("clip_count", {}) or {}
-            count = int(clips.get("clip_count", 1))
-            clip_paths = []
-            for i in range(1, count + 1):
-                name = clips.get(f"clip_name{i}")
-                if name and name != "None":
-                    clip_paths.append(folder_paths.get_full_path_or_raise("text_encoders", name))
-            if clip_paths:
-                clip = _load_clip(clip_paths, type_, device)
+            # The clip: native ComfyUI loading, one text encoder like Clip Loader.
+            clip_name = mode.get("clip_name")
+            if clip_name and clip_name != "None":
+                clip = _load_clip(folder_paths.get_full_path_or_raise("text_encoders", clip_name), type_, device)
 
             if vae_name and vae_name != "None":
                 vae = _load_vae(vae_name)

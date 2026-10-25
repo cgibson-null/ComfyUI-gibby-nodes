@@ -1,9 +1,9 @@
 import torch
 from comfy_api.latest import io
-from comfy_extras.nodes_mask import GrowMask, InvertMask
+from comfy_extras.nodes_mask import InvertMask
 
 from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from, ctx_set_image
-from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox
+from ..resolution_latent import _resize_to_mp_scale, _resize_image, _resize_mask, _mask_bbox, _grow_mask
 
 
 # Two consecutive crop regions count as a shot change when they barely overlap
@@ -21,7 +21,7 @@ def _process_mask(mask, mask_grow, mask_invert):
     unmasked pixels around the region (inverting first would grow the
     complement into it)."""
     if mask_grow:
-        mask, = GrowMask.execute(mask, mask_grow, True)
+        mask = _grow_mask(mask, mask_grow)
     if mask_invert:
         mask, = InvertMask.execute(mask)
     return mask

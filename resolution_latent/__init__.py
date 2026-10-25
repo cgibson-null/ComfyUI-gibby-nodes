@@ -162,6 +162,73 @@ def _mask_bbox(mask):
     return (left, top, right - left + 1, bottom - top + 1)
 
 
+# Frame copies a mask op holds at once - the mask, its pads, the pooling outputs
+# alive together, and the conv workspace - for the free VRAM estimate.
+_MASK_OP_COPIES = 12
+
+
+def _mask_op(mask, op):
+    """Run op(mask) over a (B,H,W) mask where it is fastest: on the CUDA device
+    when its temporaries fit the free VRAM, in frame chunks when only part of
+    the batch fits, and on the mask's own device when CUDA is out of the picture
+    or has no room. The result comes back on the mask's device."""
+    per_frame = mask.shape[-2] * mask.shape[-1] * mask.element_size() * _MASK_OP_COPIES
+    device, step = mask.device, len(mask)
+    if device.type != "cuda":
+        gpu = comfy.model_management.get_torch_device()
+        free = comfy.model_management.get_free_memory(gpu) if gpu.type == "cuda" else 0
+        if free >= per_frame:
+            device, step = gpu, int(free // per_frame)
+    if device == mask.device and step >= len(mask):
+        return op(mask)
+    parts = [op(chunk.to(device)).to(mask.device) for chunk in mask.split(step)]
+    return torch.cat(parts) if len(parts) > 1 else parts[0]
+
+
+def _open_mask(mask, size):
+    """The morphological opening (ndimage's grey_opening) that drops specks, over
+    a (B,H,W) mask. Identical to it on an odd size, and on an even one everywhere
+    but the outer frame: ndimage centers an even footprint between two pixels,
+    which has no pooling equivalent once the reflect border is folded in."""
+    def morph(x, p, erode):
+        # ndimage's grey_erosion/grey_dilation, that is its min/max filter as the
+        # two 1D passes it decomposes into, so the whole batch goes through four
+        # kernels instead of one scipy call per frame. x is a (B,1,H,W) mask and
+        # p the footprint's origin.
+        if erode:
+            x = -x
+        x = F.max_pool2d(F.pad(x, (p, size - 1 - p, 0, 0), mode="reflect"), (1, size), 1)
+        x = F.max_pool2d(F.pad(x, (0, 0, p, size - 1 - p), mode="reflect"), (size, 1), 1)
+        return -x if erode else x
+
+    def opening(m):
+        # ndimage mirrors the footprint between the erosion and the dilation, so
+        # the dilation's origin is the erosion's mirror on the even sizes
+        m = m.unsqueeze(1)
+        return morph(morph(m, size // 2, True), (size - 1) // 2, False).squeeze(1)
+
+    return _mask_op(mask, opening)
+
+
+def _grow_mask(mask, grow):
+    """Grow a (B,H,W) mask by |grow| pixels, shrinking for a negative grow, like
+    the native Grow Mask with tapered corners. |grow| 3x3 cross dilations are the
+    L1 ball of that radius, so GrowMask's per-frame loop of |grow| scipy calls
+    becomes |grow| pooled passes over the whole batch, on the device the batch
+    fits in."""
+    def dilate(m):
+        x = (m if grow > 0 else -m).unsqueeze(1)
+        for _ in range(abs(grow)):
+            pad = F.pad(x, (1, 1, 1, 1), mode="reflect")
+            x = pad[:, :, 1:-1, 1:-1].clone()
+            torch.maximum(x, pad[:, :, :-2, 1:-1], out=x)
+            torch.maximum(x, pad[:, :, 2:, 1:-1], out=x)
+            torch.maximum(x, pad[:, :, 1:-1, :-2], out=x)
+            torch.maximum(x, pad[:, :, 1:-1, 2:], out=x)
+        return (x if grow > 0 else -x).squeeze(1)
+    return _mask_op(mask, dilate)
+
+
 def _fit_size(sw, sh, box_w, box_h, keep_proportion, step):
     # Content size that fits the source (sw x sh) into the target box per Resize
     # Image v2's keep_proportion modes; always snapped to a valid latent grid.

@@ -36,40 +36,49 @@ import folder_paths
 import nodes
 from comfy_api.latest import io, ui
 from comfy_extras.color_util import hex_to_rgb
-from comfy_extras.nodes_mask import GrowMask, InvertMask
-from comfy_extras.nodes_post_processing import gaussian_kernel
 
 from ..context import _CONTEXT_TYPE, ctx_from, ctx_set_image
 from ..crop_paste.crop_image_by_mask import _process_mask
-from ..resolution_latent import _mask_bbox, _resize_mask, _pad_color_tensor, _color_alpha
+from ..resolution_latent import _mask_bbox, _mask_op, _open_mask, _resize_mask, _pad_color_tensor, _color_alpha
 
 
 def _fix_mask(mask, remove_isolated_pixels, fill_holes):
     # remove_isolated_pixels: morphological opening (essentials Mask Fix)
-    # fill_holes: close the holes the mask encloses (KJ Grow Mask With Blur)
-    if not remove_isolated_pixels and not fill_holes:
-        return mask
-    out = []
-    for m in mask:
-        arr = m.cpu().numpy().astype(np.float32)
-        if remove_isolated_pixels:
-            arr = ndi.grey_opening(arr, size=(remove_isolated_pixels, remove_isolated_pixels))
-        if fill_holes:
-            arr = ndi.binary_fill_holes(arr > 0.5).astype(np.float32)
-        out.append(torch.from_numpy(arr))
-    return torch.stack(out).to(mask.device)
+    # fill_holes: close the holes the mask encloses (KJ Grow Mask With Blur), on
+    # the cpu where ndimage labels it - one transfer for the batch, not per frame
+    if remove_isolated_pixels:
+        mask = _open_mask(mask, remove_isolated_pixels)
+    if fill_holes:
+        arr = mask.cpu().numpy()
+        filled = np.empty(arr.shape, dtype=np.float32)
+        for i, m in enumerate(arr):
+            filled[i] = ndi.binary_fill_holes(m > 0.5)
+        mask = torch.from_numpy(filled).to(mask.device)
+    return mask
 
 
 def _feather_mask(mask, mask_blur):
     # The mask edge ramped over mask_blur pixels: the gaussian kernel the native
-    # Blur Image uses, convolved on the mask's own device so the mask stays where
-    # it was. sigma is radius / 3 rather than the node's fixed 1.0, so a wider
-    # radius is a wider ramp instead of the same blur.
+    # Blur Image uses, convolved on the device the mask fits in. sigma is radius
+    # / 3 rather than the node's fixed 1.0, so a wider radius is a wider ramp
+    # instead of the same blur.
     if not mask_blur:
         return mask
-    k = mask_blur * 2 + 1
-    kernel = gaussian_kernel(k, mask_blur / 3.0, device=mask.device, dtype=mask.dtype).reshape(1, 1, k, k)
-    return F.conv2d(F.pad(mask.unsqueeze(1), (mask_blur,) * 4, "reflect"), kernel).squeeze(1)
+
+    def ramp(m):
+        # The core's kernel is a separable gaussian normalized over its own box,
+        # so the two 1D passes below are its 2D convolution for a fraction of the
+        # work.
+        x = torch.linspace(-1, 1, mask_blur * 2 + 1, dtype=torch.float32, device=m.device)
+        g = torch.exp(-(x * x) / (2.0 * (mask_blur / 3.0) ** 2))
+        g = (g / g.sum()).to(m.dtype).reshape(1, 1, 1, -1)
+        m = F.conv2d(F.pad(m.unsqueeze(1), (mask_blur, mask_blur, 0, 0), mode="reflect"), g)
+        m = F.conv2d(F.pad(m, (0, 0, mask_blur, mask_blur), mode="reflect"), g.transpose(2, 3))
+        # A wide kernel's float32 sum drifts past 1.0, and edit-mask consumers
+        # reject a mask that leaves [0, 1].
+        return m.squeeze(1).clamp_(0, 1)
+
+    return _mask_op(mask, ramp)
 
 
 def _mask_color(color):
