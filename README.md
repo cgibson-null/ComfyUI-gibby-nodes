@@ -47,6 +47,8 @@ Use **inputs** to override context values (override happens first, so output con
 
 **Decode:** on by default. Decodes the output latent to image/audio/both and removes latent from context. An image whose size is not a multiple of the VAE's downscale ratio is pre-scaled to it before encoding, and the decoded image is stretched back to the original size, so the content stays aligned with the original. Disable to skip decoding in case you're chaining ksamplers (wan high pass).
 
+**Latent output:** the latent the returned image was sampled from - the sampled latent, or the last iterative step's latent. Crop-Inpaint samples each crop at its own size, so its latent output is the latent of the inpainted area (the last region's when the mask splits into several), at the size that crop was sampled at, never the whole image.
+
 **Options:** connect options nodes to the `options` input - **Crop-Inpaint options**, **Iterative Options**, **Lora Travel options**, **Tiled VAE options**, **Clear VRAM options**, **Color Match options**, **DyPE options**, or **Merge KSampler Options** (dynamic `option1…option10` inputs that append several options lists into one).
 
 **Crop-Inpaint options** - allows crop area per mask, configure boundaries and resolution, and inpaint it at proper size, then paste back onto original.
