@@ -46,7 +46,8 @@ DYPE_PATCH_METHODS = ("dype", "sega")
 #: TOKEN grid: FLUX.2/klein and FLUX.3 (16x VAE, patch 1) and FLUX.1 (8x VAE,
 #: patch 2) are all 64x64 tokens at 1024px, so one "flux" entry covers them - and
 #: the DyPE detector reports klein and flux3 as "flux" anyway (flux3's DiT has a
-#: pe_embedder).
+#: pe_embedder). MOSS-Image and Fibo 2.0 take the same Flux2 16x VAE without
+#: patchify, so they are the same grid.
 BASE_RESOLUTIONS = {
     "flux": 1024,
     "nunchaku": 1024,
@@ -55,6 +56,8 @@ BASE_RESOLUTIONS = {
     "qwen21": 1328,
     "krea2": 1328,
     "anima": 1920,
+    "moss": 1024,
+    "fibo2": 1024,
 }
 
 _pack_cache = False

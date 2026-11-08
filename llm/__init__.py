@@ -10,7 +10,8 @@ Nodes for talking to a llama.cpp server / llama-swap proxy
   enable_* toggle - only enabled fields are sent.
 - Unsloth Load Options: per-load parameters (context size, speculative,
   KV-cache quant, extra flags) folded into the options dict under a
-  "load" key; Generate applies them via Unsloth's /load API.
+  "load" key; Generate prices them with Unsloth's own validate /
+  estimate-memory probes, then applies the priced command via /load.
 - Generate: single-shot text generation with auto-growing image/video
   reference slots (Autogrow); videos are sampled into still frames, the
   chat API takes stills only. Every run prints a tokens/sec line with the
@@ -41,6 +42,7 @@ from .llamacpp_client import (
     resolve_local_model,
     unload_model,
     unsloth_load,
+    unsloth_preflight,
     unsloth_unload,
 )
 from ..pipes.media_pipe import iter_numbered_slots, pipe_add_images
@@ -138,9 +140,80 @@ def _maybe_unload(url: str, model: str, connectivity: dict[str, Any] | None, deb
             print(f"[Gibby-LLM] keep_alive=0 unload request failed (non-fatal): {exc}")
 
 
+#: The load params the two pre-load probes price, in the names they take there.
+#: Anything else in the load block (auto_derived, gpu_layers) is an answer from the
+#: probes, not something to ask them about.
+_PREFLIGHT_KEYS = ("max_seq_length", "n_parallel", "cache_type_kv",
+                   "spec_draft_cache_type", "n_batch", "n_ubatch", "spec_draft_n_max",
+                   "speculative_type", "llama_extra_args")
+
+
+def _price_load(url: str, target: str, load: dict[str, Any], api_key: str | None,
+                debug: bool = False) -> dict[str, Any]:
+    """Run Unsloth's own pre-load probes for this load and merge their answers into it.
+
+    The Studio panel never posts /load cold: it validates the identifier, then prices the
+    command it is about to submit (``validate``, then ``estimate-memory``), and the price
+    comes back with the context and layer count that command comes to on this hardware.
+    Submitting those numbers is what makes a model the panel already loaded a no-op: /load
+    reloads whenever the settings do not match what is loaded, and a request built from the
+    user's context alone -- no fitted context, no gpu_layers -- is a different command from
+    the one the panel ran, so it reloads and plans as it goes. That is the "loads for 30
+    seconds, fails, and works on the second run" report.
+
+    ``max_seq_length_auto_derived`` is set with a substituted context because that is what
+    the flag means to Studio: the number is a fitted value, not a user pin, so a load that
+    needs to re-fit it (a forced-MTP replay) may. A context the user left at 0 stays unset,
+    which is how a llama.cpp load is asked for the model's own window. An estimate that
+    cannot size the model (``available`` false) leaves the command as the user set it apart
+    from the serving slot; a probe that errors or does not answer raises, because the load
+    about to be spent on the priced command has no price.
+    """
+    # One Generate is one reply, so ask for one serving slot. Omitted, the load takes
+    # Studio's server-wide default -- which priced 10.3 GiB of KV cache and 20.8 GiB on the
+    # GPU for a 27B at 20k with q4 KV and MTP, against 5.2 and 19.1 at one slot. That gap is
+    # one way a model the panel loads fails from Comfy on the same settings.
+    priced = dict(load)
+    priced.setdefault("n_parallel", 1)
+
+    probe = {key: value for key, value in priced.items() if key in _PREFLIGHT_KEYS}
+    if "max_seq_length" in probe:
+        # estimate-memory prices the context under its own --ctx-size name.
+        probe["n_ctx"] = probe["max_seq_length"]
+
+    check = unsloth_preflight(url, "validate", target, probe, api_key=api_key)
+    if not check.get("valid", True):
+        raise RuntimeError(f"Unsloth load refused: {target!r}: {check.get('message') or 'not a loadable model'}")
+
+    estimate = unsloth_preflight(url, "estimate-memory", target, probe, api_key=api_key)
+    if not estimate.get("available", False):
+        return priced
+
+    if debug:
+        gpu = (estimate.get("gpu_bytes") or 0) / 2**30
+        total = (estimate.get("total_bytes") or 0) / 2**30
+        print(
+            f"[Gibby-LLM] unsloth: estimate says {gpu:.1f} GiB GPU / {total:.1f} GiB total at "
+            f"{estimate.get('n_ctx')} ctx, {estimate.get('n_parallel')} slot(s), "
+            f"{estimate.get('gpu_layers')} gpu_layers"
+        )
+
+    fitted = estimate.get("context_fitted")
+    requested = priced.get("max_seq_length", 0)
+    if isinstance(fitted, int) and fitted > 0 and requested and fitted < requested:
+        priced["max_seq_length"] = fitted
+        priced["max_seq_length_auto_derived"] = True
+        if debug:
+            print(f"[Gibby-LLM] unsloth: context {requested} -> {fitted} (Unsloth's own estimate for this load)")
+    layers = estimate.get("gpu_layers")
+    if isinstance(layers, int) and layers > 0:
+        priced["gpu_layers"] = layers
+    return priced
+
+
 def _maybe_unsloth_load(url: str, model: str, api_key: str | None, options: dict[str, Any] | None, debug: bool = False) -> str | None:
-    """Resolve the model's Unsloth identity, applying the options' ``load``
-    block to it when there is one.
+    """Resolve the model's Unsloth identity, pricing and applying the options'
+    ``load`` block to it when there is one.
 
     Only meaningful for Unsloth Studio: it has a ``POST /api/inference/load``
     that takes context / speculative / KV-quant per load. llama.cpp and
@@ -162,7 +235,9 @@ def _maybe_unsloth_load(url: str, model: str, api_key: str | None, options: dict
     When load and chat identity differ, the load is therefore explicit and
     unconditional, not just when a ``load`` block is present. Plain-folder
     models chat by the same path they load under, so their chat auto-loads
-    from disk and /load is only needed to apply the block.
+    from disk and /load is only needed to apply the block. A block that is
+    applied goes through _price_load first, so it reaches /load as the command
+    Unsloth itself would have planned.
 
     Returns the identity to chat with (local when a local copy exists, else
     the repo id). Unsloth keys model lookup and vision support to the exact
@@ -187,12 +262,13 @@ def _maybe_unsloth_load(url: str, model: str, api_key: str | None, options: dict
 
     if load is not None or load_target != chat_target:
         try:
-            unsloth_load(url, load_target, load or {}, api_key=api_key)
+            load = _price_load(url, load_target, load or {}, api_key, debug)
+            unsloth_load(url, load_target, load, api_key=api_key)
         except LlamaCppError as exc:
             raise RuntimeError(f"Unsloth load failed: {exc}") from exc
 
         source = "local" if load_target != model else "hub"
-        applied = ", ".join(f"{k}={v}" for k, v in (load or {}).items()) or "server defaults"
+        applied = ", ".join(f"{k}={v}" for k, v in load.items()) or "server defaults"
         print(f"[Gibby-LLM] unsloth: {model!r} loaded from {source} ({applied})")
     return chat_target
 
@@ -420,12 +496,20 @@ class GibbyLoadOptions(io.ComfyNode):
                 "Connectivity and applies the load: Unsloth Studio via its /load API "
                 "(local copy first, else the Hub repo); llama.cpp/llama-swap ignore it "
                 "because those flags are fixed at server start (set them in "
-                "llama-swap's config.yaml cmd, one entry per variant)."
+                "llama-swap's config.yaml cmd, one entry per variant). Before the load, "
+                "Generate prices the command with Unsloth's own validate / estimate-memory "
+                "probes and sends back the context and GPU-layer count they come to, so a "
+                "context that will not fit this hardware is fitted rather than failed and a "
+                "model the Studio panel already loaded stays loaded instead of reloading. "
+                "Every default is 'ask the server', so a node that was never set changes "
+                "nothing."
             ),
             inputs=[
-                io.Int.Input("context_size", default=40960, min=0, max=1048576, step=1024, tooltip=(
-                    "Context tokens. 0 = let the server pick its default. Unsloth: "
-                    "max_seq_length. Ignored on llama-swap (use -c in config).")),
+                io.Int.Input("context_size", default=0, min=0, max=1048576, step=1024, tooltip=(
+                    "Context tokens. 0 = let the server pick its default (Unsloth fits the "
+                    "window to the free VRAM). A value its estimate says will not fit is "
+                    "lowered to the fitted number. Unsloth: max_seq_length. Ignored on "
+                    "llama-swap (use -c in config).")),
                 io.Combo.Input("speculative", options=["off", "auto", "mtp", "mtp+ngram", "ngram", "dspark", "dflash"],
                                 default="auto", tooltip=(
                     "Speculative decoding mode. 'mtp' = multi-token-prediction drafting "
@@ -444,12 +528,14 @@ class GibbyLoadOptions(io.ComfyNode):
                     "Raw llama-server flags, whitespace-separated, e.g. "
                     "'--jinja --flash-attn -ngl 999'. Unsloth appends them after its own "
                     "flags (last-wins). Ignored on llama-swap.")),
-                io.Int.Input("n_batch", default=512, min=0, max=8192, step=64, tooltip=(
-                    "Prompt processing batch size (llama-server -b). 0 = server default. "
-                    "Ignored on llama-swap (use -b in config).")),
-                io.Int.Input("n_ubatch", default=512, min=0, max=8192, step=64, tooltip=(
-                    "Attention sub-batch size (llama-server -ub). 0 = server default. "
-                    "Ignored on llama-swap (use -ub in config).")),
+                io.Int.Input("n_batch", default=0, min=0, max=8192, step=64, tooltip=(
+                    "Prompt processing batch size (llama-server -b). 0 = llama.cpp's own "
+                    "2048 default; 512 here is slower prompts, not a VRAM saving. Ignored "
+                    "on llama-swap (use -b in config).")),
+                io.Int.Input("n_ubatch", default=0, min=0, max=8192, step=64, tooltip=(
+                    "Attention sub-batch size (llama-server -ub). 0 = server default, which "
+                    "Unsloth raises for a projector llama.cpp aborts on at 512 - pinning it "
+                    "pins that too. Ignored on llama-swap (use -ub in config).")),
                 _OPTIONS_TYPE.Input("options", optional=True, tooltip=(
                     "Upstream options to merge with (e.g. a Sampling Options node). The "
                     "result carries both the sampler fields and this node's load params, "
@@ -464,7 +550,9 @@ class GibbyLoadOptions(io.ComfyNode):
     def execute(cls, context_size, speculative, spec_draft_n_max, kv_cache_quant,
                 draft_kv_cache_quant, extra_args, n_batch=0, n_ubatch=0, options=None):
         # Only non-default values are sent to /load, so the server can use its
-        # own defaults for the rest. The presence of the "load" key is what
+        # own defaults for the rest - and every default below is the "ask the
+        # server" value, so a node left on its widgets asks for nothing Unsloth
+        # would not have picked itself. The presence of the "load" key is what
         # tells Generate to attempt a load at all.
         load: dict[str, Any] = {}
         if context_size > 0:

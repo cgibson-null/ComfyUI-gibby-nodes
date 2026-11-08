@@ -1305,7 +1305,7 @@ function setupDynamicLoraRows(node) {
     filterRow.appendChild(filterInput);
     filterRow.appendChild(clearFilterBtn);
 
-    node.addDOMWidget("lora_filter", "GIBBY_LORA_FILTER", filterRow, {
+    const loraFilterWidget = node.addDOMWidget("lora_filter", "GIBBY_LORA_FILTER", filterRow, {
         getValue: () => globalFilterText,
         setValue: (value) => {
             if (typeof value === "string") {
@@ -1315,6 +1315,12 @@ function setupDynamicLoraRows(node) {
         },
         getHeight: () => ROW_HEIGHT,
     });
+    // View state, and every widget value of this node's prompt is part of the
+    // backend's cache key for it and for everything downstream - so with the
+    // filter in the prompt, one keystroke re-runs the graph. options.serialize
+    // is what the prompt builder reads; the legacy serialize flag, left on,
+    // keeps the filter in the saved workflow.
+    loraFilterWidget.options.serialize = false;
 
     // Update global filter when user types in the filter input
     filterInput.addEventListener("input", () => {
@@ -1567,6 +1573,18 @@ function setupDynamicLoraRows(node) {
         },
         getHeight: () => Math.max(1, rowControllers.length) * ROW_HEIGHT,
     });
+
+    // The rows the prompt carries are the backend's cache key for this node
+    // and every node downstream of it, so they are the rows that actually get
+    // applied - the ones execute() does not skip (lora_loader/__init__.py):
+    // off, empty, or zero strength. Turning a lora off, adding one and leaving
+    // it off, or clearing a row again then reuses the cached run instead of
+    // re-rendering the same image. widget.value keeps every row, so workflows
+    // still save and restore the whole list.
+    rowsWidget.serializeValue = () =>
+        rowControllers
+            .map((c) => c.getValue())
+            .filter((r) => r.on !== false && r.lora && r.lora !== "None" && r.strength);
 
     // Store row data on the widget so it survives node duplication
     // (without modifying widget.value which would trigger setValue recursion)

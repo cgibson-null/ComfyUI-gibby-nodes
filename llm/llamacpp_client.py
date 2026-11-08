@@ -34,6 +34,11 @@ DEFAULT_TIMEOUT = 300
 # Listing models never touches a backend process, just llama-swap's own
 # config -- should return in well under a second even while a model is mid-swap.
 MODELS_TIMEOUT = 10
+# Unsloth's pre-load probes read the GGUF header and price the command without
+# touching weights, which measured well under a second locally; the extra room
+# is for a validate that has to resolve a Hub identifier over the network. A
+# probe that does not answer by then fails the load, so it is not too tight.
+PREFLIGHT_TIMEOUT = 60
 
 
 class LlamaCppError(RuntimeError):
@@ -291,6 +296,41 @@ def _local_identities(entry: dict[str, Any]) -> tuple[str, str] | None:
     if not isinstance(repo_id, str) or not repo_id:
         return None
     return str(cache / "snapshots" / rev), repo_id
+
+
+def unsloth_preflight(
+    base_url: str,
+    endpoint: str,
+    model_path: str,
+    params: dict[str, Any],
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """POST one of Unsloth Studio's two pre-load probes (``"validate"``,
+    ``"estimate-memory"``) and return its JSON.
+
+    Both price a prospective load without loading anything: ``validate`` resolves
+    the identifier (valid or not, ``resident``, GGUF / vision / LoRA, and the
+    header's context and layer counts when asked for), and ``estimate-memory``
+    prices the KV cache, compute buffers and drafter for the exact command,
+    answering with the context (``context_fitted``) and layer count
+    (``gpu_layers``) that command comes to. The load then sends those numbers
+    back, so what is loaded is what was priced.
+
+    Anything other than an answer raises: the caller is about to spend a model
+    load on the command the probe priced, so a server that will not price it is
+    worth knowing about, not loading blind.
+    """
+    try:
+        response = requests.post(
+            f"{_base(base_url)}/api/inference/{endpoint}",
+            json={"model_path": model_path, **params},
+            timeout=PREFLIGHT_TIMEOUT,
+            headers=_auth_headers(api_key),
+        )
+    except requests.RequestException as exc:
+        raise LlamaCppError(f"{endpoint} probe did not answer: {exc}") from exc
+    _raise_for_response(response)
+    return response.json()
 
 
 def unsloth_load(

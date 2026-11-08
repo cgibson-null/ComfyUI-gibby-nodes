@@ -6,7 +6,8 @@ from .crop_inpaint import _KSAMPLER_OPTIONS_TYPE
 #: Mirrors dype_helper.DYPE_PATCH_METHODS.
 _DYPE_METHODS = ["dype", "sega"]
 
-_MODEL_TYPES = ["auto", "flux", "nunchaku", "qwen", "qwen21", "krea2", "zimage", "anima"]
+_MODEL_TYPES = ["auto", "flux", "nunchaku", "qwen", "qwen21", "krea2", "zimage", "anima",
+                "moss", "fibo2"]
 
 
 class GibbyDypeOptions(io.ComfyNode):
@@ -24,7 +25,7 @@ class GibbyDypeOptions(io.ComfyNode):
             ),
             inputs=[
                 io.Combo.Input("model_type", default="auto", options=_MODEL_TYPES,
-                               tooltip="DyPE architecture; auto detects it (krea2 and qwen21 by class name, flux2/klein/flux3 as flux). The native training resolution is derived from it"),
+                               tooltip="DyPE architecture; auto detects it (krea2, qwen21, moss and fibo2 by class name, flux2/klein/flux3 as flux). The native training resolution is derived from it"),
                 io.DynamicCombo.Input("method", options=[
                     io.DynamicCombo.Option("dype", [
                         io.Combo.Input("dype_method", default="vision_yarn", options=["vision_yarn", "yarn", "ntk", "pi", "base"],

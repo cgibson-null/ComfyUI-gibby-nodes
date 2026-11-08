@@ -11,6 +11,7 @@ schema, each living in its own self-contained folder:
 - context/: the CONTEXT object family - Context (bundler), Context Loader (models + params into a full context), Context Override, Sampling Parameters (Context).
 - resolution_latent/: Resize Image / Empty Latent (Context) - empty latent from width/height or aspect ratio + megapixels, resizes linked image/mask to match.
 - seedvr2_upscale.py: SeedVR2 Upscale (Context) - the whole SeedVR2 upscale in one node: resize to the megapixels/scale target (or a target size image), pad, tiled VAE encode, sample with the latent as the SeedVR2 conditioning, split/merge the temporal chunks of a video, decode, then align and color-correct the result back to the resized input.
+- relayvsr_upscale.py: RelayVSR Upscale (Context) - the whole RelayVSR video upscale in one node: the keyframe conditioning, the one step of sampling the model is trained for at cfg 1, and the Flash decoder that restores every frame from the keyframes and the low-quality video; the model's x2/x4 factor is the output size and seed and detail are the only widgets.
 - image_saver/: Image Saver (Context) - saves images with civitai-compatible metadata; settings and lora names come from the context.
 - pipes/: media_pipe.py (the media pipe dict shared between nodes - ref images, keyframes with positions, videos, audios - h3_pipe is it plus the h3 params), h3_pipe.py (H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe, raw refs + keyframes stored, encoded at apply time) and pipe_any.py (Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe).
 - reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to the megapixels target, scaled, encoded with context VAE when ref_latents is on); a text encoder with a vision tower also sees the images at vl_megapixels and the prompts are re-encoded with them, so a t2i model like krea conditions on a reference without any edit path; hidream-o1 and sensenova get the resized image itself instead of a latent, which is what their models read; optionally references the context's own image at its own size; references a media pipe's images and passes the pipe through, appending the wired images to it; without a context it just builds the pipe from the wired images.
@@ -41,6 +42,7 @@ from .any.any_batch_list import GibbyAnyBatchList
 from .any.any_count import GibbyAnyCount
 from .resolution_latent import GibbyEmptyLatentResolution
 from .seedvr2_upscale import GibbySeedvr2Upscale
+from .relayvsr_upscale import GibbyRelayvsrUpscale
 from .image_saver import GibbyImageSaverContext
 from .pipes.h3_pipe import H3PipeCreate, H3PipeApply
 from .reference_latent_context import GibbyReferenceLatentContext
@@ -127,7 +129,7 @@ class GibbyNodesExtension(ComfyExtension):
         # offered when it is installed. dype_installed() is a filesystem check,
         # which answers correctly whichever of the two packs imports first.
         dype_nodes = [GibbyDypeOptions] if dype_installed() else []
-        return [GibbyAnyBatchList, GibbyAnyCount, GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, *dype_nodes, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMaskEdit, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySeedvr2Upscale, GibbySplitTiles, GibbyTiledVaeOptions]
+        return [GibbyAnyBatchList, GibbyAnyCount, GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, *dype_nodes, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMaskEdit, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySeedvr2Upscale, GibbyRelayvsrUpscale, GibbySplitTiles, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:
