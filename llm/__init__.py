@@ -303,20 +303,20 @@ def _pipe_label(pipe: dict, pipe_refs: list, kf_imgs: list, total_images: int) -
     return "Reference material: " + "; ".join(parts) + "."
 
 
-def _content_parts(prompt: str, label: str | None, images_b64: list[str]) -> Any:
+def _content_parts(prompt: str, label: str | None, image_urls: list[str]) -> Any:
     """Build the `content` field for a chat message: plain string if there are
     no images (keeps the request minimal for the common case), or an OpenAI
     content-parts array with the text first, then each image as a data-URI
     `image_url` part."""
-    if not images_b64:
+    if not image_urls:
         return prompt
     parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     if label:
         parts.append({"type": "text", "text": label})
-    for b64 in images_b64:
+    for url in image_urls:
         parts.append({
             "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{b64}"},
+            "image_url": {"url": url},
         })
     return parts
 
@@ -698,21 +698,21 @@ class GibbyGenerate(io.ComfyNode):
         pipe_refs = [value for _index, _name, value in iter_numbered_slots(pipe.get("ref_images") or {}, "ref_image")]
         kf_imgs = list(pipe.get("keyframes") or [])
 
-        images_b64 = []
+        image_urls: list[str] = []
         for image in pipe_refs:
-            images_b64.extend(encode_image_batch(image, max_image_size))
+            image_urls.extend(encode_image_batch(image, max_image_size))
         for keyframe in kf_imgs:
-            images_b64.extend(encode_image_batch(keyframe, max_image_size))
-        slot_b64, _report = collect_reference_images(
+            image_urls.extend(encode_image_batch(keyframe, max_image_size))
+        slot_urls, _report = collect_reference_images(
             {**(images or {}), **(video or {})},
             frames_per_video=frames_per_video,
             max_image_size=max_image_size,
             debug=debug_print,
         )
-        images_b64.extend(slot_b64 or [])
+        image_urls.extend(slot_urls or [])
 
         user_message = {"role": "user", "content": _content_parts(
-            prompt, _pipe_label(pipe, pipe_refs, kf_imgs, len(images_b64)), images_b64)}
+            prompt, _pipe_label(pipe, pipe_refs, kf_imgs, len(image_urls)), image_urls)}
 
         # keep_context: carry this node's earlier turns (text only) into the
         # request so the model continues the conversation. Off -> drop any
@@ -734,7 +734,7 @@ url: {url}
 model: {model}
 system: {system}
 prompt: {prompt}
-images: {len(images_b64)}
+images: {len(image_urls)}
 think: {think}
 previous turns: {len(history)}
 options: {request_options}

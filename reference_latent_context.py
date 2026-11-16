@@ -28,6 +28,17 @@ what core's HiDream-O1 Reference Images attaches, and need no VAE. (That node al
 marks the negative prompt_type=negative - an image-only pass - which this one
 leaves to whoever owns the negative.)
 
+MiniMax's two image models (p-h3-image and MiniMax-H3-Image) take their references
+under minimax_refs instead: a list of {kind, latent_h, latent_w, latent} blocks the
+DiT re-injects every step, which is what core's H3 image conditioning sets, and
+their Qwen tower needs the matching vision copies so the <Picture n> slots are
+filled. Both size a reference on their own grid - p-h3-image inside the vision
+pixel budget and the generation area, MiniMax-H3-Image at a 1024 short edge for
+Qwen and 1024-2048 for the VAE - so megapixels and scale resize the picture first
+and the model's own cap applies to the result. They share the DiT class, so the
+text encoder tells them apart. p-h3-image wants its edit prompt prefixed with
+"Edit <Picture 1>. " - that text belongs in the prompt, so the node leaves it alone.
+
 Qwen Image 2.1 splices the latents at the vision slots, so it floors the size to
 2x the VAE's downscale ratio - every slot covers 2x2 latents - and shares one size
 between the encoder and the VAE. Fibo 2.0 shares it too for the opposite reason:
@@ -64,15 +75,34 @@ append to the pipe and the context passes through empty.
 """
 
 import comfy.model_base
+import comfy.text_encoders.minimax
 import node_helpers
 from nodes import ConditioningZeroOut
 from comfy_api.latest import io
+from comfy_extras.nodes_minimax_h3 import (
+    IMAGE_REF_SHORT_EDGE, IMAGE_REF_VAE_MAX_SHORT_EDGE,
+    PH3_IMAGE_SIZE, PH3_IMAGE_VISION_PIXELS, _resize_to, _size_short_edge, _size_within_area,
+)
 
-from .context import (_CONTEXT_TYPE, _clip_takes_images, _is_model, recondition_prompts, _latent_downscale,
-                      ctx_from, ctx_set_image, encode_image, _tiled_settings, _tiled_for)
+from .context import (_CONTEXT_TYPE, _clip_takes_images, _is_model, ctx_size, recondition_prompts,
+                      _latent_downscale, ctx_from, ctx_set_image, encode_image, _tiled_settings, _tiled_for)
 from .ksampler_options.crop_inpaint import _KSAMPLER_OPTIONS_TYPE
 from .pipes.media_pipe import iter_numbered_slots, pipe_add_images
 from .resolution_latent import _resize_image_to_mp
+
+
+def _h3_ref_sizes(is_ph3, area):
+    """The two sizing rules core's H3 image conditioning uses, as
+    (vision_size, vae_size) callables of a reference's (width, height):
+    p-h3-image keeps a reference inside the vision pixel budget and the generation
+    area, MiniMax-H3-Image puts its short edge on 1024 for Qwen and inside
+    1024-2048 for the VAE. Both round to the 32px canvas grid."""
+    if is_ph3:
+        area = area or PH3_IMAGE_SIZE ** 2
+        return (lambda w, h: _size_within_area(w, h, PH3_IMAGE_VISION_PIXELS),
+                lambda w, h: _size_within_area(w, h, area))
+    return (lambda w, h: _size_short_edge(w, h, IMAGE_REF_SHORT_EDGE, IMAGE_REF_SHORT_EDGE),
+            lambda w, h: _size_short_edge(w, h, IMAGE_REF_SHORT_EDGE, IMAGE_REF_VAE_MAX_SHORT_EDGE))
 
 
 def _over_white(image):
@@ -103,6 +133,9 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                 "vl_megapixels, so a t2i model (krea) conditions on them with "
                 "ref_latents off. HiDream-O1 and SenseNova get the image itself "
                 "rather than a latent, which is what their models read. "
+                "p-h3-image and MiniMax-H3-Image are referenced as minimax_refs "
+                "blocks and Qwen vision copies, each sized on its own grid, and "
+                "p-h3-image wants the 'Edit <Picture 1>. ' prefix in the prompt. "
                 "ref_ctx_img also references the context's own image: always when "
                 "no image is connected, otherwise only when enabled - it leads at its own size, "
                 "and with no context image the first image becomes the context image and is stored back. "
@@ -162,7 +195,7 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                     max=20.0,
                     step=0.01,
                     optional=True,
-                    tooltip="Size the text encoder sees the images at; 0 reuses the VAE-sized image. Ignored by qwen 2.1, whose encoder and VAE must share one size so every vision slot covers 2x2 latents, and by fibo 2.0, whose tokenizer does its own training-time resize."
+                    tooltip="Size the text encoder sees the images at; 0 reuses the VAE-sized image. Ignored by qwen 2.1, whose encoder and VAE must share one size so every vision slot covers 2x2 latents, by fibo 2.0, whose tokenizer does its own training-time resize, and by the MiniMax H3 image models, which size the Qwen copy themselves."
                 ),
                 io.Boolean.Input(
                     "ref_ctx_img",
@@ -220,6 +253,15 @@ class GibbyReferenceLatentContext(io.ComfyNode):
 
         is_qwen21 = _is_model(model, comfy.model_base.QwenImage21)
         is_fibo2 = _is_model(model, comfy.model_base.Fibo2)
+        # MiniMax's two image models take their references as minimax_refs blocks plus the
+        # Qwen vision copies, never as reference_latents. They share the DiT class and the
+        # text encoder is what tells them apart (p-h3-image is the Qwen3-VL-4B one).
+        h3_image = _is_model(model, comfy.model_base.MiniMaxH3Image)
+        is_ph3 = isinstance(getattr(context.get("clip"), "tokenizer", None),
+                            comfy.text_encoders.minimax.PH3ImageTokenizer)
+        gen_w, gen_h = ctx_size(context)
+        vision_size, vae_size = _h3_ref_sizes(is_ph3, gen_w * gen_h)
+        refs_key = "minimax_refs" if h3_image else "reference_latents"
         # flux3's Qwen3-VL encoder can see images but was trained text-only, and its
         # DiT splices nothing into the sequence, so it takes the latents alone
         vl_refs = _clip_takes_images(context.get("clip")) and not _is_model(model, comfy.model_base.Flux3)
@@ -239,6 +281,17 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         images_vl = []
 
         def add_ref(resized):
+            if h3_image:
+                # one picture twice over: the Qwen copy opens the <Picture n> vision tokens,
+                # the VAE copy is the ref block the DiT re-injects every step
+                w, h = resized.shape[2], resized.shape[1]
+                if vl_refs:
+                    images_vl.append(_resize_to(resized[:1], vision_size(w, h)))
+                if ref_latents:
+                    latent = encode_image(vae, _resize_to(resized[:1], vae_size(w, h)))["samples"]
+                    refs.append({"kind": "image", "latent_h": latent.shape[-2],
+                                 "latent_w": latent.shape[-1], "latent": latent})
+                return
             if vl_refs:
                 # qwen2.1 must see the exact image the VAE encodes, fibo2 resizes its
                 # own copy to the trained grid; the others take the much smaller copy
@@ -263,6 +316,12 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         for image in extras:
             add_ref(_resize_image_to_mp(image, megapixels, scale, multiple))
 
+        # MiniMax-H3-Image trains on "Picture n: " where its tokenizer defaults to
+        # "<Picture n>: "; _recondition_text reads the label off the context, so the
+        # sampler's later re-encodes of the prompt use it too.
+        if h3_image and not is_ph3:
+            context = dict(context, h3_picture_label="Picture %d: ")
+
         # qwen2.1 splices the latents at the vision slots, so the text must be encoded
         # with the images and the tokens dropped; the other encoders keep the tokens and
         # condition on them, which is all a model without the edit path can do.
@@ -279,7 +338,7 @@ class GibbyReferenceLatentContext(io.ComfyNode):
 
         # Update positive conditioning
         if positive is not None and refs:
-            positive = node_helpers.conditioning_set_values(positive, {"reference_latents": refs})
+            positive = node_helpers.conditioning_set_values(positive, {refs_key: refs})
             ctx["positive"] = positive
 
         # cfg 1 never runs the negative, so a negative the context carries is kept
@@ -289,7 +348,7 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         # re-encode away
         if refs:
             if negative:
-                ctx["negative"] = node_helpers.conditioning_set_values(negative, {"reference_latents": refs})
+                ctx["negative"] = node_helpers.conditioning_set_values(negative, {refs_key: refs})
             elif cfg == 1.0 and positive is not None:
                 ctx["negative"], = ConditioningZeroOut().zero_out(positive)
 

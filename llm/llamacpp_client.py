@@ -176,6 +176,17 @@ def chat_completion(
         headers=_auth_headers(api_key),
     )
     elapsed_s = time.monotonic() - start
+    if response.status_code == 413:
+        # A body the server refuses to read usually comes back with no
+        # explanation attached at all, and the one number that explains the run
+        # is the size the client just sent -- the limit is a server setting.
+        sent = len(response.request.body or b"")
+        raise LlamaCppError(
+            f"HTTP 413 from {response.url}: this request is {sent / 2**20:.0f} MiB, more than the server "
+            "takes. Send less at a time -- a smaller max_image_size, fewer frames_per_video, fewer "
+            "reference images -- or raise the server's own limit (llama-server "
+            "--limit-request-size; a proxy or server behind it sets its own)."
+        )
     _raise_for_response(response)
     return response.json(), elapsed_s
 

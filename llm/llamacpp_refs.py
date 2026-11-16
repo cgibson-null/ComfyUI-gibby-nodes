@@ -8,8 +8,8 @@ message, each one a still image. So every "video" reference still has to be
 reduced to a handful of representative frames before it can reach the model,
 exactly like it did for Ollama.
 
-This module funnels arbitrary reference material into a flat list of base64
-PNGs. What the caller does with that list (Ollama's ``images`` field vs.
+This module funnels arbitrary reference material into a flat list of image
+data URLs. What the caller does with that list (Ollama's ``images`` field vs.
 llama.cpp's ``image_url`` content parts) is none of this module's business --
 it is ported unchanged from ``ollama_refs.py`` in the Ollama-Enhanced pack,
 because none of this logic was ever Ollama-specific to begin with.
@@ -113,14 +113,21 @@ def _downscale(image: Image.Image, max_size: int) -> Image.Image:
     return image.resize(new_size, Image.LANCZOS)
 
 
-def pil_to_b64(image: Image.Image, max_size: int = 0) -> str:
-    """Encode a PIL image as a base64 PNG string, optionally downscaled first."""
+def pil_to_data_url(image: Image.Image, max_size: int = 0) -> str:
+    """Encode a PIL image as a JPEG data URL, optionally downscaled first.
+
+    JPEG rather than PNG because a vision model reads a picture at its own patch
+    grid: the lossless PNG of a 4K render is 23 MiB of base64 against the 3 MiB
+    of its JPEG and carries nothing the model can use for it, while the size is
+    what walks a run of references into the server's request-body limit (HTTP
+    413). Alpha is dropped -- the vision tower has no use for it.
+    """
     image = _downscale(image, max_size)
-    if image.mode not in ("RGB", "RGBA", "L"):
+    if image.mode not in ("RGB", "L"):
         image = image.convert("RGB")
     buffered = BytesIO()
-    image.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+    image.save(buffered, format="JPEG", quality=90)
+    return "data:image/jpeg;base64," + base64.b64encode(buffered.getvalue()).decode("ascii")
 
 
 # --------------------------------------------------------------------------
@@ -136,17 +143,17 @@ def _is_frame_batch(value: Any) -> bool:
 def encode_image_batch(value: Any, max_size: int = 0) -> list[str]:
     """Encode every frame of an IMAGE batch. No sub-sampling -- matches upstream."""
     if _is_frame_batch(value):
-        return [pil_to_b64(_frame_tensor_to_pil(frame), max_size) for frame in value]
+        return [pil_to_data_url(_frame_tensor_to_pil(frame), max_size) for frame in value]
     if isinstance(value, (list, tuple)):
         out: list[str] = []
         for item in value:
             out.extend(encode_image_batch(item, max_size))
         return out
     if isinstance(value, Image.Image):
-        return [pil_to_b64(value, max_size)]
+        return [pil_to_data_url(value, max_size)]
     # A lone [H, W, C] tensor.
     if getattr(value, "shape", None) is not None and len(value.shape) == 3:
-        return [pil_to_b64(_frame_tensor_to_pil(value), max_size)]
+        return [pil_to_data_url(_frame_tensor_to_pil(value), max_size)]
     raise TypeError(f"Unsupported image input of type {type(value).__name__}")
 
 
@@ -203,7 +210,7 @@ def _sample_video_with_pyav(video: Any, frames: int, max_size: int) -> list[str]
             for target in targets:
                 image = _decode_frame_at(container, stream, target)
                 if image is not None:
-                    encoded.append(pil_to_b64(image, max_size))
+                    encoded.append(pil_to_data_url(image, max_size))
             return encoded or None
     except Exception as exc:
         logger.debug("Gibby-LLM: PyAV sampling failed (%s), falling back", exc)
@@ -234,7 +241,7 @@ def _decode_frame_at(container: Any, stream: Any, seconds: float) -> Image.Image
 
 
 def encode_video(value: Any, frames: int, max_size: int = 0) -> list[str]:
-    """Reduce one video reference to ``frames`` evenly-spaced base64 PNGs.
+    """Reduce one video reference to ``frames`` evenly-spaced image data URLs.
 
     Accepts either a ComfyUI ``VIDEO`` object or a raw IMAGE batch (what
     VideoHelperSuite's Load Video hands back as frames).
@@ -244,7 +251,7 @@ def encode_video(value: Any, frames: int, max_size: int = 0) -> list[str]:
     # Raw frame batch (VHS and friends) -- index-sample directly.
     if _is_frame_batch(value):
         indices = evenly_spaced_indices(int(value.shape[0]), frames)
-        return [pil_to_b64(_frame_tensor_to_pil(value[i]), max_size) for i in indices]
+        return [pil_to_data_url(_frame_tensor_to_pil(value[i]), max_size) for i in indices]
 
     # Native VIDEO object -- try the memory-safe seek path first.
     if hasattr(value, "get_components"):
@@ -253,7 +260,7 @@ def encode_video(value: Any, frames: int, max_size: int = 0) -> list[str]:
             return sampled
         images = value.get_components().images
         indices = evenly_spaced_indices(int(images.shape[0]), frames)
-        return [pil_to_b64(_frame_tensor_to_pil(images[i]), max_size) for i in indices]
+        return [pil_to_data_url(_frame_tensor_to_pil(images[i]), max_size) for i in indices]
 
     # Anything else: let the image path have a go (lists, PIL, single frame).
     return encode_image_batch(value, max_size)
@@ -269,9 +276,9 @@ def collect_reference_images(
     max_image_size: int = 0,
     debug: bool = False,
 ) -> tuple[list[str] | None, list[str]]:
-    """Turn every populated image/video slot into one flat list of base64 PNGs.
+    """Turn every populated image/video slot into one flat list of image data URLs.
 
-    Returns ``(images_b64, report)``. ``images_b64`` is ``None`` when nothing
+    Returns ``(image_urls, report)``. ``image_urls`` is ``None`` when nothing
     was connected. The caller decides how to attach that list to a request --
     see ``LLMConnect.py`` for the ``image_url`` content-part wrapping.
     ``report`` is a per-slot human-readable summary for debug output.

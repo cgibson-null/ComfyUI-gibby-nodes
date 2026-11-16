@@ -24,6 +24,10 @@ because the conditioning is a trained embedding rather than a prompt, and under
 noise, so the seed is the one degree of freedom the sampler keeps, and `detail`
 is how much of the detail the decoder adds to the bicubic upscale of each frame
 is kept.
+
+The context's audio is handed straight back out: the upscale is spatial only and
+keeps every frame, so a soundtrack still lines up with the result and does not
+have to be routed around the node.
 """
 
 import folder_paths
@@ -68,7 +72,9 @@ class GibbyRelayvsrUpscale(io.ComfyNode):
                 "Sampling is fixed at euler/simple, 1 step, cfg 1 and denoise 1.0, which is what the model "
                 "is distilled for; at one step every usable scheduler starts at the same sigma. The seed is "
                 "the degree of freedom the sampler keeps, and detail is how much of the detail the decoder "
-                "adds to the bicubic upscale of each frame is kept (0 = bicubic)."
+                "adds to the bicubic upscale of each frame is kept (0 = bicubic). "
+                "The context's audio is output untouched - the upscale is spatial only and keeps every "
+                "frame, so the soundtrack still lines up."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True, tooltip="Provides the image, model and VAE when the inputs below are not connected; the output context carries the upscaled image"),
@@ -81,6 +87,7 @@ class GibbyRelayvsrUpscale(io.ComfyNode):
             outputs=[
                 _CONTEXT_TYPE.Output(display_name="context"),
                 io.Image.Output(display_name="image"),
+                io.Audio.Output(display_name="audio"),
             ],
         )
 
@@ -116,4 +123,4 @@ class GibbyRelayvsrUpscale(io.ComfyNode):
         out = decoded.reshape(*image.shape[:2], *decoded.shape[-3:]) if image.dim() == 5 else decoded
 
         ctx_set_sampled_image(ctx, out)
-        return io.NodeOutput(ctx, out)
+        return io.NodeOutput(ctx, out, ctx.get("audio"))

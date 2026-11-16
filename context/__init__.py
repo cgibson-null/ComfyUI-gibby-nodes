@@ -255,9 +255,16 @@ def _is_flux2(model_obj):
 
 def _is_flux2_latent(model_obj):
     """Whether a model wrapper (ModelPatcher) wants Flux2's 128ch /16x latents.
-    Flux3 and Fibo 2.0 share the Flux2 latent format but keep their own constant
-    shift, so the latent format and the schedule ask with different predicates."""
-    return _is_model(model_obj, (comfy.model_base.Flux2, comfy.model_base.Flux3, comfy.model_base.Fibo2))
+    The model's latent format decides, not its class: MOSS image shares the format
+    without sharing a base class, while Flux3 and Fibo 2.0 share it but keep their
+    own constant shift - so the latent format and the schedule ask with different
+    predicates. A wrong answer here costs a silent nearest-exact rescale of the
+    empty latent (comfy.sample.fix_empty_latent_channels) and a start log that
+    measures the latent with the VAE's 16x ratio instead of the 8x one it was
+    built at."""
+    fmt = getattr(getattr(model_obj, "model", None), "latent_format", None)
+    return (getattr(fmt, "latent_channels", None) == 128
+            and getattr(fmt, "spacial_downscale_ratio", None) == 16)
 
 
 def _clip_takes_images(clip):
@@ -273,7 +280,7 @@ def _clip_takes_images(clip):
 
 def empty_latent(width, height, batch_size=1, flux2=None, model_obj=None):
     """An empty latent dict for width x height: the 128ch /16x Flux2 one when
-    flux2 (or model_obj is a Flux2/Flux3/Fibo2 model), else the standard 4ch /8x one."""
+    flux2 (or model_obj's latent format is that), else the standard 4ch /8x one."""
     if flux2 is None:
         flux2 = _is_flux2_latent(model_obj)
     if flux2:
@@ -384,10 +391,17 @@ def _recondition_text(clip, base_cond, text, ctx, images=None, keep_vision=False
     ref_items = ctx.get("h3_ref_items")
     kf_imgs = ctx.get("h3_kf_imgs")
     if ref_items:
-        tokens = clip.tokenize(text, minimax_ref_items=ref_items)
+        # an h3 pipe that relabels its picture references has to be re-encoded the way
+        # it was encoded, or the labels change under the conditioning it came from
+        label = ctx.get("h3_picture_label")
+        tokens = (clip.tokenize(text, images=[item["data"] for item in ref_items], picture_label=label)
+                  if label else clip.tokenize(text, minimax_ref_items=ref_items))
         return _graft_conds(base_cond, clip.encode_from_tokens_scheduled(tokens))
     if images:
-        tokens = clip.tokenize(text, images=images, keep_vision=keep_vision, prevent_empty_text=True)
+        # h3_picture_label is set for the models whose prompt template differs from
+        # their tokenizer's default label (MiniMax-H3-Image: "Picture n: ")
+        label = {"picture_label": ctx["h3_picture_label"]} if ctx.get("h3_picture_label") else {}
+        tokens = clip.tokenize(text, images=images, keep_vision=keep_vision, prevent_empty_text=True, **label)
         if not _images_in_tokens(tokens):
             logging.warning(f"{type(clip.tokenizer).__name__} put no images in the tokens: the reference images are dropped and the prompt conditions on text alone.")
         return _graft_conds(base_cond, clip.encode_from_tokens_scheduled(tokens))

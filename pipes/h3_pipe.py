@@ -22,6 +22,15 @@ from comfy_extras.nodes_minimax_h3 import (
 from ..context import _CONTEXT_TYPE, ctx_from, ctx_set_latent
 from .media_pipe import iter_numbered_slots
 
+# How the picture references are introduced to the text encoder. Core's ref2va label,
+# "<Picture %d>: ", is byte for byte its fl2va template - the two-frame conditioning -
+# so a run with exactly two references reads to the model as "these are the video's
+# first and last frames" and it reproduces them at the ends. This pack has separate
+# first_frame/last_frame inputs, so a reference is never a frame anchor and the labels
+# have to say so. <Picture n> stays in the text, since that is the tag a prompt uses
+# to name a reference.
+REF_LABEL = "<Picture %d> (reference): "
+
 
 def _snap_frames(n):
     """Frame count snapped down to MiniMax H3's 17k+5 requirement."""
@@ -216,9 +225,16 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
         keyframes.append((idx, _resize(img, kf_width, kf_height, "center")))
     keyframes.sort(key=lambda pair: pair[0])
 
-    # Tokenize prompt with refs, or with the start/end keyframes as reference images
+    # Tokenize prompt with refs, or with the start/end keyframes as reference images.
+    # Image references go through the tokenizer's own label rather than core's ref2va
+    # presentation, which is what makes them collide with first/last-frame conditioning;
+    # audio and video references need that presentation for their ordering, so a pipe
+    # carrying them keeps core's labels.
     kf_imgs = []
-    if ref_items:
+    ref_label = REF_LABEL if ref_items and all(item["type"] == "image" for item in ref_items) else ""
+    if ref_label:
+        tokens = clip.tokenize(prompt, images=[item["data"] for item in ref_items], picture_label=ref_label)
+    elif ref_items:
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
     else:
         for idx, img in keyframes:
@@ -240,7 +256,7 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
         cond = node_helpers.conditioning_set_values(cond, values)
 
     latent, _ = _empty_av_latent(kf_width, kf_height, length)
-    return cond, latent, ref_items, kf_imgs
+    return cond, latent, ref_items, kf_imgs, ref_label
 
 
 class H3PipeCreate(io.ComfyNode):
@@ -441,7 +457,7 @@ class H3PipeApply(io.ComfyNode):
 
         tw = target_width if target_width > 0 else None
         th = target_height if target_height > 0 else None
-        cond, latent, ref_items, kf_imgs = _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, tw, th)
+        cond, latent, ref_items, kf_imgs, ref_label = _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, tw, th)
 
         # Store results back in context
         ctx["positive"] = cond
@@ -453,5 +469,8 @@ class H3PipeApply(io.ComfyNode):
         # images, so a prompt re-encode reuses them instead of re-deriving the media.
         ctx["h3_ref_items"] = ref_items
         ctx["h3_kf_imgs"] = kf_imgs
+        if ref_label:
+            # so a prompt re-encode labels the pictures the way the pipe did
+            ctx["h3_picture_label"] = ref_label
 
         return io.NodeOutput(ctx, cond, latent, pipe)
