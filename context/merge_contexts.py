@@ -25,9 +25,9 @@ class GibbyMergeContexts(io.ComfyNode):
             category="gibby/context",
             search_aliases=["merge", "combine", "context"],
             description=(
-                "Merges contexts into one: the 1st provided context is the base, then each "
-                "following context overrides its fields in order. A value overrides only when "
-                "it is set - None, zero and empty string keep the base's value."
+                "Merges contexts into one: the 1st is the base, then each following context overrides its fields "
+                "in order. A value overrides only when it is set - None, zero and empty string keep the base's "
+                "value."
             ),
             inputs=[
                 io.Autogrow.Input("contexts", template=template),

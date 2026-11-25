@@ -16,6 +16,8 @@ context's own conditioning, which is built from the plan's first step so the
 travel syntax is never encoded as literal text.
 """
 
+import logging
+
 
 def _find_matching(text, start, open_ch, close_ch):
     """The index of the closing char matching the opening char at start; -1 when unbalanced."""
@@ -48,15 +50,10 @@ def _split_travel(text):
 
 
 def _parse_travel_group(content):
-    """The parsed contents of a [...] group:
-    - [before:after:step] -> a (before, after, step) switch; before is active until
-      the step, after from it on (step with a dot=fraction of steps, without=absolute).
-    - [before:after:step:radius] -> a ("blend", before, after, step, radius) crossfade:
-      the prompts mix linearly around the step, radius is how many steps each side
-      stays pure (with a dot a fraction of the steps).
-    - [before:after] or [before:after|period] -> an ("alt", before, after, period)
-      alternate that flips between before and after; period is how many steps each
-      side stays active (default 1, with a dot a fraction of the steps).
+    """The parsed contents of a [...] group, as (before, after, step) for a switch,
+    ("blend", before, after, step, radius) for a crossfade, or ("alt", before, after,
+    period) for an alternate; a step or period with a dot is a fraction of the steps,
+    without one it is absolute, and radius is how many steps each side stays pure.
     Otherwise the content is plain text."""
     parts = _split_travel(content)
     if len(parts) == 2:
@@ -149,6 +146,13 @@ def _resolve_travel_step(node, steps_value):
             max(0, min(steps_value, val)))
 
 
+# N nested crossfades make 2^N prompt products and every distinct one gets
+# encoded: 16 groups is 65536 encodes, which looks like a frozen ComfyUI. The
+# heaviest pieces carry the blend, so the cap costs a softer crossfade instead.
+_MAX_MIX_PIECES = 32
+_mix_pieces_warned = False
+
+
 def _pieces(item):
     """A rendered prompt piece as (text, weight) endpoints: a plain string is a
     single full-strength endpoint, a ("mix", ...) item its endpoints."""
@@ -164,10 +168,20 @@ def _mix_pieces(a, b, w):
 def _fold_pieces(items):
     """Join a sequence of prompt pieces into one prompt: the endpoints are the
     cartesian product of the pieces' endpoints with multiplied weights; a single
-    endpoint collapses back to a plain string."""
+    endpoint collapses back to a plain string. The product is capped - see
+    _MAX_MIX_PIECES."""
+    global _mix_pieces_warned
     out = [("", 1.0)]
     for item in items:
         out = [(t + t2, wt * wt2) for t, wt in out for t2, wt2 in _pieces(item)]
+        if len(out) > _MAX_MIX_PIECES:
+            if not _mix_pieces_warned:
+                _mix_pieces_warned = True
+                logging.warning(f"[Gibby Prompt Travel] too many nested crossfades in one prompt: "
+                                f"encoding only the {_MAX_MIX_PIECES} heaviest combinations per step")
+            kept = sorted(out, key=lambda p: -p[1])[:_MAX_MIX_PIECES]
+            total = sum(wt for _t, wt in kept) or 1.0
+            out = [(t, wt / total) for t, wt in kept]
     return out[0][0] if len(out) == 1 else ("mix", out)
 
 

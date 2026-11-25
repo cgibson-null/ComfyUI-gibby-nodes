@@ -2,6 +2,7 @@
 
 - H3PipeCreate: stores raw reference media + config in a reusable h3_pipe dict.
 - H3PipeApply: clip + vaes + h3_pipe → conditioning + latent (all VAE encoding happens here).
+  A context that already carries an H3 AV latent keeps it and only gains the conditioning.
 
 The h3_pipe is a media pipe - ref_images, keyframes with their position spec,
 ref_videos (+ soundtracks), ref_audios - plus the h3 params (prompt, width,
@@ -15,12 +16,13 @@ import nodes
 import node_helpers
 import comfy.audio
 from comfy_api.latest import io
+from comfy.ldm.minimax.model import FRAME_RESCALE
 from comfy_extras.nodes_minimax_h3 import (
-    _empty_av_latent, _resize, adapt_canvas,
-    CANVAS_MULTIPLE, REF_IMAGE_SHORT_EDGE, FPS,
+    _empty_av_latent, _resize, adapt_canvas, temporal_shape,
+    CANVAS_MULTIPLE, REF_IMAGE_SHORT_EDGE, FPS, AUDIO_LATENT_FPS,
 )
 from ..context import _CONTEXT_TYPE, ctx_from, ctx_set_latent
-from .media_pipe import iter_numbered_slots
+from ..pipes.media_pipe import iter_numbered_slots
 
 # How the picture references are introduced to the text encoder. Core's ref2va label,
 # "<Picture %d>: ", is byte for byte its fl2va template - the two-frame conditioning -
@@ -93,9 +95,9 @@ def _assemble_keyframes(first_frame, last_frame, keyframes, indices, even_distri
                 len(parsed), len(batch), mid))
         parsed, batch = parsed[:mid], batch[:mid]
         if first_frame is not None and any(_is_first_pos(p) for p in parsed):
-            logging.warning("WARNING: H3 Pipe Create: first frame and a keyframe both anchor frame 0 - keeping both")
+            logging.warning("WARNING: H3 Pipe Create: first frame and a keyframe both anchor frame 0 - the first frame anchors it and the keyframe is dropped")
         if last_frame is not None and any(_is_last_pos(p) for p in parsed):
-            logging.warning("WARNING: H3 Pipe Create: last frame and a keyframe both anchor the last frame - keeping both")
+            logging.warning("WARNING: H3 Pipe Create: last frame and a keyframe both anchor the last frame - the last frame anchors it and the keyframe is dropped")
 
     images = []
     if first_frame is not None:
@@ -117,7 +119,7 @@ def _assemble_keyframes(first_frame, last_frame, keyframes, indices, even_distri
 
     if loop:
         if not even_distribution and any(_is_last_pos(p) for p in parsed):
-            logging.warning("WARNING: H3 Pipe Create: loop anchors the first keyframe at the last frame, which already has a keyframe - keeping both")
+            logging.warning("WARNING: H3 Pipe Create: loop anchors the first keyframe at the last frame, which already has a keyframe - the loop anchor takes the last frame and the other is dropped")
         images.append(images[0])
         positions.append(-1)
 
@@ -134,6 +136,47 @@ def _resolve_keyframe_index(pos, frame_count):
     if idx < 0 or idx >= frame_count:
         raise ValueError("keyframe index {} is outside the video's {} frames".format(pos, frame_count))
     return idx
+
+
+def _audio_guide_keyframes(audio_vae, frame_count, audio_t, tracks, positions):
+    """Audio tracks -> keyframe entries that pin sound onto the clip's timeline.
+
+    A keyframe's audio window starts at FRAME_RESCALE * frame and runs forward one
+    40 Hz step per row, so each track is bounded by the next track and by the end
+    of the clip's audio, and the tail is what gets cut: the anchor coordinate IS
+    the track's start, so trimming the head would move content the user pinned to
+    an instant. Tracks cannot be blended, because blending two pinned windows
+    means two different contents at the same audio coordinates, so a track that
+    lands on an instant another track already owns is dropped rather than merged.
+    """
+    if len(positions) < len(tracks):
+        logging.warning("WARNING: H3 Pipe Apply: {} audio tracks with {} positions - the tracks left over anchor frame 0".format(len(tracks), len(positions)))
+
+    guides = []
+    for slot, audio in enumerate(tracks):
+        pos = positions[slot] if slot < len(positions) else 0
+        guides.append([_resolve_keyframe_index(pos, frame_count), slot + 1, audio])
+    guides.sort(key=lambda guide: (guide[0], guide[1]))
+
+    audio_end = math.ceil(audio_t / FRAME_RESCALE)
+    out = []
+    for n, (idx, slot, audio) in enumerate(guides):
+        # how far the window may reach: to the next track, or to the clip's audio end
+        room = math.floor(audio_t - FRAME_RESCALE * idx)
+        limit = "the clip's audio ends at frame {}".format(audio_end)
+        if n + 1 < len(guides):
+            gap = math.floor(FRAME_RESCALE * (guides[n + 1][0] - idx))
+            if gap < room:
+                room, limit = gap, "keyaudio_{} anchors frame {}".format(guides[n + 1][1], guides[n + 1][0])
+        if room < 1:
+            logging.warning("WARNING: H3 Pipe Apply: keyaudio_{} anchors frame {} on top of the track anchored there before it - two pinned windows cannot share an instant, so this track is dropped".format(slot, idx))
+            continue
+        z, rt = _encode_ref_audio(audio_vae, audio)
+        if room < rt:
+            z = z[..., :room].clone()
+            logging.warning("WARNING: H3 Pipe Apply: keyaudio_{} is cut from {:.2f}s to {:.2f}s because {}".format(slot, rt / AUDIO_LATENT_FPS, room / AUDIO_LATENT_FPS, limit))
+        out.append({"resolved_frame_index": idx, "audio_latent": z})
+    return out
 
 
 def _build_ref_blocks_and_items(vae, audio_vae, frame_count, width, height, ref_image_size,
@@ -189,12 +232,26 @@ def _build_ref_blocks_and_items(vae, audio_vae, frame_count, width, height, ref_
     return ref_items, ref_blocks
 
 
-def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, target_height=None):
+def _is_av_latent(latent):
+    """Whether a latent dict already holds a MiniMax H3 AV pair - what a node that
+    owns the clip's latent leaves on the context (H3 Timeline's target, an upscaled
+    pass). An image latent or nothing is not one, and still gets the pipe's empty
+    AV latent."""
+    samples = latent.get("samples") if isinstance(latent, dict) else None
+    if not getattr(samples, "is_nested", False) or len(samples.tensors) != 2:
+        return False
+    video = samples.tensors[0]
+    return video.ndim == 5 and video.shape[1] == 24
+
+
+def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, target_height=None,
+                                latent=None):
     """Shared helper: take clip + vaes + h3_pipe → conditioning + latent.
 
     Encodes all refs from raw media stored in pipe at apply time.
     If target_width/target_height provided, the keyframes and the latent
     are created at that resolution instead of the pipe's.
+    A given latent is returned as the node's latent instead of an empty one.
     """
     prompt = pipe["prompt"]
     width = pipe["width"]
@@ -210,8 +267,9 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
     ref_image_size = pipe.get("ref_image_size", "match")
 
     # Build refs from raw media stored in pipe (encoding happens here)
-    if audio_vae is None and (pipe.get("ref_audios") or pipe.get("ref_video_audios")):
-        raise ValueError("H3 Pipe Apply: the pipe has reference audios but no audio VAE - "
+    if audio_vae is None and (pipe.get("ref_audios") or pipe.get("ref_video_audios")
+                              or pipe.get("keyaudio")):
+        raise ValueError("H3 Pipe Apply: the pipe has audio but no audio VAE - "
                          "connect one to the audio_vae input (or provide it in the context)")
     ref_items, ref_blocks = _build_ref_blocks_and_items(
         vae, audio_vae, frame_count, width, height, ref_image_size,
@@ -225,6 +283,28 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
         keyframes.append((idx, _resize(img, kf_width, kf_height, "center")))
     keyframes.sort(key=lambda pair: pair[0])
 
+    # One image per end instant: two keyframes on the same frame carry the same time
+    # coordinate and different pixels, which the model resolves into a blend, and fl2va
+    # has room for two pictures in the prompt at most - "<Picture 1>" is the video's
+    # first frame, "<Picture 2>" its last. So frame 0 keeps its earliest claim and the
+    # last frame its latest, where first_frame and last_frame sit in the batch
+    # _assemble_keyframes builds; any other claim at those instants is dropped.
+    head = [i for i, pair in enumerate(keyframes) if pair[0] == 0]
+    tail = [i for i, pair in enumerate(keyframes) if pair[0] == frame_count - 1]
+    keep = set(head[:1]) | set(tail[-1:])
+    hidden = len(head) + len(tail) - len(keep)
+    if hidden:
+        logging.warning("WARNING: H3 Pipe Apply: {} keyframe(s) anchor the first/last frame on top of a frame anchor - each end anchors one image, so the frame anchor wins there and the rest are dropped".format(hidden))
+        keyframes = [pair for i, pair in enumerate(keyframes)
+                     if i in keep or pair[0] not in (0, frame_count - 1)]
+
+    # The pinned audio tracks anchor on the same timeline as the keyframes, as the
+    # audio half of a keyframe; the bound is the audio length of the latent this
+    # call hands back, not the frame count, since the two round differently.
+    guides = _audio_guide_keyframes(audio_vae, frame_count, temporal_shape(length)[2],
+                                    pipe.get("keyaudio") or [],
+                                    pipe.get("keyaudio_positions") or [])
+
     # Tokenize prompt with refs, or with the start/end keyframes as reference images.
     # Image references go through the tokenizer's own label rather than core's ref2va
     # presentation, which is what makes them collide with first/last-frame conditioning;
@@ -237,6 +317,7 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
     elif ref_items:
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
     else:
+        # The end anchors, if any, are the prompt's first and last frame pictures.
         for idx, img in keyframes:
             if idx in (0, frame_count - 1):
                 kf_imgs.append(img)
@@ -246,16 +327,18 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
 
     # Attach keyframe latents and refs to conditioning
     values = {}
-    if keyframes:
-        values["minimax_keyframes"] = [{"resolved_frame_index": idx, "latent": vae.encode(img)}
-                                       for idx, img in keyframes]
+    blocks = [{"resolved_frame_index": idx, "latent": vae.encode(img)}
+              for idx, img in keyframes] + guides
+    if blocks:
+        values["minimax_keyframes"] = blocks
         values["minimax_frame_count"] = frame_count
     if ref_blocks:
         values["minimax_refs"] = ref_blocks
     if values:
         cond = node_helpers.conditioning_set_values(cond, values)
 
-    latent, _ = _empty_av_latent(kf_width, kf_height, length)
+    if latent is None:
+        latent, _ = _empty_av_latent(kf_width, kf_height, length)
     return cond, latent, ref_items, kf_imgs, ref_label
 
 
@@ -292,11 +375,17 @@ class H3PipeCreate(io.ComfyNode):
                 io.Image.Input("keyframes", optional=True,
                                tooltip="Keyframe batch - each frame anchors the video at a position from 'indices' (or evenly distributed). first/last frame above join the batch at its start/end."),
                 io.String.Input("indices", default="", optional=True, advanced=True,
-                                tooltip="Comma-separated keyframe positions: an integer is a frame index (negative counts from the end, -1 = last), a decimal is a percentage of the video (0.5 = middle). Ignored with even_distribution."),
+                                tooltip="Comma-separated keyframe positions: an integer is a frame index (negative counts from the end), a decimal is a percentage of the video (0.5 = middle). Ignored with even_distribution."),
                 io.Boolean.Input("even_distribution", default=False, optional=True, advanced=True,
-                                 tooltip="Spread the full keyframe batch (first/last frame included) evenly from 0 to the last frame."),
+                                 tooltip="Includes first/last frame."),
                 io.Boolean.Input("loop", default=False, optional=True, advanced=True,
-                                 tooltip="Also anchor a duplicate of the first keyframe at the last frame (for looping videos)."),
+                                 tooltip="Duplicates the first keyframe at the last frame."),
+                io.Autogrow.Input("keyaudio", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Audio.Input("keyaudio"), prefix="keyaudio_", min=0, max=3),
+                    tooltip="Sound pinned onto the clip's own timeline at a frame from 'indices_audio' - the model performs it there, at a lip sync point or on a beat. Reference audio is only imitated."),
+                io.String.Input("indices_audio", default="", optional=True, advanced=True,
+                                tooltip="Positions for the audio tracks, in slot order: an integer is a frame index (negative counts from the end), a decimal a percentage of the video; an empty position anchors frame 0. A track is cut where the next one starts or the audio ends."),
                 io.Autogrow.Input("ref_images", optional=True,
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Image.Input("ref_image"), prefix="ref_image_", min=0, max=9)),
@@ -318,6 +407,7 @@ class H3PipeCreate(io.ComfyNode):
                 ref_image_size=None, override_config=None,
                 first_frame=None, last_frame=None,
                 keyframes=None, indices=None, even_distribution=None, loop=None,
+                keyaudio=None, indices_audio=None,
                 ref_images=None, ref_videos=None, ref_video_audios=None,
                 ref_audios=None):
         if h3_pipe is None:
@@ -357,6 +447,17 @@ class H3PipeCreate(io.ComfyNode):
                 pipe.pop("keyframes", None)
                 pipe.pop("keyframe_positions", None)
 
+        # Rebuild the audio guide section when any audio guide input is provided
+        if ((keyaudio is not None and any(v is not None for v in keyaudio.values()))
+                or (indices_audio is not None and str(indices_audio).strip())):
+            tracks = [value for _index, _name, value in iter_numbered_slots(keyaudio or {}, "keyaudio")]
+            if tracks:
+                pipe["keyaudio"] = tracks
+                pipe["keyaudio_positions"] = _parse_positions(indices_audio or "")
+            else:
+                pipe.pop("keyaudio", None)
+                pipe.pop("keyaudio_positions", None)
+
         # Override reference media (only if connected; store raw tensors, no encoding)
         if ref_images is not None and any(v is not None for v in ref_images.values()):
             pipe["ref_images"] = {k: v for k, v in ref_images.items() if v is not None}
@@ -388,7 +489,8 @@ class H3PipeApply(io.ComfyNode):
             display_name="H3 Pipe Apply",
             category="gibby",
             description=("Applies an h3_pipe with clip and vaes to create conditioning + latent. "
-                          "Same output as MiniMax H3 Hybrid Cond."),
+                          "Same output as MiniMax H3 Hybrid Cond. A context that already carries "
+                          "an H3 AV latent keeps it and only gains the conditioning."),
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True),
                 io.Dict.Input("h3_pipe"),
@@ -397,20 +499,16 @@ class H3PipeApply(io.ComfyNode):
                 io.Vae.Input("audio_vae", optional=True),
                 io.Int.Input("target_width", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
                              optional=True,
-                             tooltip="Optional target width in pixels for the keyframes and the latent (for dual-pass upscale workflows)"),
+                             tooltip="For dual-pass upscale workflows"),
                 io.Int.Input("target_height", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
                              optional=True,
-                             tooltip="Optional target height in pixels for the keyframes and the latent (for dual-pass upscale workflows)"),
-                io.Boolean.Input("drop_ref_images", default=False, optional=True,
-                                 tooltip="Drop the pipe's reference images before applying"),
-                io.Boolean.Input("drop_keyframes", default=False, optional=True,
-                                 tooltip="Drop the pipe's keyframes before applying"),
-                io.Boolean.Input("drop_ref_videos", default=False, optional=True,
-                                 tooltip="Drop the pipe's reference videos before applying"),
-                io.Boolean.Input("drop_ref_video_audios", default=False, optional=True,
-                                 tooltip="Drop the pipe's reference video soundtracks before applying"),
-                io.Boolean.Input("drop_ref_audios", default=False, optional=True,
-                                 tooltip="Drop the pipe's reference audios before applying"),
+                             tooltip="For dual-pass upscale workflows"),
+                io.Boolean.Input("drop_ref_images", default=False, optional=True),
+                io.Boolean.Input("drop_keyframes", default=False, optional=True),
+                io.Boolean.Input("drop_keyaudio", default=False, optional=True),
+                io.Boolean.Input("drop_ref_videos", default=False, optional=True),
+                io.Boolean.Input("drop_ref_video_audios", default=False, optional=True),
+                io.Boolean.Input("drop_ref_audios", default=False, optional=True),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output(display_name="context"),
@@ -423,6 +521,7 @@ class H3PipeApply(io.ComfyNode):
     @classmethod
     def execute(cls, context=None, clip=None, vae=None, audio_vae=None, h3_pipe=None,
                 target_width=0, target_height=0, drop_ref_images=False, drop_keyframes=False,
+                drop_keyaudio=False,
                 drop_ref_videos=False, drop_ref_video_audios=False, drop_ref_audios=False):
         ctx = ctx_from(context)
 
@@ -444,6 +543,9 @@ class H3PipeApply(io.ComfyNode):
         if drop_keyframes:
             pipe.pop("keyframes", None)
             pipe.pop("keyframe_positions", None)
+        if drop_keyaudio:
+            pipe.pop("keyaudio", None)
+            pipe.pop("keyaudio_positions", None)
         if drop_ref_videos:
             pipe.pop("ref_videos", None)
         if drop_ref_video_audios:
@@ -457,7 +559,13 @@ class H3PipeApply(io.ComfyNode):
 
         tw = target_width if target_width > 0 else None
         th = target_height if target_height > 0 else None
-        cond, latent, ref_items, kf_imgs, ref_label = _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, tw, th)
+        # A context that already carries an H3 AV latent owns it: the target latent
+        # H3 Timeline built, or the upscaled one a second pass samples. Only the
+        # conditioning is added there - replacing the latent would throw the clip
+        # the caller built away. Anything else gets the pipe's empty latent.
+        existing = ctx.get("latent")
+        cond, latent, ref_items, kf_imgs, ref_label = _apply_pipe_to_conditioning(
+            clip, vae, audio_vae, pipe, tw, th, existing if _is_av_latent(existing) else None)
 
         # Store results back in context
         ctx["positive"] = cond

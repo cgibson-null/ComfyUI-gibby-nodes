@@ -1,20 +1,9 @@
 """
-Lora Loader
------------
-A multi-lora loader built on ComfyUI's modern V3 node schema, with a
-growable/shrinkable row count via a small "lora slots" number field that
-updates live.
+Lora Loader: a multi-lora loader on the V3 node schema, with a growable row count
+via a "lora slots" number field that updates live.
 
-WHY IT'S BUILT THIS WAY:
-rgthree's original version draws its own custom widget (the rows, the
-toggles, the "+ Add Lora" button) directly onto the old canvas system with
-hand-written JavaScript, doing its own click/drag handling from scratch.
-That's exactly the kind of custom node that breaks under Nodes 2.0.
-
-This version instead uses a JS helper (see lora_loader.js) that builds real
-HTML elements via ComfyUI's own node.addDOMWidget() function - not hand-
-drawn canvas graphics. It isn't reinventing any rendering, which is why it
-survives frontend changes that break fully hand-drawn widgets.
+The rows are real HTML built through node.addDOMWidget() by lora_loader.js, not
+canvas graphics drawn by hand, so they survive frontend changes.
 """
 
 import hashlib
@@ -71,19 +60,32 @@ _civitai_settings = {
 }
 
 # --- Lora info / Civitai lookup -------------------------------------------
-# Hashing is cached (keyed by file size + modified time) so a multi-GB lora
-# only gets hashed once, and it runs in a background thread so hashing a
-# large file doesn't freeze the rest of ComfyUI's server while it works.
-# Civitai lookups (and any manual edits to Name/Strength/Notes) are cached
-# in a small local JSON file, keyed by lora filename, so they're shared by
-# every node instance and survive restarts.
+# Hashing is cached by file size + modified time and runs in a background thread,
+# so a multi-GB lora is hashed once without freezing the server. Civitai data and
+# manual Name/Strength/Notes edits go to a small JSON file keyed by filename, so
+# every node instance shares them across restarts.
+
+# The parsed caches, by path. One dict per file for the life of the server.
+_JSON_CACHES = {}
+
 
 def _load_json_cache(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    """The JSON cache at path, read once and kept in memory.
+
+    Writers mutate the returned dict and hand it back to _save_json_cache, so a
+    lookup never re-parses a half-megabyte file, and a write that lands after a
+    background hash carries whatever another lookup stored in the meantime
+    instead of the snapshot read before it - which is how a lora's hash or
+    Civitai entry used to vanish without a word."""
+    cache = _JSON_CACHES.get(path)
+    if cache is None:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+        _JSON_CACHES[path] = cache
+    return cache
 
 
 def _save_json_cache(path, cache):
@@ -124,22 +126,26 @@ def _remember_hash_entry(cache, save_cache, name, stat, hash_, **extra):
     save_cache(cache)
 
 
+def _hash_for(path, key, load_cache, save_cache):
+    """The sha256 hex digest of a file that exists, from the cache entry stored
+    under key: the cached one while its size and mtime still match the file,
+    computed and saved otherwise. Shared by the lora and the model caches."""
+    stat = os.stat(path)
+    cache = load_cache()
+    entry = cache.get(key, {})
+    if _hash_entry_fresh(entry, stat):
+        return entry["hash"]
+    digest = _hash_file_sync(path)
+    _remember_hash_entry(cache, save_cache, key, stat, digest)
+    return digest
+
+
 def _lora_hash_for(lora_name):
-    """Returns the sha256 hex digest for a lora filename, using the info
-    cache when valid and computing + saving it otherwise."""
+    """The sha256 hex digest for a lora filename; None when the file is missing."""
     path = folder_paths.get_full_path("loras", lora_name)
     if not path or not os.path.isfile(path):
         return None
-
-    stat = os.stat(path)
-    cache = _load_info_cache()
-    entry = cache.get(lora_name, {})
-    if _hash_entry_fresh(entry, stat):
-        return entry["hash"]
-
-    digest = _hash_file_sync(path)
-    _remember_hash_entry(cache, _save_info_cache, lora_name, stat, digest)
-    return digest
+    return _hash_for(path, lora_name, _load_info_cache, _save_info_cache)
 
 
 def _format_lora_tag(name, strength):
@@ -518,9 +524,7 @@ class GibbyLoraLoader(io.ComfyNode):
             display_name="Lora Loader",
             category="gibby",
             description=(
-                "Apply any number of LoRAs to a model/clip. No rgthree-comfy "
-                "required; built for Nodes 2.0. Adjust 'lora slots' to add "
-                "or remove rows."
+                "Apply any number of LoRAs to a model/clip. No rgthree-comfy required; built for Nodes 2.0."
             ),
             # All the actual lora rows, and the "lora slots" count control
             # itself, live entirely in JS-built widgets, not declared here -

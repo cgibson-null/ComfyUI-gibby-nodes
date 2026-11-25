@@ -14,10 +14,11 @@ class GibbyAnyBatchList(io.ComfyNode):
             display_name="Any Batch/List",
             category="gibby",
             search_aliases=["batch any", "make list", "list any", "combine any", "stack any"],
-            description=("Batches or lists every connected input, whatever its type. "
-                         "Batch concatenates tensors along dim 0 the way Batch Images "
-                         "does and joins lists such as conditioning; List - and batch "
-                         "of anything neither, like a model - outputs a Python list."),
+            description=(
+                "Batches or lists every connected input, whatever its type. Batch concatenates tensors along dim "
+                "0 the way Batch Images does; List outputs a Python list, even for things neither can hold, like "
+                "a model."
+            ),
             inputs=[
                 io.Boolean.Input(
                     "mode",

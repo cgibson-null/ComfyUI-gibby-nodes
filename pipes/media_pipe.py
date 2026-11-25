@@ -3,11 +3,11 @@
 The media pipe is a plain dict carrying raw reference media between nodes
 (H3 Pipe Create/Apply, Reference Latent (Context), Generate):
 
-    ref_images, keyframes + keyframe_positions, ref_videos,
-    ref_video_audios, ref_audios
+    ref_images, keyframes + keyframe_positions, keyaudio + keyaudio_positions,
+    ref_videos, ref_video_audios, ref_audios
 
 The h3_pipe is the same dict plus the h3 params (prompt, width, height,
-length, ref_image_size). Keyframe positions are stored unresolved:
+length, ref_image_size). Keyframe and audio positions are stored unresolved:
 an integer is a frame index (negative counts from the end, -1 = last),
 a float is a percentage of the video.
 """

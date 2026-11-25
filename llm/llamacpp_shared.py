@@ -1,44 +1,15 @@
-"""Small shared pieces: sampler-option filtering.
-
-Ported from ``ollama_shared.py`` in the Ollama-Enhanced pack.
-"""
+"""Sampler-option filtering shared by the LLM Connect nodes."""
 
 from __future__ import annotations
 
 from typing import Any
 
 
-# Sampler knobs exposed by GibbySamplingOptions, gated by an
-# `enable_<name>` flag each -- same UX as the Ollama pack's Options node.
-#
-# Dropped versus the Ollama version, and why:
-#   num_ctx  -- llama.cpp fixes context size at server start (`-c` flag /
-#               llama-swap's per-model `cmd`). There is no per-request
-#               equivalent; sending one would just be silently ignored.
-#   tfs_z    -- tail-free sampling was removed from llama.cpp itself. Ollama
-#               still lists it, but forwarding it to a llama.cpp server would
-#               either be ignored or (on strict builds) rejected as unknown.
-#
-# Renamed versus the Ollama version:
-#   num_predict -> n_predict. llama.cpp's server has accepted `max_tokens` for
-#               OpenAI compatibility since day one, but its own extension
-#               field for "max new tokens, -1 = unbounded" has always been
-#               `n_predict`. -1 behaves the same as Ollama's -1.
-#
-# New, with no Ollama equivalent at all -- Ollama's API has no concept of a
-# reasoning phase separate from the answer, so there was nothing to port:
-#   reasoning_budget -- llama.cpp server-enforced token cap on the hidden
-#               thinking phase (see --reasoning-budget upstream). Works for
-#               any model that does a distinct thinking phase, regardless of
-#               whether that model was specifically trained around the
-#               concept of "effort levels." Only meaningful when the
-#               Generate node's own `think` toggle is also on.
-#   reasoning_effort -- passed through to the chat template as a hint
-#               (low/medium/high). Only understood by models actually
-#               trained for it (gpt-oss, StepFun, as of this writing) --
-#               silently ignored by everything else. reasoning_budget is the
-#               one that actually works universally; this one is along for
-#               the ride for when it's supported.
+# Sampler knobs exposed by GibbySamplingOptions, each gated by an enable_<name>
+# flag. Deliberately absent: num_ctx (llama.cpp fixes the context at server
+# start, so a per-request value would be ignored) and tfs_z (removed from
+# llama.cpp itself). reasoning_effort is only a chat-template hint that most
+# models ignore; reasoning_budget is the one llama.cpp actually enforces.
 _OPTION_ENABLERS = (
     "enable_mirostat",
     "enable_mirostat_eta",

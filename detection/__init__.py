@@ -1,39 +1,24 @@
 """
-Detection node
---------------
-Detects / segments objects on the context image (or a directly connected
-image, which overrides it) and writes the result back into the context.
-The context's model and clip are never touched.
+Mask/Segment (Context): detect or segment objects on the context image (a
+connected image overrides it) and write the result back into the context. The
+context's model and clip are never touched.
 
-A mode selector (like the Context Loader) reveals the widgets of the chosen
-approach, following the Impact FaceDetailer's box and SAM options:
+A mode selector reveals the widgets of the chosen approach, following the Impact
+FaceDetailer's box and SAM options:
 - bbox: the ultralytics bbox detector (models/ultralytics/bbox).
-- segm: the bbox detector as a prompt source, refined by a SAM model
-  (models/sams).
-- sam3: the SAM3 / SAM3.1 checkpoint selected in the node (checkpoints
-  folder), loaded with the native checkpoint loader together with its own
-  SAM3 CLIP - text detection from the sam3_prompt (encoded like CLIP Text
-  Encode) and segmentation from the bboxes / point prompts. With tracking on,
-  the per-object masks it detects on the first frame - or a mask connected to
-  this node, which skips that detection outright - seed the native
-  Run SAM3 Video Track tracker, which propagates them through the whole batch
-  (the mask output then follows the objects frame by frame, keeping the
-  objects object_indices selects).
+- segm: the bbox detector as a prompt source, refined by a SAM model (models/sams).
+- sam3: the selected SAM3 checkpoint (checkpoints folder) with its own SAM3 CLIP -
+  text detection from sam3_prompt, segmentation from the bboxes / point prompts.
+  With tracking on, the first-frame detection - or a mask connected to this node,
+  which skips that detection - seeds the native Run SAM3 Video Track tracker, which
+  propagates the masks through the batch.
 
-bbox/segm run through the Impact Subpack's UltralyticsDetectorProvider and
-the Impact Pack's SAM/mask helpers (SAMLoader, make_sam_mask); sam3 runs
-through the native SAM3 Detect node.
-
-The prompts (bboxes, pos/neg coords) use the same formats as SAM3 Detect,
-and also accept KJNodes BBOX (startX/startY/endX/endY) boxes. A connected
-prompt beats the detector; with no prompt connected, the detector runs.
-The bboxes are used only by this node (to build the mask) and are not
-stored in the context - the mask is.
+The prompts (bboxes, pos/neg coords) use SAM3 Detect's formats and also accept
+KJNodes BBOX boxes. A connected prompt beats the detector. The bboxes are used
+only to build the mask and are not stored in the context - the mask is.
 
 The mask is stored exactly as the detection produced it: growing, inverting,
-dropping isolated specks, filling holes, knocking the background out, and the
-tinted preview this node used to show all live in Mask Edit (Context), the
-node that chains onto this one.
+cleaning up and the tinted preview all live in Mask Edit (Context) instead.
 """
 
 import json
@@ -47,7 +32,7 @@ import comfy.sd
 import comfy.utils
 from comfy_api.latest import io
 
-from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, ctx_from, parse_index_spec
+from ..context import _CONTEXT_TYPE, _CROP_INFO_TYPE, WeakCache, ctx_from, parse_index_spec
 from ..crop_paste.crop_image_by_mask import _store_crop_info
 from ..resolution_latent import _mask_bbox, _resize_mask
 
@@ -107,17 +92,17 @@ def _sam3_models():
     return opts or all_models or ["(no models found)"]
 
 
-_last_yolo = None  # (model_name, detector) - one entry, like the SAM caches below
+# Held weakly like the SAM caches below: Clear VRAM unloads the model, and a
+# strong reference here would keep it in host RAM for the rest of the session.
+_last_yolo = WeakCache()  # model_name -> (detector,)
 
 
 def _bbox_detector(model_name):
-    global _last_yolo
     provider = nodes.NODE_CLASS_MAPPINGS.get("UltralyticsDetectorProvider")
     if provider is None:
         raise ValueError("bbox/segm detection needs ComfyUI-Impact-Subpack (UltralyticsDetectorProvider)")
-    if _last_yolo is None or _last_yolo[0] != model_name:
-        _last_yolo = (model_name, provider().doit(model_name)[0])
-    return _last_yolo[1]
+    detector, = _last_yolo.get_or_load(model_name, lambda: (provider().doit(model_name)[0],))
+    return detector
 
 
 def _parse_points(coords):
@@ -303,37 +288,37 @@ def _detect_segm(image, m, pos_pts, neg_pts, per_frame_boxes):
     return torch.stack(masks)
 
 
-_last_sam = None  # (model_name, sam_model)
+_last_sam = WeakCache()  # model_name -> (sam_model,)
 
 
 def _load_sam(model_name):
     # SAMLoader.load_model has no cache of its own (a graph node runs once per
     # prompt); this node calls it internally, so keep the loaded model like _load_sam3
-    global _last_sam
-    if _last_sam is None or _last_sam[0] != model_name:
+    def load():
         loader = nodes.NODE_CLASS_MAPPINGS.get("SAMLoader")
         if loader is None:
             raise ValueError("segm mode needs ComfyUI-Impact-Pack (SAMLoader)")
-        (sam_model,) = loader().load_model(model_name, "AUTO")
-        _last_sam = (model_name, sam_model)
-    return _last_sam[1]
+        return loader().load_model(model_name, "AUTO")
+
+    sam_model, = _last_sam.get_or_load(model_name, load)
+    return sam_model
 
 
-_last_sam3 = None  # (model_name, (model, clip))
+_last_sam3 = WeakCache()  # model_name -> (model, clip)
 
 
 def _load_sam3(model_name):
     # The native checkpoint loader brings the SAM3 model and its own SAM3 CLIP
-    global _last_sam3
-    if _last_sam3 is None or _last_sam3[0] != model_name:
+    def load():
         path = folder_paths.get_full_path_or_raise("checkpoints", model_name)
         model, clip, _vae, _clipvision = comfy.sd.load_checkpoint_guess_config(
             path, output_vae=True, output_clip=True,
             embedding_directory=folder_paths.get_folder_paths("embeddings"))
         if not hasattr(model.model.diffusion_model, "detector"):
             raise ValueError(f"'{model_name}' is not a SAM3 / SAM3.1 checkpoint")
-        _last_sam3 = (model_name, (model, clip))
-    return _last_sam3[1]
+        return model, clip
+
+    return _last_sam3.get_or_load(model_name, load)
 
 
 def _detect_sam3(image, model, conditioning, per_frame_boxes, pos_coords, neg_coords, threshold, refine_iterations, individual_masks=False):
@@ -396,12 +381,10 @@ def _bbox_inputs(bbox_models):
     return [
         io.Combo.Input("bbox_detector", default=bbox_models[0], options=bbox_models,
                        tooltip="Ultralytics bbox detector (models/ultralytics/bbox)"),
-        io.Float.Input("bbox_threshold", default=0.5, min=0.0, max=1.0, step=0.01,
-                       tooltip="Detection confidence threshold"),
+        io.Float.Input("bbox_threshold", default=0.5, min=0.0, max=1.0, step=0.01),
         io.Int.Input("bbox_dilation", default=10, min=-512, max=512, step=1,
-                     tooltip="Grow each detected box (negative to shrink)"),
-        io.Int.Input("drop_size", default=10, min=1, step=1,
-                     tooltip="Drop detections smaller than this many pixels"),
+                     tooltip="Negative shrinks"),
+        io.Int.Input("drop_size", default=10, min=1, step=1),
     ]
 
 
@@ -414,7 +397,7 @@ def _sam3_track_inputs():
         io.Int.Input("max_objects", default=4, min=0, max=64,
                      tooltip="Max tracked objects; the initial masks count toward this limit (0 = the internal cap of 64)"),
         io.Int.Input("detect_interval", default=1, min=1,
-                     tooltip="Run detection every N frames (1 = every frame, higher saves compute)"),
+                     tooltip="1 = every frame"),
         io.String.Input("object_indices", default="",
                         tooltip="Tracked objects to keep: '0,2', the last one '-1', a range '0-2', a slice '1:3', ':-2' or '::2' "
                                 "(empty = every tracked object)"),
@@ -423,12 +406,11 @@ def _sam3_track_inputs():
 
 def _sam_inputs(segm_models):
     return [
-        io.Combo.Input("segm_model", default=segm_models[0], options=segm_models, tooltip="SAM model (models/sams)"),
-        io.Combo.Input("sam_detection_hint", default="center-1", options=_SAM_HINTS,
-                       tooltip="How SAM is prompted from each box"),
-        io.Int.Input("sam_dilation", default=0, min=-512, max=512, step=1, tooltip="Grow the SAM mask (negative to shrink)"),
-        io.Float.Input("sam_threshold", default=0.93, min=0.0, max=1.0, step=0.01, tooltip="SAM prompt threshold"),
-        io.Int.Input("sam_bbox_expansion", default=0, min=0, max=1000, step=1, tooltip="Expand each box before prompting SAM"),
+        io.Combo.Input("segm_model", default=segm_models[0], options=segm_models, tooltip="models/sams"),
+        io.Combo.Input("sam_detection_hint", default="center-1", options=_SAM_HINTS),
+        io.Int.Input("sam_dilation", default=0, min=-512, max=512, step=1, tooltip="Negative shrinks"),
+        io.Float.Input("sam_threshold", default=0.93, min=0.0, max=1.0, step=0.01),
+        io.Int.Input("sam_bbox_expansion", default=0, min=0, max=1000, step=1),
         io.Float.Input("sam_mask_hint_threshold", default=0.7, min=0.0, max=1.0, step=0.01,
                        tooltip="mask-area hint: fraction of the box used for points"),
         io.Combo.Input("sam_mask_hint_use_negative", default="False", options=_SAM_NEGATIVE,
@@ -443,14 +425,13 @@ class GibbyDetection(io.ComfyNode):
     def define_schema(cls) -> io.Schema:
         sam3_models = _sam3_models()
         sam3_option = io.DynamicCombo.Option("sam3", [
-            io.Combo.Input("sam3_model", default=sam3_models[0], options=sam3_models, tooltip="SAM3 / SAM3.1 checkpoint"),
-            io.Float.Input("sam3_threshold", default=0.5, min=0.0, max=1.0, step=0.01, tooltip="Detection score threshold"),
-            io.Int.Input("sam3_refine_iterations", default=2, min=0, max=5, tooltip="SAM decoder refinement passes"),
+            io.Combo.Input("sam3_model", default=sam3_models[0], options=sam3_models),
+            io.Float.Input("sam3_threshold", default=0.5, min=0.0, max=1.0, step=0.01),
+            io.Int.Input("sam3_refine_iterations", default=2, min=0, max=5),
             io.String.Input("sam3_prompt", default="", multiline=True,
                              tooltip="Text prompt, encoded by the checkpoint's SAM3 clip like CLIP Text Encode"),
             # detection_tracking.js hides the tracker rows again while this is off
-            io.Boolean.Input("tracking", default=False,
-                             tooltip="Track the first frame's detection through the batch (Run SAM3 Video Track)"),
+            io.Boolean.Input("tracking", default=False),
         ] + _sam3_track_inputs())
         # bbox/segm need the Impact pack + subpack; offer them only when installed.
         # sam3 is first so it is the default mode
@@ -469,17 +450,9 @@ class GibbyDetection(io.ComfyNode):
             category="gibby/detection",
             search_aliases=["detect", "segment", "bbox", "yolo", "sam", "sam3"],
             description=(
-                "Detects or segments objects on the image (connected image wins over the "
-                "context one) and stores the resulting image and mask in the context; "
-                "the context's model and clip pass through untouched. A mode selector reveals "
-                "the widgets of the chosen approach: bbox (ultralytics detector), segm (SAM "
-                "refined by the detector's boxes), sam3 (the selected SAM3 checkpoint, which can "
-                "track its first-frame detection - or a connected mask, one per object - through "
-                "a batch of frames). The mask is stored "
-                "as the detection produced it - grow it, invert it, clean it up or preview it "
-                "with Mask Edit (Context). "
-                "Also outputs crop info for pasting results back with Image Paste By Mask "
-                "(Batch) (Context): the image, the mask and each mask's bbox as the paste rect."
+                "Detects or segments objects on the image and stores the resulting image "
+                "and mask in the context. Also outputs crop info for Image Paste By Mask "
+                "(Batch)."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True, tooltip="Base context; its image is used when no image is connected"),
@@ -492,8 +465,8 @@ class GibbyDetection(io.ComfyNode):
                 # Appended last on purpose: the frontend restores links by input
                 # index, so inserting it above would re-route the prompt inputs.
                 io.Mask.Input("mask", optional=True,
-                              tooltip="Seeds the tracker instead of detecting on the first frame (sam3 with tracking on): "
-                                      "one mask per object, from the first frame - a merged mask tracks as a single object. "
+                              tooltip="Seeds the sam3 tracker instead of detecting on the first frame: "
+                                      "one mask per object, from the first frame - a merged mask tracks as one object. "
                                       "Only a connected mask seeds; the context's mask is left alone"),
 
                 io.DynamicCombo.Input("mode", options=options),

@@ -23,7 +23,7 @@ import { app } from "../../../scripts/app.js";
 // therefore wrapped to relabel a bare class-name entry with the node's display
 // name; the clicked value stays the class name, so the entry still resolves.
 
-const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO", "GIBBY_TILING_INFO", "LORA_STACK", "LLAMACPP_CONNECTIVITY", "LLAMACPP_OPTIONS"];
+const SUGGESTED_TYPES = ["CONTEXT", "GIBBY_KSAMPLER_OPTIONS", "GIBBY_CROP_INFO", "GIBBY_TILING_INFO", "LORA_STACK", "LLAMACPP_CONNECTIVITY", "LLAMACPP_OPTIONS", "GIBBY_H3_TIMELINE"];
 
 const classToDisplay = new Map(); // comfyClass -> display_name (when different)
 

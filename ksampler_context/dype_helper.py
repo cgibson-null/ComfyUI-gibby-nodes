@@ -1,20 +1,12 @@
 """
-DyPE bridge - ComfyUI-DyPE as a soft dependency
------------------------------------------------
-Everything the KSampler (Context) needs to drive the DyPE pack: the high-res
-model patches (DyPE, SEGA).
+DyPE bridge: everything KSampler (Context) needs to drive the optional
+ComfyUI-DyPE pack (the DyPE and SEGA model patches).
 
-The pack is optional and its load order relative to this pack is not
-guaranteed, so:
-
-- availability is a filesystem check (``dype_installed``), never an import or a
-  sys.modules probe - it answers correctly before ComfyUI has imported DyPE;
-- the pack is imported lazily on first use (``_pack``) and cached; when
-  ComfyUI already imported it, that module object is reused instead of loading
-  a second copy;
-- the DyPE options node is only registered when the pack is present (see the
-  pack ``__init__``), and every entry point here degrades to a no-op when the
-  pack is missing, so a graph saved with DyPE wired in still runs without it.
+Load order between the packs is not guaranteed, so availability is a filesystem
+check (``dype_installed``) rather than an import or sys.modules probe, the pack is
+imported lazily on first use (``_pack``) and cached, and every entry point here
+degrades to a no-op when it is missing - a graph saved with DyPE wired in still
+runs without it. The DyPE options node is only registered when the pack is present.
 
 The native training resolution the patches need is never asked for: it is a
 constant of each architecture (``BASE_RESOLUTIONS``), looked up from the
@@ -39,15 +31,13 @@ _PACK_MODULE = "_gibby_dype_pack"
 #: raises until the DyPE pack unwraps it.
 DYPE_PATCH_METHODS = ("dype", "sega")
 
-#: Native training resolution per DyPE architecture. The checkpoint records its
-#: trained extent only for Z-Image (axes_lens) and Anima; for every other
-#: architecture it is a constant of the training recipe, so it is looked up
-#: from the detected type instead of asked for. What matters is the trained
-#: TOKEN grid: FLUX.2/klein and FLUX.3 (16x VAE, patch 1) and FLUX.1 (8x VAE,
-#: patch 2) are all 64x64 tokens at 1024px, so one "flux" entry covers them - and
-#: the DyPE detector reports klein and flux3 as "flux" anyway (flux3's DiT has a
-#: pe_embedder). MOSS-Image and Fibo 2.0 take the same Flux2 16x VAE without
-#: patchify, so they are the same grid.
+#: Native training resolution per DyPE architecture. Only Z-Image (axes_lens) and
+#: Anima record their trained extent in the checkpoint; for every other architecture
+#: it is a constant of the training recipe. What matters is the trained TOKEN grid:
+#: FLUX.2/klein/FLUX.3 (16x VAE, patch 1) and FLUX.1 (8x VAE, patch 2) are all
+#: 64x64 tokens at 1024px, so one "flux" entry covers them - and the DyPE detector
+#: reports klein and flux3 as "flux" anyway. MOSS-Image and Fibo 2.0 take the same
+#: Flux2 16x VAE without patchify, so they are the same grid.
 BASE_RESOLUTIONS = {
     "flux": 1024,
     "nunchaku": 1024,

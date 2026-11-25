@@ -71,3 +71,57 @@ export function rerenderWidgetList(node) {
 export function markGraphDirty(node) {
     try { node.graph?.setDirtyCanvas(true, true); } catch (e) { /* ignore */ }
 }
+
+// Show/hide the named rows and run the two passes a change needs: the core's
+// computeSize refit (it re-measures the node with the rows shown/hidden) and
+// the Vue widget list re-render (it only reads options.hidden when it
+// re-renders). wanted is {widgetName: show}; a missing widget is skipped.
+export function applyRowVisibility(node, wanted) {
+    let changed = false;
+    for (const [name, show] of Object.entries(wanted)) {
+        const w = findWidget(node, name, { dotted: true });
+        if (!w) continue;
+        changed = changed || !!w.options?.hidden === show;
+        setWidgetHidden(w, !show);
+    }
+    if (!changed) return;
+    refitNode(node);
+    rerenderWidgetList(node);
+    markGraphDirty(node);
+}
+
+// The plumbing a "hide some rows based on another widget" extension needs:
+// apply sync(node, hook) when the node is created, after configure (the saved
+// values and the saved mode land there) and one tick after the named widgets'
+// own handlers - a mode combo rebuilds its rows then. Everything is looked up
+// by name on every pass: a DynamicCombo recreates its rows, so a captured
+// widget or row goes stale. widgets[0] is the widget whose presence says the
+// node is ready; until then setup retries once, shortly.
+export function rowVisibility(nodeType, { widgets, sync }) {
+    const hook = (node, name) => {
+        const w = findWidget(node, name, { dotted: true });
+        if (!w || w._gibbyRowHook) return;
+        w._gibbyRowHook = true;
+        const prev = w.callback;
+        w.callback = function (...args) {
+            const r = prev?.apply(this, args);
+            setTimeout(() => sync(liveNode(node.id) || node, hook), 0);
+            return r;
+        };
+    };
+    const setup = (node) => {
+        if (!node || node._removed) return false;
+        for (const name of widgets) hook(node, name);
+        sync(node, hook);
+        return !!findWidget(node, widgets[0], { dotted: true });
+    };
+    for (const name of ["onNodeCreated", "onConfigure"]) {
+        const orig = nodeType.prototype[name];
+        nodeType.prototype[name] = function () {
+            if (orig) {
+                try { orig.apply(this, arguments); } catch (e) { /* ignore */ }
+            }
+            if (!setup(this)) setTimeout(() => setup(liveNode(this.id) || this), 50);
+        };
+    }
+}

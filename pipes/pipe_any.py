@@ -23,9 +23,8 @@ class PipeAny(io.ComfyNode):
             display_name="Pipe Any",
             category="gibby",
             description=(
-                "Creates a pipe dict from the connected any_N inputs, keyed 'any_1'...'any_10'. "
-                "With a pipe connected, the connected inputs override it at their keys. "
-                "Each output passes its key's value on."
+                "Creates a pipe dict from the connected any_N inputs, keyed 'any_1'...'any_10'. With a pipe "
+                "connected, the connected inputs override it at their keys."
             ),
             inputs=[
                 # Top: existing pipe to override

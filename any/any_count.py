@@ -9,11 +9,9 @@ class GibbyAnyCount(io.ComfyNode):
             display_name="Any Count",
             category="gibby",
             search_aliases=["batch count", "count", "length", "size", "how many", "empty", "null"],
-            description=("How many items a value holds: the batch size of a tensor "
-                         "or latent, the length of a conditioning or a list, 1 for a "
-                         "single object. An unconnected input and a null both count "
-                         "0, so an optional branch can be measured instead of having "
-                         "to be wired."),
+            description=("How many items a value holds. An unconnected input and a null "
+                         "both count 0, so an optional branch can be measured instead of "
+                         "wired."),
             inputs=[
                 io.AnyType.Input(
                     "value",

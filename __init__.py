@@ -1,28 +1,27 @@
 """
-Gibby Nodes
------------
-A small collection of ComfyUI custom nodes built on the modern V3 node
-schema, each living in its own self-contained folder:
+Gibby Nodes: a collection of ComfyUI custom nodes on the V3 node schema, each in
+its own self-contained folder. Put this whole folder in ComfyUI/custom_nodes/ and
+restart ComfyUI.
 
-- lora_loader/: multi-lora loader with growable rows (Lora Loader).
-- fast_groups/: frontend-only Muter / Bypasser virtual nodes.
-- group_header_toggles/: queue/bypass/mute buttons on group headers, configured via native settings (GibbyNodes > Group Header Toggles).
-- any/: the type-agnostic utilities - any_switch.py (Any Switch - outputs one connected input by index, only that branch runs), any_batch_list.py (Any Batch/List - batches or lists every connected input) and any_count.py (Any Count - how many items a value holds, 0 for nothing connected or a null).
-- context/: the CONTEXT object family - Context (bundler), Context Loader (models + params into a full context), Context Override, Sampling Parameters (Context).
-- resolution_latent/: Resize Image / Empty Latent (Context) - empty latent from width/height or aspect ratio + megapixels, resizes linked image/mask to match.
-- seedvr2_upscale.py: SeedVR2 Upscale (Context) - the whole SeedVR2 upscale in one node: resize to the megapixels/scale target (or a target size image), pad, tiled VAE encode, sample with the latent as the SeedVR2 conditioning, split/merge the temporal chunks of a video, decode, then align and color-correct the result back to the resized input.
-- relayvsr_upscale.py: RelayVSR Upscale (Context) - the whole RelayVSR video upscale in one node: the keyframe conditioning, the one step of sampling the model is trained for at cfg 1, and the Flash decoder that restores every frame from the keyframes and the low-quality video; the model's x2/x4 factor is the output size and seed and detail are the only widgets; the context's audio passes through to an output untouched.
-- image_saver/: Image Saver (Context) - saves images with civitai-compatible metadata; settings and lora names come from the context.
-- pipes/: media_pipe.py (the media pipe dict shared between nodes - ref images, keyframes with positions, videos, audios - h3_pipe is it plus the h3 params), h3_pipe.py (H3 Pipe Create / H3 Pipe Apply - reusable MiniMax H3 conditioning pipe, raw refs + keyframes stored, encoded at apply time) and pipe_any.py (Pipe Any - combine multiple Any inputs into a pipe dict, or override an existing pipe).
-- reference_latent_context/: Reference Latent (Context) - sets reference latents on conditioning from provided images (resized to the megapixels target, scaled, encoded with context VAE when ref_latents is on); a text encoder with a vision tower also sees the images at vl_megapixels and the prompts are re-encoded with them, so a t2i model like krea conditions on a reference without any edit path; hidream-o1 and sensenova get the resized image itself instead of a latent, which is what their models read; p-h3-image and MiniMax-H3-Image want minimax_refs blocks and Qwen vision copies instead of a latent, sized on their own grid; optionally references the context's own image at its own size; references a media pipe's images and passes the pipe through, appending the wired images to it; without a context it just builds the pipe from the wired images.
-- detection/: Mask/Segment (Context) - detects/segments objects on the context image with an ultralytics bbox detector, a SAM/SeC model, or a SAM3.1 checkpoint; writes the resulting image and mask back into the context.
-- mask_edit/: Mask Edit (Context) - the mask manipulation the detection and crop nodes used to carry (grow, invert, edge feather, isolated-pixel removal, hole filling, background removal) plus the mask tinted preview.
-- llm/: LLM Connect - Connectivity, Sampling Options, Unsloth Load Options and Generate for a llama.cpp / llama-swap / Unsloth server (OpenAI-compatible API), with auto-growing image/video references; Generate also takes a media pipe (refs + keyframes, labeled) and outputs one.
-- tiling.py: Split Tiles (Context) / Combine Tiles (Context) - splits the context image into a batch of uniform overlapping tiles with crop-inpaint masks; recombines the tile batch (at the upscaled size) with a crossfade across the overlaps.
-- ksampler_options/dype.py: DyPE options - the ComfyUI-DyPE pack as a soft dependency (registered only when that pack is installed). dype/sega patch the model for high-resolution generation; KSampler (Context) applies them through ksampler_context/dype_helper.py, re-patching per sample at the size actually being sampled so the outbound context keeps the original model.
-
-INSTALL:
-Put this whole folder in ComfyUI/custom_nodes/, then restart ComfyUI.
+- lora_loader/: Lora Loader - multi-lora loader with growable rows.
+- group/: fast_groups.js and group_header_toggles.js - frontend-only Muter/Bypasser
+  virtual nodes and queue/bypass/mute buttons on group headers.
+- any/: Any Switch, Any Batch/List, Any Count, Show Any.
+- context/: Context, Context Loader, Context Override, Sampling Parameters (Context).
+- resolution_latent/: Resize Image / Empty Latent (Context).
+- upscale/: the one-node upscales - SeedVR2, RelayVSR.
+- h3/: H3 Latent Upscale plus the H3 nodes around the media pipe - H3 Pipe Create /
+  Apply, H3 Timeline (Context) and its Assemble / Pin, H3 Mask Latent, H3 Chunk.
+- image_saver/: Image Saver (Context).
+- pipes/: the media pipe dict and Pipe Any.
+- reference_latent_context.py: Reference Latent (Context).
+- detection/: Mask/Segment (Context). mask_edit/: Mask Edit (Context).
+- crop_paste/: Image Crop By Mask (Batch) (Context) and its paste counterpart.
+- llm/: LLM Connect - Connectivity, Sampling Options, Unsloth Load Options, Generate.
+- tiling.py: Split Tiles / Combine Tiles (Context).
+- ksampler_context/: KSampler (Context), driven by the option nodes in
+  ksampler_options/ (Crop-Inpaint, Iterative, Color Match, Tiled VAE, Clear VRAM,
+  Lora Travel, DyPE).
 """
 
 import asyncio
@@ -40,11 +39,15 @@ from .ksampler_context import GibbyKSamplerContext
 from .any.any_switch import GibbyAnySwitch
 from .any.any_batch_list import GibbyAnyBatchList
 from .any.any_count import GibbyAnyCount
+from .any.any_show import GibbyShowAny
 from .resolution_latent import GibbyEmptyLatentResolution
-from .seedvr2_upscale import GibbySeedvr2Upscale
-from .relayvsr_upscale import GibbyRelayvsrUpscale
+from .upscale.seedvr2_upscale import GibbySeedvr2Upscale
+from .upscale.relayvsr_upscale import GibbyRelayvsrUpscale
+from .h3.h3_latent_upscale import GibbyH3LatentUpscale
 from .image_saver import GibbyImageSaverContext
-from .pipes.h3_pipe import H3PipeCreate, H3PipeApply
+from .h3.h3_pipe import H3PipeCreate, H3PipeApply
+from .h3.h3_timeline import (GibbyH3Timeline, GibbyH3TimelineAssemble, GibbyH3TimelinePin,
+                             GibbyH3MaskLatent, GibbyH3Chunk)
 from .reference_latent_context import GibbyReferenceLatentContext
 from .pipes.pipe_any import PipeAny
 from .crop_paste.crop_image_by_mask import GibbyCropImageByMaskBatch
@@ -73,13 +76,9 @@ _NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 _FOLDER_NAME = os.path.basename(_NODE_DIR)
 
 # --- Serve each JS file ourselves, with an explicit Content-Type -----------
-# Two earlier attempts tried to fix Windows' broken .js MIME-type guessing by
-# patching the databases ComfyUI's web server consults - but there's no way to
-# be fully sure which database (if any) is actually being read on any given
-# setup. Rather than keep guessing at that indirectly, this registers a route
-# for each file's URL and serves it ourselves, with the Content-Type set
-# directly and explicitly. No guessing involved at all, so it can't be
-# derailed by any registry/database problem.
+# Windows guesses the .js MIME type wrongly and there is no reliable way to know
+# which database ComfyUI's web server actually consults, so instead of patching
+# one we register a route per file and set the Content-Type directly.
 try:
     import glob as _glob
     from aiohttp import web
@@ -94,11 +93,8 @@ try:
             )
         return handler
 
-    # One route per JS file of the pack (lora_loader's rows, the Fast Groups
-    # nodes, the group header buttons, the context suggestions, the crop
-    # preview, the tracker/overlap/step rows, the LLM dropdown, the runtime
-    # badge). Discovered by globbing, so a new JS file is covered without
-    # remembering to list it here.
+    # One route per JS file of the pack, discovered by globbing so a new file is
+    # covered without listing it here.
     for _path in _glob.glob(os.path.join(_NODE_DIR, "**", "*.js"), recursive=True):
         PromptServer.instance.routes.get(
             "/extensions/" + _FOLDER_NAME + "/" + os.path.relpath(_path, _NODE_DIR).replace(os.sep, "/")
@@ -129,7 +125,7 @@ class GibbyNodesExtension(ComfyExtension):
         # offered when it is installed. dype_installed() is a filesystem check,
         # which answers correctly whichever of the two packs imports first.
         dype_nodes = [GibbyDypeOptions] if dype_installed() else []
-        return [GibbyAnyBatchList, GibbyAnyCount, GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, *dype_nodes, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMaskEdit, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbySamplingParametersContext, GibbySeedvr2Upscale, GibbyRelayvsrUpscale, GibbySplitTiles, GibbyTiledVaeOptions]
+        return [GibbyAnyBatchList, GibbyAnyCount, GibbyAnySwitch, GibbyClearVramOptions, GibbyContext, GibbyContextLoader, GibbyContextOverride, GibbyColorMatchOptions, GibbyCombineTiles, GibbyConnectivity, GibbyCropImageByMaskBatch, GibbyCropInpaintOptions, GibbyDetection, *dype_nodes, GibbyGenerate, GibbyIterativeUpscaleOptions, GibbyLoadOptions, GibbyLoraTravelOptions, GibbyMaskEdit, GibbyMergeContexts, GibbyMergeKSamplerOptions, GibbyPasteImageByMaskBatch, H3PipeApply, H3PipeCreate, GibbyImageSaverContext, GibbyKSamplerContext, GibbyLoraLoader, GibbySamplingOptions, PipeAny, GibbyReferenceLatentContext, GibbyEmptyLatentResolution, GibbyH3LatentUpscale, GibbyH3Timeline, GibbyH3TimelineAssemble, GibbyH3TimelinePin, GibbyH3MaskLatent, GibbyH3Chunk, GibbySamplingParametersContext, GibbySeedvr2Upscale, GibbyRelayvsrUpscale, GibbyShowAny, GibbySplitTiles, GibbyTiledVaeOptions]
 
 
 async def comfy_entrypoint() -> GibbyNodesExtension:

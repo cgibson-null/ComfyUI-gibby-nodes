@@ -1,18 +1,11 @@
 """
-Context node
-------------
-A general-purpose context bundler (inspired by rgthree's "Context Big"). It
-exposes a wide set of inputs/outputs so values can be collected into one
-CONTEXT object and passed along a workflow, then unpacked again downstream.
+Context node: a general-purpose context bundler (inspired by rgthree's Context
+Big). Every input is optional; link a base context in to inherit its values for
+any field left unconnected. It never generates anything - use Context Loader for
+model loading and on-demand generation.
 
-Every input is optional: connect what you need, or link a base context in to
-inherit its values for any field left unconnected. This node never generates
-anything on its own - use Context Loader for model loading and on-demand
-generation (conditioning from prompts, latent from image).
-
-The evaluate() staticmethod fills missing derived values (conditioning,
-latent) from what a context already holds; it is shared with Context Loader
-and KSampler (Context).
+The evaluate() staticmethod fills missing derived values (conditioning, latent)
+from what a context already holds; Context Loader and KSampler (Context) share it.
 """
 
 import datetime
@@ -43,39 +36,35 @@ _CROP_INFO_TYPE = io.Custom("GIBBY_CROP_INFO")
 
 def ctx_from(context):
     """A fresh context dict: a copy when context is a dict, else an empty one.
-    Nodes always work on this copy, so the context they received is never
-    mutated (a mutated input would leak into earlier nodes on re-runs)."""
+    Nodes always work on the copy, so a mutated input cannot leak into earlier
+    nodes on re-runs."""
     return dict(context) if isinstance(context, dict) else {}
 
 
 def drop_image_derived(ctx):
     """Drop the latent and the cached sample after the context's image changes:
-    both were built from the image it carried before, so they're now stale -
-    the sampler would otherwise reuse the old latent or return the cached
-    result instead of encoding/sampling the new image."""
+    both were built from the old image, so the sampler would reuse the stale
+    latent or return the cached result instead of encoding the new image."""
     ctx.pop("latent", None)
     ctx.pop("_kctx_sampled", None)
 
 
 def ctx_set_image(ctx, image):
-    """Override the context's image and drop the latent and cached sample built
-    from the old one, so the sampler re-encodes the new image instead of reusing
-    them."""
+    """Override the context's image and drop what the old one was built from."""
     ctx["image"] = image
     drop_image_derived(ctx)
 
 
 def ctx_set_latent(ctx, latent):
-    """Override the context's latent and drop the cached sample built from the old
-    one, so the sampler samples the new latent instead of returning that result."""
+    """Override the context's latent and drop the sample built from the old one."""
     ctx["latent"] = latent
     ctx.pop("_kctx_sampled", None)
 
 
 def ctx_set_sampled_image(ctx, image):
     """Store a sampled image on the context and drop everything the sample
-    replaced: the latent and cached sample built from the old image, the mask it
-    was sampled with, and the tiling info of the old image."""
+    replaced: the old latent and cached sample, the mask it used, and the old
+    image's tiling info."""
     ctx["image"] = image
     drop_image_derived(ctx)
     ctx.pop("mask", None)
@@ -173,16 +162,40 @@ def clear_vram(event="", verbose=False):
         _log("Clear VRAM", event)
 
 
+class WeakCache:
+    """One load, held weakly by key, for models a node loads internally rather
+    than as a graph node.
+
+    A strong reference here kept the last model in host RAM for the rest of the
+    server session, past unload_all_models from the Clear VRAM options. A dead
+    reference is a miss, so the model goes when ComfyUI drops it. One entry per
+    cache keeps it from holding extra models."""
+
+    def __init__(self):
+        self.key = None
+        self.refs = None
+
+    def get_or_load(self, key, load):
+        """The objects load() returns (a tuple), for this key only."""
+        if self.key == key:
+            values = tuple(ref() for ref in self.refs)
+            if all(values):
+                return values
+        values = tuple(load())
+        self.key = key
+        self.refs = tuple(weakref.ref(value) for value in values)
+        return values
+
+
 _INDEX_RANGE = re.compile(r"(-?\d+)\s*-\s*(-?\d+)")
 
 
 def parse_index_spec(spec, count, field="indices"):
     """The 0-based indices a user-typed spec selects out of `count` items, in the
     order written and without duplicates; None when the spec is empty.
-    Accepts indices ("5"), negative indices ("-2" = second to last), inclusive
-    ranges ("0-2"), and python-style slices (":3", "4:6", "-3:", "::2"), mixed
-    in a comma-separated list. Out-of-range indices are dropped; a malformed
-    part raises, naming `field`."""
+    Accepts "5", "-2", an inclusive range "0-2", and python slices (":3", "-3:",
+    "::2") in a comma-separated list. Out-of-range indices are dropped; a
+    malformed part raises, naming `field`."""
     if not (spec or "").strip():
         return None
     indices = []
@@ -257,11 +270,9 @@ def _is_flux2_latent(model_obj):
     """Whether a model wrapper (ModelPatcher) wants Flux2's 128ch /16x latents.
     The model's latent format decides, not its class: MOSS image shares the format
     without sharing a base class, while Flux3 and Fibo 2.0 share it but keep their
-    own constant shift - so the latent format and the schedule ask with different
-    predicates. A wrong answer here costs a silent nearest-exact rescale of the
+    own constant shift. A wrong answer costs a silent nearest-exact rescale of the
     empty latent (comfy.sample.fix_empty_latent_channels) and a start log that
-    measures the latent with the VAE's 16x ratio instead of the 8x one it was
-    built at."""
+    measures the latent with the VAE's 16x ratio instead of the 8x one."""
     fmt = getattr(getattr(model_obj, "model", None), "latent_format", None)
     return (getattr(fmt, "latent_channels", None) == 128
             and getattr(fmt, "spacial_downscale_ratio", None) == 16)
@@ -312,12 +323,8 @@ def ctx_size(ctx):
 
 
 def _stringify(value):
-    """Convert an arbitrary value to a string, mirroring KJNodes' 'Something To String'.
-
-    Primitives become their str() form, lists/tuples are joined with ', ', and
-    anything else falls back to str(). None becomes an empty string so the
-    output is always a valid STRING.
-    """
+    """Convert an arbitrary value to a string, mirroring KJNodes' 'Something To
+    String'. Lists are joined with ', ', None becomes an empty string."""
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -338,12 +345,10 @@ _COND_CACHE_LIMIT = 8
 
 
 def _encode_text(clip, text):
-    """Encode a prompt with clip, reusing the encoding made earlier with the same
-    clip object: the same prompt across runs, and the prompt a context's conditioning
-    and its prompt travel plan share. Keyed weakly by the clip, so unloading it drops
-    its entries, and a lora applied to a clip clones it, so a different text encoder
-    misses instead of reusing stale embeddings. A clip keeps its last
-    _COND_CACHE_LIMIT prompts."""
+    """Encode a prompt with clip, reusing the encoding made earlier for the same
+    clip object. Keyed weakly by the clip so unloading it drops its entries, and a
+    lora applied to a clip clones it, so a different text encoder misses instead of
+    reusing stale embeddings. A clip keeps its last _COND_CACHE_LIMIT prompts."""
     entries = _COND_CACHE.get(clip)
     if entries is None:
         entries = _COND_CACHE[clip] = OrderedDict()
@@ -374,8 +379,8 @@ def _graft_conds(base_cond, new_conds):
 def _images_in_tokens(tokens):
     """Whether tokenize() actually placed the images. A tokenizer with no image
     template leaves the vision block out of the text and the images disappear
-    without an error - MOSS-Image's Qwen3.5 tokenizer rewrites the no-template
-    path as text-only, so the encoder's vision tower is never asked."""
+    without an error (MOSS-Image's Qwen3.5 tokenizer rewrites the no-template
+    path as text-only)."""
     return any(isinstance(token[0], dict) and token[0].get("type") == "image"
                for batch in tokens.values() for row in batch for token in row)
 
@@ -383,11 +388,10 @@ def _images_in_tokens(tokens):
 def _recondition_text(clip, base_cond, text, ctx, images=None, keep_vision=False):
     """Re-encode `text` against clip, grafted onto base_cond's values so its
     reference payloads survive (flux2 reference_latents, h3 minimax_refs/keyframes).
-    For h3 the context carries the pre-processed ref items / keyframe images, and
-    the text is tokenized with them so the Qwen vision tokens stay consistent.
-    With images the text is tokenized with them: qwen2.1 drops the vision tokens
-    and splices reference latents into the slots they open (keep_vision=False),
-    every other vision encoder keeps the tokens and conditions on them alone."""
+    With the context's h3 ref items / keyframe images, or with images, the text is
+    tokenized with them so the vision tokens stay consistent: qwen2.1 drops them and
+    splices reference latents into the slots they open (keep_vision=False), every
+    other vision encoder keeps them."""
     ref_items = ctx.get("h3_ref_items")
     kf_imgs = ctx.get("h3_kf_imgs")
     if ref_items:
@@ -420,12 +424,10 @@ def _conditioning_text(ctx, side):
 
 
 def recondition_prompts(ctx, positive_text, negative_text, images=None, keep_vision=False):
-    """Re-encode positive/negative prompt texts against the context clip, grafted
-    onto the context's existing conditionings so their reference payloads survive.
-    A prompt that travels is encoded as the first prompt of its travel plan; the
-    sampler swaps in the other steps. A negative the context carries is never
-    replaced at cfg 1 - the negative does not run there, so it is neither re-encoded
-    nor zeroed out. Returns (positive, negative); falls back to the existing
+    """Re-encode the prompt texts against the context clip, grafted onto its
+    existing conditionings so their reference payloads survive. A prompt that
+    travels is encoded as the first prompt of its travel plan; the sampler swaps in
+    the other steps. Returns (positive, negative), falling back to the existing
     conditionings when there is no clip or nothing to re-encode."""
     clip = ctx.get("clip")
     if clip is None or (not positive_text and not negative_text):
@@ -530,9 +532,8 @@ class GibbyContext(io.ComfyNode):
             display_name="Context",
             category="gibby/context",
             description=(
-                "Collects many values into one CONTEXT object (and passes each "
-                "through individually). Every input is optional; connect a base "
-                "context in to inherit its values for any field left unconnected."
+                "Collects many values into one CONTEXT object and passes each through individually. A connected "
+                "base context supplies any field left unconnected."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True),

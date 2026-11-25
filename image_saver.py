@@ -1,22 +1,16 @@
-"""Image Saver (Context).
+"""Image Saver (Context): save images with civitai-compatible generation metadata,
+adapted for context workflows.
 
-Saves images with civitai-compatible generation metadata, adapted for context
-workflows:
+Generation settings (model name, seed, steps, sampler, prompts, size) come from
+the linked CONTEXT instead of widgets; an optional image input overrides the
+context's image. LoRA names come from the context's lora_stack in Lora Loader's
+tag format.
 
-- Generation settings (model name, seed, steps, sampler, prompts, size) come
-  from the linked CONTEXT instead of widgets; an optional image input overrides
-  the context's image.
-- LoRA names are converted from the context's lora_stack with Lora Loader's
-  tag format and written to the metadata without touching the prompt; the
-  append_lora_names toggle appends them to the positive prompt as
-  <lora:name:weight> tags instead.
-- Resource hashes and Civitai data live in JSON caches at the plugin root
-  (lora_info_cache.json via Lora Loader, model_info_cache.json here) instead
-  of .sha256/.civitai.info files next to models; embeddings are hashed in
-  memory. LoRA Civitai data is read from Lora Loader's cache.
+Resource hashes and Civitai data live in JSON caches at the plugin root
+(lora_info_cache.json via Lora Loader, model_info_cache.json here) instead of
+.sha256/.civitai.info files next to models; embeddings are hashed in memory.
 
-Based on ComfyUI-Image-Saver by Luciano Cirino:
-https://github.com/LucianoCirino/ComfyUI-Image-Saver
+Based on ComfyUI-Image-Saver by Luciano Cirino.
 """
 
 import json
@@ -49,9 +43,8 @@ from comfy_api.latest import io
 
 from .context import _CONTEXT_TYPE, ctx_from, ctx_size, ctx_set_image
 from .lora_loader import (_civitai_get_json, _civitai_model_version_by_hash, _format_lora_tag,
-                          _get_or_fetch_lora_civitai_info,
-                           _hash_entry_fresh, _hash_file_sync, _lora_hash_for, _load_json_cache,
-                           _remember_hash_entry, _save_json_cache, iter_lora_stack)
+                          _get_or_fetch_lora_civitai_info, _hash_file_sync, _hash_for,
+                          _lora_hash_for, _load_json_cache, _save_json_cache, iter_lora_stack)
 
 
 # --- File path matching (ComfyUI-Image-Saver/utils.py) -----------------------
@@ -157,20 +150,10 @@ def _save_model_info_cache(cache: dict):
 
 
 def _model_hash_for(model_path: str):
-    """sha256 for a model file via the plugin-root JSON cache; computes and saves when absent or stale."""
+    """sha256 for a model file via the plugin-root JSON cache; None when missing."""
     if not model_path or not os.path.isfile(model_path):
         return None
-
-    name = os.path.basename(model_path)
-    stat = os.stat(model_path)
-    cache = _load_model_info_cache()
-    entry = cache.get(name, {})
-    if _hash_entry_fresh(entry, stat):
-        return entry["hash"]
-
-    digest = _hash_file_sync(model_path)
-    _remember_hash_entry(cache, _save_model_info_cache, name, stat, digest)
-    return digest
+    return _hash_for(model_path, os.path.basename(model_path), _load_model_info_cache, _save_model_info_cache)
 
 
 # --- Civitai helpers (ComfyUI-Image-Saver/utils_civitai.py) ------------------
@@ -873,8 +856,7 @@ class GibbyImageSaverContext(io.ComfyNode):
             display_name="Image Saver (Context)",
             category="gibby",
             description=(
-                "Save images with civitai-compatible generation metadata. "
-                "Generation settings come from the linked context; an optional image input overrides its image."
+                "Save images with civitai-compatible generation metadata, read from the linked context."
             ),
             is_output_node=True,
             inputs=[
@@ -883,17 +865,17 @@ class GibbyImageSaverContext(io.ComfyNode):
                 io.String.Input(
                     "filename",
                     default='%time_%basemodelname_%seed',
-                    tooltip="filename (available variables: %date, %time, %time_format<format>, %model, %width, %height, %seed, %counter, %counter<padding>, %sampler_name, %steps, %cfg, %scheduler_name, %basemodelname, %denoise)",
+                    tooltip="Available variables: %date, %time, %time_format<format>, %model, %width, %height, %seed, %counter, %counter<padding>, %sampler_name, %steps, %cfg, %scheduler_name, %basemodelname, %denoise",
                 ),
-                io.String.Input("path", default='', tooltip="path to save the images (under Comfy's save directory)"),
+                io.String.Input("path", default='', tooltip="Under Comfy's save directory"),
                 io.Combo.Input("extension", options=['png', 'jpeg', 'jpg', 'webp'], default='png', tooltip="file extension/type to save image as"),
                 io.Boolean.Input("lossless_webp", default=True, advanced=True, tooltip="if True, saved WEBP files will be lossless"),
-                io.Int.Input("quality_jpeg_or_webp", default=100, min=1, max=100, tooltip="quality setting of JPEG/WEBP"),
+                io.Int.Input("quality_jpeg_or_webp", default=100, min=1, max=100),
                 io.Boolean.Input("optimize_png", default=False, advanced=True, tooltip="if True, saved PNG files will be optimized (can reduce file size but is slower)"),
-                io.Int.Input("counter", default=0, min=0, max=0xffffffffffffffff, advanced=True, tooltip="counter"),
-                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, advanced=True, tooltip="denoise value"),
-                io.String.Input("time_format", default="%Y-%m-%d-%H%M%S", advanced=True, tooltip="timestamp format"),
-                io.Boolean.Input("save_workflow_as_json", default=False, tooltip="if True, also saves the workflow as a separate JSON file"),
+                io.Int.Input("counter", default=0, min=0, max=0xffffffffffffffff, advanced=True),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, advanced=True),
+                io.String.Input("time_format", default="%Y-%m-%d-%H%M%S", advanced=True),
+                io.Boolean.Input("save_workflow_as_json", default=False),
                 io.Boolean.Input("embed_workflow", default=True, tooltip="if True, embeds the workflow in the saved image files.\nStable for PNG, experimental for WEBP.\nJPEG experimental and only if metadata size is below 65535 bytes"),
                 io.String.Input(
                     "additional_hashes",
@@ -902,14 +884,14 @@ class GibbyImageSaverContext(io.ComfyNode):
                     tooltip="hashes separated by commas, optionally with names. 'Name:HASH' (e.g., 'MyLoRA:FF735FF83F98')\nWith download_civitai_data set to true, weights can be added as well. (e.g., 'HASH:Weight', 'Name:HASH:Weight')",
                 ),
                 io.Boolean.Input("download_civitai_data", default=False, advanced=True, tooltip="Download and cache data from civitai.red to save correct metadata. Allows LoRA weights to be saved to the metadata."),
-                io.Boolean.Input("append_lora_names", default=False, advanced=True, tooltip="Append the context's lora names to the prompt as <lora:name:weight> tags in the saved metadata. Off: the prompt stays clean, LoRAs are still written to the hashes from the context."),
+                io.Boolean.Input("append_lora_names", default=False, advanced=True, tooltip="Append the context's lora names to the prompt as <lora:name:weight> tags in the saved metadata. Off keeps the prompt clean; the LoRAs are still written to the hashes."),
                 io.Boolean.Input("easy_remix", default=True, advanced=True, tooltip="Strip LoRAs and simplify 'embedding:path' from the prompt to make the Remix option on civitai.red more seamless."),
-                io.Boolean.Input("show_preview", default=True, tooltip="if True, displays saved images in the UI preview"),
-                io.String.Input("custom", default="", advanced=True, tooltip="custom string to add to the metadata, inserted into the a111 string before the model hash"),
-                io.Boolean.Input("save_image", default=True, tooltip="if True, saves the image to disk"),
+                io.Boolean.Input("show_preview", default=True),
+                io.String.Input("custom", default="", advanced=True, tooltip="Inserted into the a111 string before the model hash"),
+                io.Boolean.Input("save_image", default=True),
                 # Appended last: the frontend restores widgets_values by position, so
                 # a widget inserted above would shift every value after it.
-                io.Boolean.Input("save_metadata", default=True, tooltip="if True, writes the a1111/Civitai generation parameters into the saved files. Off writes no parameters block and does no hashing or Civitai lookups; the workflow embed and the JSON sidecar keep their own toggles."),
+                io.Boolean.Input("save_metadata", default=True, tooltip="Write the a1111/Civitai generation parameters into the saved files. Off writes no parameters block and does no hashing or Civitai lookup; the workflow embed and the JSON sidecar keep their own toggles."),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output(display_name="context"),

@@ -1,28 +1,8 @@
 """
-LLM Connect
------------
-Nodes for talking to a llama.cpp server / llama-swap proxy
-(OpenAI-compatible API); Unsloth Studio works too:
-
-- Connectivity: server URL + model selection (dropdown auto-fetched from
-  the server, see the /gibby_llm/get_models route in the pack __init__).
-- Sampling Options: per-request sampler settings, each field gated by an
-  enable_* toggle - only enabled fields are sent.
-- Unsloth Load Options: per-load parameters (context size, speculative,
-  KV-cache quant, extra flags) folded into the options dict under a
-  "load" key; Generate prices them with Unsloth's own validate /
-  estimate-memory probes, then applies the priced command via /load.
-- Generate: single-shot text generation with auto-growing image/video
-  reference slots (Autogrow); videos are sampled into still frames, the
-  chat API takes stills only. Every run prints a tokens/sec line with the
-  time it took. Takes a media pipe (its refs + keyframes are sent, labeled
-  as such) and outputs one with the wired refs appended and the generated
-  text as its prompt. With keep_context on, the previous turns (prompts +
-  replies, text only) are carried into the next run so the model continues
-  the conversation instead of starting fresh.
-
-The HTTP client, reference collection and option filtering live in
-llamacpp_client.py / llamacpp_refs.py / llamacpp_shared.py in this folder.
+LLM Connect: nodes for an OpenAI-compatible server - llama.cpp, llama-swap
+or Unsloth Studio. Connectivity, Sampling Options, Unsloth Load Options and
+Generate. The HTTP client, reference collection and option filtering live in
+the sibling llamacpp_*.py files.
 """
 
 from __future__ import annotations
@@ -55,15 +35,10 @@ _OPTIONS_TYPE = io.Custom("LLAMACPP_OPTIONS")
 
 _CATEGORY = "gibby/llm connect"
 
-# keep_context conversations: (node id, url, model) -> the earlier turns of
-# that node's conversation as OpenAI-style message dicts. Text only --
-# images are re-sent fresh from the connected inputs every run, so they
-# stay out of the stored history. Stored after each successful run;
-# switching keep_context off, or the server/model, starts a fresh
-# conversation. Both bounds are load-bearing: a conversation that is never
-# trimmed outgrows the server's context window, and a node that is deleted or
-# moved to another model leaves its key behind, so the oldest conversation and
-# its oldest turns are dropped.
+# keep_context history: (node id, url, model) -> earlier turns as OpenAI message
+# dicts (text only; images are always re-sent from the inputs). Both bounds are
+# load-bearing: an untrimmed conversation outgrows the server's context window,
+# and a deleted node would otherwise leave its key behind.
 _MAX_CONVERSATIONS = 32
 _MAX_TURNS = 40
 _CONVERSATIONS: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
@@ -85,11 +60,8 @@ def _store_conversation(conv_key, turns):
 
 
 def _normalize_stop(options: dict[str, Any] | None) -> dict[str, Any] | None:
-    """llama.cpp's `stop` wants a list; the widget is a single STRING field.
-
-    Wraps a non-empty stop string into a one-element list, drops the key
-    entirely for an empty string (matches "no stop sequence configured").
-    """
+    """The widget is a single STRING; llama.cpp's `stop` wants a list, and no
+    stop sequence means no key at all."""
     if not options or "stop" not in options:
         return options
     options = dict(options)
@@ -103,17 +75,10 @@ def _normalize_stop(options: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def _maybe_unload(url: str, model: str, connectivity: dict[str, Any] | None, debug: bool = False) -> None:
-    """Best-effort implementation of Ollama's ``keep_alive == 0`` semantics.
-
-    Only the "unload immediately" case has a real server-side call behind it:
-    llama-swap's ``POST /api/models/unload/:model_id``, or Unsloth Studio's
-    ``POST /api/inference/unload`` -- which must name the model the way the
-    server loaded it, so it gets the same local-path-or-repo-id the load used.
-    Positive/-1 values can't be implemented the same way (see the
-    Connectivity node's keep_alive tooltip). Failures here are swallowed: a
-    run that already produced a valid result should not fail because the
-    best-effort cleanup afterward didn't work.
-    """
+    """Ollama's ``keep_alive == 0``: unload now, via llama-swap's
+    /api/models/unload or Unsloth's /api/inference/unload (which has to name the
+    model the way the server loaded it). Other values have no server-side call.
+    Failures are swallowed - a good result should not fail over cleanup."""
     if connectivity is None:
         return
     keep_alive = connectivity.get("keep_alive")
@@ -150,29 +115,17 @@ _PREFLIGHT_KEYS = ("max_seq_length", "n_parallel", "cache_type_kv",
 
 def _price_load(url: str, target: str, load: dict[str, Any], api_key: str | None,
                 debug: bool = False) -> dict[str, Any]:
-    """Run Unsloth's own pre-load probes for this load and merge their answers into it.
+    """Ask Unsloth to price this load (``validate``, then ``estimate-memory``) and
+    merge its fitted context and gpu_layers back in.
 
-    The Studio panel never posts /load cold: it validates the identifier, then prices the
-    command it is about to submit (``validate``, then ``estimate-memory``), and the price
-    comes back with the context and layer count that command comes to on this hardware.
-    Submitting those numbers is what makes a model the panel already loaded a no-op: /load
-    reloads whenever the settings do not match what is loaded, and a request built from the
-    user's context alone -- no fitted context, no gpu_layers -- is a different command from
-    the one the panel ran, so it reloads and plans as it goes. That is the "loads for 30
-    seconds, fails, and works on the second run" report.
-
-    ``max_seq_length_auto_derived`` is set with a substituted context because that is what
-    the flag means to Studio: the number is a fitted value, not a user pin, so a load that
-    needs to re-fit it (a forced-MTP replay) may. A context the user left at 0 stays unset,
-    which is how a llama.cpp load is asked for the model's own window. An estimate that
-    cannot size the model (``available`` false) leaves the command as the user set it apart
-    from the serving slot; a probe that errors or does not answer raises, because the load
-    about to be spent on the priced command has no price.
+    /load reloads whenever the settings differ from what is loaded, so sending the
+    user's raw context instead of the panel's priced command reloads a model that
+    is already up - the "loads for 30 seconds, fails, works on the second run"
+    report. A probe that errors raises: the load about to be spent on it has no
+    price. An estimate that cannot size the model leaves the user's command alone.
     """
-    # One Generate is one reply, so ask for one serving slot. Omitted, the load takes
-    # Studio's server-wide default -- which priced 10.3 GiB of KV cache and 20.8 GiB on the
-    # GPU for a 27B at 20k with q4 KV and MTP, against 5.2 and 19.1 at one slot. That gap is
-    # one way a model the panel loads fails from Comfy on the same settings.
+    # One Generate is one reply, so one serving slot: Studio's server-wide default
+    # priced 10.3 GiB of KV cache for a 27B at 20k where one slot needs 5.2.
     priced = dict(load)
     priced.setdefault("n_parallel", 1)
 
@@ -212,37 +165,17 @@ def _price_load(url: str, target: str, load: dict[str, Any], api_key: str | None
 
 
 def _maybe_unsloth_load(url: str, model: str, api_key: str | None, options: dict[str, Any] | None, debug: bool = False) -> str | None:
-    """Resolve the model's Unsloth identity, pricing and applying the options'
-    ``load`` block to it when there is one.
+    """Resolve the model's Unsloth identity and apply the options' ``load`` block
+    to it. Returns the identity to chat with, or None to keep the caller's id.
 
-    Only meaningful for Unsloth Studio: it has a ``POST /api/inference/load``
-    that takes context / speculative / KV-quant per load. llama.cpp and
-    llama-swap bake those into the server's startup ``cmd``, so the block is
-    ignored there (a note under debug, not an error) and None is returned so
-    the caller keeps its own model id.
+    Unsloth keys model lookup and vision support to the exact load string, and a
+    /v1/models repo id makes it download from the Hub even when a local copy is on
+    disk - so a locally-present model must be loaded and chatted by its on-disk
+    identity. Where the two identities differ (HF-cache models) the load has to be
+    explicit, or the chat auto-load re-downloads.
 
-    A /v1/models id is a Hub repo id, so sending it to /load -- or to
-    /v1/chat/completions, where Unsloth auto-loads an unknown model --
-    downloads the model even when a local copy is on disk. If a local copy
-    exists (LM Studio / hf cache), load it by its on-disk identity so
-    Unsloth serves from disk; fall back to the repo id only when there is no
-    local copy. That's why the identity is resolved even when there is no
-    ``load`` key to apply -- a plain Connectivity -> Generate chain must not
-    trigger a Hub download for a locally-present model.
-
-    HF-cache models are the strict case: their chat identity is the repo id,
-    so a chat-triggered auto-load re-resolves through the Hub and downloads.
-    When load and chat identity differ, the load is therefore explicit and
-    unconditional, not just when a ``load`` block is present. Plain-folder
-    models chat by the same path they load under, so their chat auto-loads
-    from disk and /load is only needed to apply the block. A block that is
-    applied goes through _price_load first, so it reaches /load as the command
-    Unsloth itself would have planned.
-
-    Returns the identity to chat with (local when a local copy exists, else
-    the repo id). Unsloth keys model lookup and vision support to the exact
-    load string, so a hub repo id can miss a locally-loaded model's mmproj
-    (reports is_vision=false, then rejects image input).
+    llama.cpp and llama-swap fix these flags at server start, so the block is
+    ignored there and None is returned.
     """
     if detect_backend(url, api_key) != "unsloth":
         if debug and (options or {}).get("load") is not None:
@@ -304,10 +237,8 @@ def _pipe_label(pipe: dict, pipe_refs: list, kf_imgs: list, total_images: int) -
 
 
 def _content_parts(prompt: str, label: str | None, image_urls: list[str]) -> Any:
-    """Build the `content` field for a chat message: plain string if there are
-    no images (keeps the request minimal for the common case), or an OpenAI
-    content-parts array with the text first, then each image as a data-URI
-    `image_url` part."""
+    """The chat message's content: a plain string when there are no images, else
+    an OpenAI content-parts array with the text first."""
     if not image_urls:
         return prompt
     parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -330,35 +261,23 @@ class GibbyConnectivity(io.ComfyNode):
             category=_CATEGORY,
             search_aliases=["llama", "llama.cpp", "llama-swap", "unsloth", "server", "model", "connectivity"],
             description=(
-                "Connection to a llama.cpp server, llama-swap proxy or Unsloth Studio. "
-                "The model dropdown is fetched from the server's /v1/models (cached per URL). "
-                "keep_alive: only 0 does anything real against llama.cpp/llama-swap -- it "
-                "unloads the model immediately after each response via llama-swap's "
-                "/api/models/unload endpoint; any other value is accepted for compatibility "
-                "with the Ollama version's widget shape, but does not change server-side "
-                "timing (that's the model's ttl in llama-swap's config.yaml)."
+                "Connection to a llama.cpp server, llama-swap proxy or Unsloth Studio; the model list is read "
+                "from the server's /v1/models."
             ),
             inputs=[
                 io.String.Input("url", default="http://127.0.0.1:8080", tooltip=(
-                    "Base URL of the llama.cpp server or llama-swap proxy. "
-                    "Default points at llama-swap's default port on this box.")),
+                    "Base URL of the server. Default is llama-swap's default port on this box.")),
                 io.Combo.Input("model", options=[], default="", tooltip=(
-                    "Model id, as reported by GET /v1/models on the server above. "
-                    "Behind llama-swap this is one of the friendly names from its "
-                    "config.yaml, not a raw file path. Use the Reconnect button if the "
-                    "list is empty or stale.")),
+                    "Model id as the server reports it. Behind llama-swap that is the friendly "
+                    "name from config.yaml, not a file path. Reconnect if the list is stale.")),
                 io.Int.Input("keep_alive", default=0, min=-1, max=120, step=1, tooltip=(
-                    "Only 0 does anything real against llama.cpp/llama-swap: it unloads "
-                    "the model immediately after each response. Any other value is "
-                    "accepted for compatibility with the Ollama version's widget shape, "
-                    "but does not change server-side timing.")),
+                    "0 unloads the model right after each response. Any other value is accepted "
+                    "for Ollama widget parity but does nothing - timing is llama-swap's own ttl.")),
                 io.Combo.Input("keep_alive_unit", options=["minutes", "hours"], default="minutes", tooltip=(
-                    "Kept for UI parity with the Ollama version. Currently unused - "
-                    "llama.cpp/llama-swap has nothing that consumes a duration here.")),
+                    "Unused - kept for UI parity with the Ollama version.")),
                 io.String.Input("api_key", default="", tooltip=(
-                    "Optional Bearer token for servers that gate the OpenAI API behind "
-                    "auth (e.g. Unsloth Studio). Sent as 'Authorization: Bearer <key>' "
-                    "on every call. Leave empty for an open llama.cpp / llama-swap server.")),
+                    "Bearer token for servers that gate the API behind auth (Unsloth Studio). "
+                    "Empty for an open llama.cpp / llama-swap server.")),
             ],
             outputs=[
                 _CONNECTIVITY_TYPE.Output("connectivity"),
@@ -377,11 +296,8 @@ class GibbyConnectivity(io.ComfyNode):
 
     @classmethod
     def validate_inputs(cls, **kwargs) -> bool:
-        # `model` is a combo whose options are fetched from the LLM server at
-        # runtime (the /gibby_llm/get_models route), so the schema's options
-        # list is empty and the built-in "value in list" check would reject
-        # every server-reported model id. The server is the source of truth
-        # for which models exist, so accept the value as-is.
+        # The combo's options come from the live server (/gibby_llm/get_models), so
+        # the schema list is empty and the server is the source of truth.
         return True
 
 
@@ -394,71 +310,52 @@ class GibbySamplingOptions(io.ComfyNode):
             category=_CATEGORY,
             search_aliases=["llama", "sampling", "options", "temperature", "top_p", "seed", "reasoning"],
             description=(
-                "Per-request sampling for llama.cpp inference -- temperature, "
-                "top_k/top_p/min_p, mirostat, repeat_penalty, stop, n_predict, seed, "
-                "reasoning_budget/reasoning_effort. Each field has an enable_* gate; "
-                "only enabled fields are sent to the server. NOT here: context size, "
-                "MTP/speculative, KV-cache quant, GPU layers, batch size -- those are "
-                "fixed when the server process starts (see Unsloth Load Options and "
-                "llama-swap's config.yaml cmd)."
+                "Per-request sampling for llama.cpp inference. Each field has an enable_* gate; only enabled "
+                "fields are sent. Load-time settings are not here - see Unsloth Load Options."
             ),
             inputs=[
                 io.Boolean.Input("enable_mirostat", default=False),
                 io.Int.Input("mirostat", default=0, min=0, max=2, step=1, tooltip=(
-                    "0 = disabled, 1 = Mirostat 1.0, 2 = Mirostat 2.0.")),
+                    "0 = off, 1 = Mirostat 1.0, 2 = Mirostat 2.0")),
                 io.Boolean.Input("enable_mirostat_eta", default=False),
-                io.Float.Input("mirostat_eta", default=0.1, min=0, step=0.1, tooltip=(
-                    "Mirostat learning rate.")),
+                io.Float.Input("mirostat_eta", default=0.1, min=0, step=0.1),
                 io.Boolean.Input("enable_mirostat_tau", default=False),
-                io.Float.Input("mirostat_tau", default=5.0, min=0, step=0.1, tooltip=(
-                    "Mirostat target entropy.")),
+                io.Float.Input("mirostat_tau", default=5.0, min=0, step=0.1),
                 io.Boolean.Input("enable_repeat_last_n", default=False),
                 io.Int.Input("repeat_last_n", default=64, min=-1, max=2048, step=1, tooltip=(
-                    "How far back to look to prevent repetition. 0 = disabled, -1 = context size.")),
+                    "How far back to look. 0 = disabled, -1 = context size")),
                 io.Boolean.Input("enable_repeat_penalty", default=False),
                 io.Float.Input("repeat_penalty", default=1.1, min=0, max=2, step=0.05, tooltip=(
-                    "Higher penalizes repetition more strongly. 1.0 = no penalty.")),
+                    "1.0 = no penalty")),
                 io.Boolean.Input("enable_temperature", default=False),
-                io.Float.Input("temperature", default=0.8, min=0, max=2, step=0.05, tooltip=(
-                    "Higher = more creative/random.")),
+                io.Float.Input("temperature", default=0.8, min=0, max=2, step=0.05),
                 io.Boolean.Input("enable_seed", default=True),
                 io.Int.Input("seed", default=0, min=-1, max=2 ** 31 - 1, step=1, tooltip=(
-                    "Fixed seed for reproducible output. -1 = random each call.")),
+                    "-1 = random each call")),
                 io.Boolean.Input("enable_stop", default=False),
-                io.String.Input("stop", default="", tooltip=(
-                    "Generation stops immediately if this string is produced.")),
+                io.String.Input("stop", default=""),
                 io.Boolean.Input("enable_n_predict", default=False),
                 io.Int.Input("n_predict", default=-1, min=-1, max=32768, step=1, tooltip=(
-                    "Max tokens to generate. -1 = unbounded.")),
+                    "-1 = unbounded")),
                 io.Boolean.Input("enable_top_k", default=False),
-                io.Int.Input("top_k", default=40, min=0, max=200, step=1, tooltip=(
-                    "Sample only from the top K tokens by probability.")),
+                io.Int.Input("top_k", default=40, min=0, max=200, step=1),
                 io.Boolean.Input("enable_top_p", default=False),
-                io.Float.Input("top_p", default=0.9, min=0, max=1, step=0.05, tooltip=(
-                    "Nucleus sampling threshold.")),
+                io.Float.Input("top_p", default=0.9, min=0, max=1, step=0.05),
                 io.Boolean.Input("enable_min_p", default=False),
                 io.Float.Input("min_p", default=0.0, min=0, max=1, step=0.05, tooltip=(
                     "Minimum token probability, relative to the most likely token.")),
                 io.Boolean.Input("enable_reasoning_budget", default=False),
                 io.Int.Input("reasoning_budget", default=-1, min=-1, max=32768, step=128, tooltip=(
-                    "Hard cap, in tokens, on the hidden thinking phase before the visible "
-                    "answer starts. Enforced by llama.cpp itself, so it works for any model "
-                    "that does a distinct thinking phase. -1 = unrestricted, 0 = skip thinking "
-                    "entirely even with 'think' on. Rough feel: ~512 = quick/shallow, ~2048 = "
-                    "moderate, ~8192+ = deep. Only matters if 'think' is also enabled on the "
-                    "Generate node. Needs a reasonably recent llama.cpp server build.")),
+                    "Token cap on the hidden thinking phase, enforced by llama.cpp. "
+                    "-1 = unrestricted, 0 = no thinking. Needs 'think' on.")),
                 io.Boolean.Input("enable_reasoning_effort", default=False),
                 io.String.Input("reasoning_effort", default="low", tooltip=(
-                    "Free-text hint sent to the model's chat template about how much to "
-                    "think. Type any value directly (e.g. low/medium/high).")),
-                io.Boolean.Input("debug", default=False, tooltip=(
-                    "Print the outgoing request and raw response to the ComfyUI console. "
-                    "No effect on the API call itself.")),
+                    "Free-text hint to the chat template about how much to think, e.g. "
+                    "low/medium/high.")),
+                io.Boolean.Input("debug", default=False),
                 _OPTIONS_TYPE.Input("options", optional=True, tooltip=(
-                    "Upstream options to merge with (e.g. an Unsloth Load Options node). "
-                    "This node's sampler fields are layered on top, so the output carries "
-                    "both -- chain it either direction with Load Options and feed the "
-                    "result to Generate.")),
+                    "Upstream options to merge with (e.g. Unsloth Load Options). This node's "
+                    "fields win, so chain it either direction.")),
             ],
             outputs=[
                 _OPTIONS_TYPE.Output("options"),
@@ -467,9 +364,7 @@ class GibbySamplingOptions(io.ComfyNode):
 
     @classmethod
     def execute(cls, options=None, **kwargs):
-        # Layer this node's sampler fields on top of any upstream options (e.g.
-        # a Load Options node's "load" block), so the two can be chained in
-        # either order and the result carries both.
+        # Layer this node's fields over any upstream options so the two chain either way.
         merged = dict(options or {})
         merged.update(kwargs)
         if merged.get("debug"):
@@ -490,56 +385,38 @@ class GibbyLoadOptions(io.ComfyNode):
             category=_CATEGORY,
             search_aliases=["llama", "unsloth", "load", "options", "context", "speculative", "mtp"],
             description=(
-                "Holds load-time parameters (context size, speculative/MTP, KV-cache "
-                "quant, extra llama-server flags) and folds them into the options dict "
-                "under a 'load' key. No connection of its own -- Generate resolves the "
-                "Connectivity and applies the load: Unsloth Studio via its /load API "
-                "(local copy first, else the Hub repo); llama.cpp/llama-swap ignore it "
-                "because those flags are fixed at server start (set them in "
-                "llama-swap's config.yaml cmd, one entry per variant). Before the load, "
-                "Generate prices the command with Unsloth's own validate / estimate-memory "
-                "probes and sends back the context and GPU-layer count they come to, so a "
-                "context that will not fit this hardware is fitted rather than failed and a "
-                "model the Studio panel already loaded stays loaded instead of reloading. "
-                "Every default is 'ask the server', so a node that was never set changes "
-                "nothing."
+                "Load-time parameters folded into the options dict under a 'load' key. "
+                "Unsloth Studio applies them through its /load API; llama.cpp and llama-swap "
+                "fix them at server start and ignore them."
             ),
             inputs=[
                 io.Int.Input("context_size", default=0, min=0, max=1048576, step=1024, tooltip=(
-                    "Context tokens. 0 = let the server pick its default (Unsloth fits the "
-                    "window to the free VRAM). A value its estimate says will not fit is "
-                    "lowered to the fitted number. Unsloth: max_seq_length. Ignored on "
-                    "llama-swap (use -c in config).")),
+                    "Context tokens; 0 = the server's default, which Unsloth fits to free "
+                    "VRAM. Ignored on llama-swap (use -c in config).")),
                 io.Combo.Input("speculative", options=["off", "auto", "mtp", "mtp+ngram", "ngram", "dspark", "dflash"],
                                 default="auto", tooltip=(
-                    "Speculative decoding mode. 'mtp' = multi-token-prediction drafting "
-                    "(needs MTP weights in the GGUF). 'auto' = let Unsloth pick. 'off' = none. "
-                    "Ignored on llama-swap (use --spec-type in config).")),
+                    "Speculative decoding mode; 'mtp' needs MTP weights in the GGUF, 'auto' "
+                    "lets Unsloth pick. Ignored on llama-swap (use --spec-type in config).")),
                 io.Int.Input("spec_draft_n_max", default=0, min=0, max=16, step=1, tooltip=(
-                    "Max draft tokens per speculative step (1-16). 0 = server default. "
+                    "Max draft tokens per speculative step; 0 = server default. "
                     "Ignored when speculative is 'off'.")),
                 io.Combo.Input("kv_cache_quant", options=cls._QUANT_LEVELS, default="default", tooltip=(
-                    "KV cache dtype for K and V ('q4_0' halves the cache's VRAM vs f16). "
-                    "'default' = let the server decide. Ignored on llama-swap (use -ctk/-ctv in config).")),
+                    "KV cache dtype for K and V ('q4_0' halves it vs f16). "
+                    "Ignored on llama-swap (use -ctk/-ctv in config).")),
                 io.Combo.Input("draft_kv_cache_quant", options=cls._QUANT_LEVELS, default="default", tooltip=(
-                    "KV cache dtype for the speculative draft context. 'default' = server "
-                    "default (f16). Only meaningful with speculative on.")),
+                    "KV cache dtype for the speculative draft context; needs speculative on.")),
                 io.String.Input("extra_args", default="", tooltip=(
                     "Raw llama-server flags, whitespace-separated, e.g. "
-                    "'--jinja --flash-attn -ngl 999'. Unsloth appends them after its own "
-                    "flags (last-wins). Ignored on llama-swap.")),
+                    "'--jinja --flash-attn -ngl 999'. Unsloth appends them (last-wins).")),
                 io.Int.Input("n_batch", default=0, min=0, max=8192, step=64, tooltip=(
-                    "Prompt processing batch size (llama-server -b). 0 = llama.cpp's own "
-                    "2048 default; 512 here is slower prompts, not a VRAM saving. Ignored "
-                    "on llama-swap (use -b in config).")),
+                    "Prompt processing batch size (llama-server -b); 0 = llama.cpp's 2048. "
+                    "Ignored on llama-swap (use -b in config).")),
                 io.Int.Input("n_ubatch", default=0, min=0, max=8192, step=64, tooltip=(
-                    "Attention sub-batch size (llama-server -ub). 0 = server default, which "
-                    "Unsloth raises for a projector llama.cpp aborts on at 512 - pinning it "
-                    "pins that too. Ignored on llama-swap (use -ub in config).")),
+                    "Attention sub-batch size (llama-server -ub); 0 = the server default, "
+                    "which Unsloth raises above the 512 llama.cpp aborts on. "
+                    "Ignored on llama-swap (use -ub in config).")),
                 _OPTIONS_TYPE.Input("options", optional=True, tooltip=(
-                    "Upstream options to merge with (e.g. a Sampling Options node). The "
-                    "result carries both the sampler fields and this node's load params, "
-                    "ready to feed Generate.")),
+                    "Upstream options to merge with (e.g. Sampling Options).")),
             ],
             outputs=[
                 _OPTIONS_TYPE.Output("options"),
@@ -549,11 +426,9 @@ class GibbyLoadOptions(io.ComfyNode):
     @classmethod
     def execute(cls, context_size, speculative, spec_draft_n_max, kv_cache_quant,
                 draft_kv_cache_quant, extra_args, n_batch=0, n_ubatch=0, options=None):
-        # Only non-default values are sent to /load, so the server can use its
-        # own defaults for the rest - and every default below is the "ask the
-        # server" value, so a node left on its widgets asks for nothing Unsloth
-        # would not have picked itself. The presence of the "load" key is what
-        # tells Generate to attempt a load at all.
+        # Only non-default values go to /load so the server keeps its own defaults;
+        # every default here is the "ask the server" value. The presence of the
+        # "load" key is what tells Generate to attempt a load at all.
         load: dict[str, Any] = {}
         if context_size > 0:
             load["max_seq_length"] = context_size
@@ -597,73 +472,48 @@ class GibbyGenerate(io.ComfyNode):
             category=_CATEGORY,
             search_aliases=["llama", "llama.cpp", "llama-swap", "unsloth", "generate", "chat", "llm", "text"],
             description=(
-                "Single-shot text generation via a llama.cpp / llama-swap / Unsloth "
-                "server, with auto-growing image and video reference inputs. Videos are "
-                "sampled into evenly-spaced frames -- the chat API accepts stills only. "
-                "Every run prints a tokens/sec line with the time it took to the "
-                "ComfyUI console, so a run in progress isn't a black box. With "
-                "keep_context on, the previous turns are carried into the next run, "
-                "so the model continues the conversation."
+                "Single-shot text generation with auto-growing image and video references. Videos are sampled "
+                "into evenly-spaced frames - the chat API takes stills only."
             ),
             inputs=[
                 _CONNECTIVITY_TYPE.Input("connectivity", tooltip=(
                     "Server + model from a Connectivity node.")),
                 _OPTIONS_TYPE.Input("options", optional=True, tooltip=(
-                    "Sampler config from a Sampling Options node. Covers temperature, "
-                    "top_k/top_p/min_p, mirostat, repeat_penalty/repeat_last_n, stop, "
-                    "n_predict, seed - plus reasoning_budget/reasoning_effort, which "
-                    "control how much the model thinks (only relevant "
-                    "when 'think' is also on). Nothing is sent to the server unless "
-                    "that field's own enable_<name> checkbox is on in the Options node.")),
+                    "Sampler config from a Sampling Options node; a field is only sent when "
+                    "its own enable_<name> checkbox is on there.")),
                 io.Dict.Input("media_pipe", optional=True, tooltip=(
-                    "Media pipe - its reference images and keyframes are sent to the "
-                    "model before the wired images, labeled as "
-                    "such; the output pipe carries the wired images appended "
-                    "and the generated text overwrites its prompt.")),
-                io.String.Input("system", multiline=True, default="You are an AI artist.", optional=True, tooltip=(
-                    "System prompt - sets the role and general behavior of the model.")),
+                    "Media pipe: its reference images and keyframes are sent before the wired "
+                    "images, labeled as such. The output pipe has the wired images appended "
+                    "and the generated text as its prompt.")),
+                io.String.Input("system", multiline=True, default="You are an AI artist.", optional=True),
                 io.String.Input("prompt", multiline=True, default="Describe the reference material.", optional=True, tooltip=(
-                    "User prompt. With several references connected, refer to them by "
-                    "position and say in the system prompt how many you are sending.")),
+                    "User prompt. With several references, refer to them by position and say "
+                    "in the system prompt how many you are sending.")),
                 io.Boolean.Input("think", default=True, optional=True, tooltip=(
-                    "Ask the model to reason before answering, if it supports thinking. "
-                    "Thinking text comes back on the 'thinking' output. Control how much "
-                    "it thinks via reasoning_budget/reasoning_effort on a connected "
-                    "Sampling Options node.")),
+                    "Ask the model to reason first, if it supports it; the thinking text "
+                    "comes back on the 'thinking' output.")),
                 io.Boolean.Input("keep_context", default=False, optional=True, tooltip=(
-                    "Continue the conversation: the previous turns (your prompts and the "
-                    "model's replies, text only) are prepended to the next run, so the "
-                    "model remembers what it already said. Kept per node and per "
-                    "server + model; switching it off clears the conversation, a failed "
-                    "run leaves it unchanged, and images are always sent fresh from the "
-                    "connected inputs, never from the history. Re-queueing with "
-                    "unchanged inputs is cached -- change the prompt to ask the next "
-                    "question.")),
+                    "Carry the previous turns (text only) into the next run so the model "
+                    "continues the conversation. Kept per node and per server + model; "
+                    "switching it off clears the history.")),
                 io.Boolean.Input("clear_vram", default=True, optional=True, tooltip=(
-                    "Call torch.cuda.empty_cache() after generation to free unused CUDA "
-                    "memory. Useful when switching between LLM and image generation tasks.")),
+                    "Free unused CUDA memory before the request, e.g. when alternating "
+                    "LLM and image runs.")),
                 io.Combo.Input("format", options=["text", "json"], default="text", optional=True, tooltip=(
-                    "'json' sets response_format to json_object (loose JSON mode, not "
-                    "schema-validated).")),
+                    "'json' sets response_format to json_object - loose JSON mode, "
+                    "not schema-validated.")),
                 io.Int.Input("frames_per_video", default=4, min=1, max=MAX_REF_SLOTS * 2, step=1, optional=True, tooltip=(
-                    "How many evenly-spaced frames to pull from each connected video. "
-                    "llama.cpp's chat API has no video field - clips are sampled into "
-                    "stills. First and last frame are always included. Most vision models "
-                    "degrade past roughly 8 images total.")),
+                    "Evenly-spaced frames pulled from each connected video (first and last "
+                    "always included). Most vision models degrade past roughly 8 images total.")),
                 io.Int.Input("max_image_size", default=0, min=0, max=4096, step=64, optional=True, tooltip=(
-                    "Downscale every reference so its long edge is at most this many "
-                    "pixels. 0 = send at original resolution. Useful when a big batch is "
-                    "bloating the request.")),
+                    "Downscale every reference so its long edge is at most this many pixels; "
+                    "0 = original resolution.")),
                 io.Autogrow.Input("images", template=images_template, optional=True, tooltip=(
-                    "Reference image or image batch. Connect one and another empty "
-                    "images slot appears. Batches are sent in full, unsampled. Whether "
-                    "the connected model actually sees these depends on it having vision "
-                    "support in llama.cpp.")),
+                    "Reference image or image batch, sent in full and unsampled. A new slot "
+                    "appears when you connect one.")),
                 io.Autogrow.Input("video", template=video_template, optional=True, tooltip=(
-                    "Reference video. Accepts a ComfyUI VIDEO or a raw IMAGE frame batch "
-                    "(e.g. VideoHelperSuite Load Video). Connect one and another empty "
-                    "video slot appears. Sampled down to 'frames_per_video' "
-                    "evenly-spaced frames.")),
+                    "Reference video: a ComfyUI VIDEO or a raw IMAGE frame batch (e.g. VHS "
+                    "Load Video), sampled down to 'frames_per_video' frames.")),
             ],
             outputs=[
                 io.String.Output("result"),
@@ -687,9 +537,8 @@ class GibbyGenerate(io.ComfyNode):
         debug_print = bool(options is not None and options.get("debug"))
 
         request_options = _normalize_stop(filter_enabled_options(options))
-        # Fixed seed by default: when the connected options carry no
-        # enable_seed toggle (Load Options only, or no options at all),
-        # send seed=0 instead of letting the server randomize each run.
+        # No enable_seed toggle in the options (Load Options only, or none at all):
+        # send seed=0 rather than let the server randomize each run.
         if "enable_seed" not in (options or {}):
             request_options = {**(request_options or {}), "seed": 0}
 
@@ -714,9 +563,7 @@ class GibbyGenerate(io.ComfyNode):
         user_message = {"role": "user", "content": _content_parts(
             prompt, _pipe_label(pipe, pipe_refs, kf_imgs, len(image_urls)), image_urls)}
 
-        # keep_context: carry this node's earlier turns (text only) into the
-        # request so the model continues the conversation. Off -> drop any
-        # stored conversation for this node + server + model.
+        # keep_context: prepend this node's earlier turns; off drops the history.
         node_id = getattr(getattr(cls, "hidden", None), "unique_id", None) or "generate"
         conv_key = (node_id, url, model)
         if keep_context:
@@ -745,9 +592,8 @@ format: {format}
         if clear_vram:
             _clear_vram("before the LLM server", verbose=debug_print)
 
-        # Unsloth keys model lookup to the identity it loaded the model
-        # under, so a hub repo id can miss a locally-loaded model (and
-        # trigger a download) -- resolve the local-first identity first.
+        # Unsloth keys model lookup to the identity it loaded under, so a hub repo
+        # id can miss a locally-loaded model (and re-download it).
         chat_model = _maybe_unsloth_load(url, model, api_key, options, debug_print) or model
 
         try:
@@ -766,17 +612,14 @@ format: {format}
             pprint(response)
             print("---------------------------------------------------------")
 
-        # Always printed, not just under debug -- this is the "yes, it just
-        # did real work" confirmation, not a diagnostic dump.
+        # Always printed: the "it did real work" confirmation, not a diagnostic.
         speed = describe_speed(response, elapsed_s)
         print(f"[Gibby-LLM] {model!r}: {speed} in {elapsed_s:.2f}s")
 
         result_text, thinking_text = extract_reply(response, think)
 
-        # Store the turn only after a successful run, so a failure never
-        # corrupts the conversation. The thinking text is deliberately not
-        # stored - it is the model's internal reasoning, not part of the
-        # dialogue.
+        # Store the turn only after a success, so a failure never corrupts the
+        # conversation. The thinking text is not part of the dialogue.
         if keep_context:
             turn: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
             if result_text:
@@ -785,10 +628,8 @@ format: {format}
 
         _maybe_unload(url, model, connectivity, debug_print)
 
-        # The pipe the wired references build: frame-batch videos join it as
-        # refs too, native Video objects don't - H3 needs raw frames. The
-        # generated text overwrites the prompt, so the pipe carries the LLM's
-        # description of the refs forward (an empty reply keeps the old one).
+        # Frame-batch videos join the pipe as refs too, native Video objects don't -
+        # H3 needs raw frames. The generated text becomes the pipe's prompt.
         out_pipe = pipe_add_images(media_pipe, [value for _index, _name, value in iter_numbered_slots(images or {}, "images")])
         videos = {name: value for _index, name, value in iter_numbered_slots(video or {}, "video")
                   if _is_frame_batch(value)}

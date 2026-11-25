@@ -1,77 +1,32 @@
 """
-Reference Latent (Context) node
--------------------------------
-Sets reference latents on conditioning from provided images.
+Reference Latent (Context): each image is resized to the megapixels target, scaled,
+VAE-encoded, and set as a reference on the conditioning.
 
-Each image is resized to the megapixels target, then scaled by the provided
-scale factor, encoded using the context's VAE, and set as reference_latents
-on the positive conditioning (and negative if cfg != 1).
+Which reference path a model takes:
+- ref_latents (default): the edit models - flux2/klein, flux3, fibo2, qwen image
+  edit, qwen 2.1. Off for krea, which only has the path by accident.
+- Vision-tower encoders (the Qwen-VL family: qwen image, qwen 2.1, krea2, mage,
+  boogu, ideogram4, joyimage, kandinsky5, fibo2) re-encode the context prompts
+  with the images at vl_megapixels, so a t2i model conditions on them with no
+  edit path. Flux3 is excluded: its Qwen3-VL encoder is text-only by training.
+  A tokenizer with no image template drops the images and warns.
+- HiDream-O1 and SenseNova take the raw image under reference_latents, not a
+  latent - their encoders are passthroughs and the DiT encodes. No VAE needed.
+- p-h3-image and MiniMax-H3-Image use minimax_refs {kind, latent_h, latent_w,
+  latent} blocks plus the matching Qwen vision copies for the <Picture n> slots.
+  They share a DiT class, so the text encoder tells them apart, and each sizes a
+  reference on its own grid (see _h3_ref_sizes): megapixels and scale resize the
+  picture first, then the model's own cap applies to the result. p-h3-image wants
+  its "Edit <Picture 1>. " prefix written in the prompt, not added here.
 
-Two independent paths, picked by the model and by its text encoder:
+Size floors: qwen 2.1 splices latents at the vision slots, so it floors to 2x the
+VAE ratio and shares one size between encoder and VAE. Fibo 2.0 shares one size
+because its tokenizer resizes for its own tower the way training did. Everything
+else floors to the VAE ratio and resizes the encoder's copy separately.
 
-- reference latents (ref_latents, on by default): the image is VAE-encoded and
-  set on the conditioning, which is what the edit models were trained to take
-  (flux2/klein, flux3, fibo2, qwen image edit, qwen 2.1). Off for a model that only has
-  the latent-concat path by accident (krea) - it was never trained on it.
-- the text encoder seeing the images: any model whose encoder runs a vision tower
-  (the Qwen-VL family: qwen image, qwen 2.1, krea2, mage, boogu, ideogram4,
-  joyimage, kandinsky5, fibo2) re-encodes the context prompts with the images at
-  vl_megapixels, so a t2i model conditions on them with no edit path at all.
-  Flux3 is left out - its Qwen3-VL encoder is text-only by training and its DiT
-  splices nothing. A tokenizer with no image template drops the images and warns
-  about it (MOSS-Image, and the passthrough encoders below).
-
-HiDream-O1 and SenseNova take the reference under reference_latents too, but as
-raw images rather than latents: their encoders are passthroughs that emit token
-ids and the DiT does the encoding. They get the resized image unchanged, which is
-what core's HiDream-O1 Reference Images attaches, and need no VAE. (That node also
-marks the negative prompt_type=negative - an image-only pass - which this one
-leaves to whoever owns the negative.)
-
-MiniMax's two image models (p-h3-image and MiniMax-H3-Image) take their references
-under minimax_refs instead: a list of {kind, latent_h, latent_w, latent} blocks the
-DiT re-injects every step, which is what core's H3 image conditioning sets, and
-their Qwen tower needs the matching vision copies so the <Picture n> slots are
-filled. Both size a reference on their own grid - p-h3-image inside the vision
-pixel budget and the generation area, MiniMax-H3-Image at a 1024 short edge for
-Qwen and 1024-2048 for the VAE - so megapixels and scale resize the picture first
-and the model's own cap applies to the result. They share the DiT class, so the
-text encoder tells them apart. p-h3-image wants its edit prompt prefixed with
-"Edit <Picture 1>. " - that text belongs in the prompt, so the node leaves it alone.
-
-Qwen Image 2.1 splices the latents at the vision slots, so it floors the size to
-2x the VAE's downscale ratio - every slot covers 2x2 latents - and shares one size
-between the encoder and the VAE. Fibo 2.0 shares it too for the opposite reason:
-its tokenizer resizes for its own tower the way training did - thumbnail to 768 a
-side, then Qwen3-VL's 32px grid - so a pre-shrunk copy would only cost it the
-resolution it reads at. Everything else floors to the VAE ratio and
-resizes the encoder's copy separately (flux2/klein and flux3 take the latents
-as-is; flux3's text encoder is text-only and its DiT patchifies nothing, so the
-ratio alone is the whole constraint).
-
-With the context's cfg at 1 a negative it carries is kept as it is (it only gains
-the references): cfg 1 never runs the negative, so a turbo model (fibo2) pays for no
-re-encode of it and a negative built outside the prompts survives the node. Only a
-negative that exists as prompt text alone becomes the zeroed positive, the way
-KSampler (Context) makes it.
-
-With ref_ctx_img the context's own image is referenced too: always
-when no image input is connected (at its own size, no rescale), and with image
-inputs connected only when the toggle is on - then it leads the reference list
-at its own size, and when the context has no image the first image input becomes
-the context image and is stored back on the output context.
-
-A reference is encoded whole unless tiled_vae_options carries the pack's Tiled
-VAE options: a reference at or above above_megapixels then goes through the tiled
-VAE, the same rule KSampler (Context) follows for the image it encodes, which is
-what a huge image costs when megapixels is 0 or ref_ctx_img references the
-context's image at its own size. Only that option of the list is read.
-
-A media pipe's reference images are referenced too - the wired images append
-to them in the output pipe; keyframes/videos/audios pass through untouched.
-
-Without a context the node is just a media pipe creator: the wired images
-append to the pipe and the context passes through empty.
+At cfg 1 a negative the context carries is only given the references - the
+negative never runs there. Only a negative that exists as prompt text alone
+becomes the zeroed positive, as KSampler (Context) makes it.
 """
 
 import comfy.model_base
@@ -124,26 +79,8 @@ class GibbyReferenceLatentContext(io.ComfyNode):
             display_name="Reference Latent (Context)",
             category="gibby",
             description=(
-                "Sets reference latents on conditioning from provided images. "
-                "Each image is resized to the megapixels target (0 = its own size), "
-                "scaled by the scale factor, encoded with the context VAE, and "
-                "referenced on positive/negative conditioning; a negative the "
-                "context carries survives cfg 1 unchanged. "
-                "A text encoder with a vision tower also sees the images, at "
-                "vl_megapixels, so a t2i model (krea) conditions on them with "
-                "ref_latents off. HiDream-O1 and SenseNova get the image itself "
-                "rather than a latent, which is what their models read. "
-                "p-h3-image and MiniMax-H3-Image are referenced as minimax_refs "
-                "blocks and Qwen vision copies, each sized on its own grid, and "
-                "p-h3-image wants the 'Edit <Picture 1>. ' prefix in the prompt. "
-                "ref_ctx_img also references the context's own image: always when "
-                "no image is connected, otherwise only when enabled - it leads at its own size, "
-                "and with no context image the first image becomes the context image and is stored back. "
-                "tiled_vae_options encodes a reference at or above above_megapixels in tiles, "
-                "like KSampler (Context). "
-                "A media pipe's reference images are referenced too - the wired images "
-                "append to them in the output pipe. Without a context the node is just "
-                "a media pipe creator: the wired images append to the pipe."
+                "Sets reference latents on the conditioning from the provided images, encoded with the context "
+                "VAE. A text encoder with a vision tower sees the images too."
             ),
             inputs=[
                 # All inputs optional, so the frontend renders them in declaration
@@ -152,8 +89,9 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                     "Base context; without it the node just builds a media pipe "
                     "from the connected images")),
                 io.Dict.Input("media_pipe", optional=True, tooltip=(
-                    "Media pipe - its reference images are referenced too (the wired images "
-                    "append to them in the output pipe); keyframes/videos/audios pass through untouched.")),
+                    "Media pipe: its reference images are referenced too, and the wired "
+                    "images append to them in the output pipe. Keyframes, videos and "
+                    "audios pass through untouched.")),
                 io.Autogrow.Input(
                     "images",
                     template=io.Autogrow.TemplateNames(
@@ -162,7 +100,6 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                         min=0,
                     ),
                     optional=True,
-                    tooltip="Reference images to encode as reference latents",
                 ),
                 io.Float.Input(
                     "megapixels",
@@ -186,7 +123,7 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                     "ref_latents",
                     default=True,
                     optional=True,
-                    tooltip="VAE-encode the images and reference them on the conditioning: on for the edit models (flux2/klein, flux3, qwen image edit, qwen 2.1). Off for a model that was never trained to take them (krea) - its text encoder still sees the images."
+                    tooltip="VAE-encode the images and reference them on the conditioning: on for the edit models (flux2/klein, flux3, qwen image edit, qwen 2.1), off for a model never trained to take them (krea)."
                 ),
                 io.Float.Input(
                     "vl_megapixels",
@@ -195,21 +132,19 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                     max=20.0,
                     step=0.01,
                     optional=True,
-                    tooltip="Size the text encoder sees the images at; 0 reuses the VAE-sized image. Ignored by qwen 2.1, whose encoder and VAE must share one size so every vision slot covers 2x2 latents, by fibo 2.0, whose tokenizer does its own training-time resize, and by the MiniMax H3 image models, which size the Qwen copy themselves."
+                    tooltip="Size the text encoder sees the images at; 0 reuses the VAE-sized image. Ignored by qwen 2.1 and fibo 2.0, which size the encoder's copy themselves, and by the MiniMax H3 image models."
                 ),
                 io.Boolean.Input(
                     "ref_ctx_img",
                     display_name="ref_ctx_img",
                     default=False,
                     optional=True,
-                    tooltip="Also reference the context's own image at its own size (no rescale): always when no image is connected, otherwise only when enabled. With no context image the first image becomes the context image and is stored back on the output context."
+                    tooltip="Also reference the context's own image, at its own size: always when no image is connected, otherwise only when enabled. With no context image, image_1 becomes the context image and is stored back."
                 ),
                 _KSAMPLER_OPTIONS_TYPE.Input("tiled_vae_options", optional=True, tooltip=(
-                    "The Tiled VAE options node, the same one KSampler (Context) takes: a "
-                    "reference at or above above_megapixels is encoded in tiles instead of "
-                    "whole, which is what a huge image costs when megapixels is 0 or "
-                    "ref_ctx_img references the context's image at its own size. "
-                    "Only the tiled_vae option in the list is read - the rest are ignored.")),
+                    "The Tiled VAE options node, as KSampler (Context) takes it: a reference "
+                    "at or above above_megapixels is encoded in tiles instead of whole. "
+                    "Only the tiled_vae option in the list is read.")),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output(display_name="context"),
@@ -246,16 +181,16 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         vae = context.get("vae")
         model = context.get("model")
         # hidream-o1 and sensenova read raw images off reference_latents and do their
-        # own patch-grid conditioning, so they get the pixels and no VAE at all
+        # own patch-grid conditioning - pixels, no VAE.
         raw_refs = _is_model(model, (comfy.model_base.HiDreamO1, comfy.model_base.SenseNovaU15))
         if (main is None and not extras and not pipe_refs) or (vae is None and ref_latents and not raw_refs):
             return io.NodeOutput(ctx_from(context), pipe_add_images(media_pipe, explicit))
 
         is_qwen21 = _is_model(model, comfy.model_base.QwenImage21)
         is_fibo2 = _is_model(model, comfy.model_base.Fibo2)
-        # MiniMax's two image models take their references as minimax_refs blocks plus the
-        # Qwen vision copies, never as reference_latents. They share the DiT class and the
-        # text encoder is what tells them apart (p-h3-image is the Qwen3-VL-4B one).
+        # MiniMax's two image models use minimax_refs blocks plus the Qwen vision
+        # copies, never reference_latents. They share the DiT class; the text encoder
+        # tells them apart (p-h3-image is the Qwen3-VL-4B one).
         h3_image = _is_model(model, comfy.model_base.MiniMaxH3Image)
         is_ph3 = isinstance(getattr(context.get("clip"), "tokenizer", None),
                             comfy.text_encoders.minimax.PH3ImageTokenizer)
@@ -266,11 +201,10 @@ class GibbyReferenceLatentContext(io.ComfyNode):
         # DiT splices nothing into the sequence, so it takes the latents alone
         vl_refs = _clip_takes_images(context.get("clip")) and not _is_model(model, comfy.model_base.Flux3)
         # Floor refs to the VAE's downscale ratio so the encode doesn't truncate them;
-        # qwen2.1 uses 2x so every vision slot covers 2x2 latents (Text Encode Qwen Image 2.1)
+        # qwen2.1 uses 2x so every vision slot covers 2x2 latents.
         dw, _ = _latent_downscale(vae, None)
         multiple = 2 * dw if is_qwen21 else dw
-        # the sampler's tiled VAE rule, applied per reference: only the tiled_vae
-        # option of the list means anything here
+        # The sampler's tiled VAE rule, applied per reference.
         tiled_above, tile_size, tile_overlap, temporal_size, temporal_overlap = _tiled_settings(tiled_vae_options)
 
         positive = context.get("positive")
@@ -294,8 +228,8 @@ class GibbyReferenceLatentContext(io.ComfyNode):
                 return
             if vl_refs:
                 # qwen2.1 must see the exact image the VAE encodes, fibo2 resizes its
-                # own copy to the trained grid; the others take the much smaller copy
-                # core's qwen image edit nodes feed the tower
+                # own copy to the trained grid; the others take the small copy core's
+                # qwen image edit nodes feed the tower.
                 vl = resized if is_qwen21 or is_fibo2 or vl_megapixels <= 0 else _resize_image_to_mp(resized, vl_megapixels, 1.0, dw)
                 images_vl.append(_over_white(vl))
             if ref_latents:
@@ -341,11 +275,10 @@ class GibbyReferenceLatentContext(io.ComfyNode):
             positive = node_helpers.conditioning_set_values(positive, {refs_key: refs})
             ctx["positive"] = positive
 
-        # cfg 1 never runs the negative, so a negative the context carries is kept
-        # as it is and only gains the refs - it can be conditioning a graph built
-        # outside the prompts. A negative that exists only as prompt text becomes the
-        # zeroed positive, since a turbo model (fibo2) at cfg 1 would throw the
-        # re-encode away
+        # cfg 1 never runs the negative, so a negative the context carries only gains
+        # the refs - it can be conditioning built outside the prompts. One that exists
+        # only as prompt text becomes the zeroed positive, which is what a turbo model
+        # at cfg 1 would throw away anyway.
         if refs:
             if negative:
                 ctx["negative"] = node_helpers.conditioning_set_values(negative, {refs_key: refs})

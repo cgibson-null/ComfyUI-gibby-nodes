@@ -1,26 +1,17 @@
 """
-Mask Edit node
---------------
-The mask manipulation the detection and crop nodes used to carry, in one node:
-grow and invert (the native Grow Mask / Invert Mask), an edge feather (the
-gaussian the native Blur Image applies, on the mask), isolated-pixel removal and
-hole filling (the Essentials Mask Fix opening and the hole closing KJ's blur
-grow uses), and background removal, which replaces the unmasked area with
-rembg_color (alpha 0 makes it transparent instead).
+Mask Edit (Context): the mask manipulation the detection and crop nodes used to
+carry, in one node - grow, invert, edge feather, isolated-pixel removal, hole
+filling, and background removal (the unmasked area replaced with rembg_color).
 
-It also owns the tinted preview: the mask color blended over the image (KJNodes
-ImageAndMaskPreview style); a batch of frames previews as a video at
-preview_fps, blended and encoded one frame at a time the way the native
-SAM3 Track Preview does it (a display-only artifact, so it skips the Save Video
-encoder settings for a fast x264 preset).
+It also owns the tinted preview: the mask colour blended over the image, a batch
+of frames previewing as a video at preview_fps.
 
 Chain it after Mask/Segment (Context) to clean a detection up before cropping by
 it, or after Image Crop By Mask (Batch) (Context) to knock the background out of
 the crop. The edited image and mask replace the context's. A crop info that
-describes the image being edited is refreshed to the edited mask, so a paste back
+describes the image being edited is refreshed to the edited mask so a paste back
 honors the edit; a crop's own - whose mask is the full frame the crop came from -
-does not match and passes through untouched, so Image Paste By Mask (Batch)
-(Context) still pastes onto the frame the crop was taken from.
+passes through untouched.
 """
 
 import os
@@ -49,6 +40,9 @@ def _fix_mask(mask, remove_isolated_pixels, fill_holes):
     if remove_isolated_pixels:
         mask = _open_mask(mask, remove_isolated_pixels)
     if fill_holes:
+        # shortcut: ndimage labels one frame at a time, so a long 4K batch pays a
+        # scipy pass per frame; there is no gpu equivalent. Upgrade if that ever
+        # dominates a run.
         arr = mask.cpu().numpy()
         filled = np.empty(arr.shape, dtype=np.float32)
         for i, m in enumerate(arr):
@@ -144,19 +138,8 @@ class GibbyMaskEdit(io.ComfyNode):
             is_output_node=True,
             search_aliases=["mask", "grow", "invert", "blur", "feather", "background", "preview"],
             description=(
-                "Edits the mask (connected mask wins over the context one) and stores the "
-                "resulting image and mask back in the context; the context's model and clip "
-                "pass through untouched. A crop info that describes the image being edited is "
-                "refreshed to the edited mask, so a paste back honors the edit, while a crop's "
-                "own passes through untouched. The mask is cleaned first "
-                "(remove_isolated_pixels drops isolated specks, fill_holes closes the holes the "
-                "mask encloses), then its edge is feathered by mask_blur pixels and it is grown "
-                "and inverted, so growing enlarges what is left instead of the specks. remove_bg "
-                "replaces the unmasked area with rembg_color "
-                "(an alpha 0 color makes it transparent instead). With preview on, the node "
-                "displays the image with the mask tinted in the mask color. Use it after "
-                "Mask/Segment (Context) to clean a detection up before cropping by it, or after "
-                "Image Crop By Mask (Batch) (Context) to knock the background out of the crop."
+                "Edits the mask, or the context's when none is connected, and stores the image and mask back in "
+                "the context."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True,
@@ -169,24 +152,23 @@ class GibbyMaskEdit(io.ComfyNode):
                 # the widgets below keep this declaration order (execute's defaults
                 # match each widget's default for the case an input is omitted).
                 io.Int.Input("remove_isolated_pixels", optional=True, default=0, min=0, step=1,
-                             tooltip="Opening kernel that drops isolated mask specks (0 = off); runs first"),
-                io.Boolean.Input("fill_holes", optional=True, default=False, tooltip="Close the holes the mask encloses"),
+                             tooltip="Opening kernel that drops mask specks; runs first"),
+                io.Boolean.Input("fill_holes", optional=True, default=False),
                 io.Int.Input("mask_blur", optional=True, default=0, min=0, max=63, step=1,
-                             tooltip="Feathers the mask edge over this many pixels (0 = off), the gaussian kernel of the native Blur Image at sigma = radius / 3; runs after the cleanup so the ramp follows the cleaned shape"),
+                             tooltip="Native Blur Image kernel at sigma = radius / 3; runs after the cleanup"),
                 io.Int.Input("mask_grow", optional=True, default=0, min=-nodes.MAX_RESOLUTION, max=nodes.MAX_RESOLUTION, step=1,
-                             tooltip="Grows the mask by this many pixels (negative shrinks it), like the native Grow Mask with tapered corners"),
+                             tooltip="Negative shrinks; native Grow Mask with tapered corners"),
                 io.Boolean.Input("mask_invert", optional=True, default=False,
-                                 tooltip="Inverts the mask after growing, like the native Invert Mask"),
+                                 tooltip="Runs after mask_grow"),
 
-                io.Boolean.Input("remove_bg", optional=True, default=False,
-                                 tooltip="Replaces the unmasked area with rembg_color"),
+                io.Boolean.Input("remove_bg", optional=True, default=False),
                 io.Color.Input("rembg_color", optional=True, socketless=False, default="#000000",
-                               tooltip="Background color; connect the hex output of a Color Picker. Alpha 0 makes the background transparent instead (RGBA output)"),
+                               tooltip="Alpha 0 makes the background transparent instead (RGBA output)"),
 
-                io.Boolean.Input("preview", optional=True, default=True, tooltip="Show the mask tinted in the mask color over the image (video if the input is a batch of frames)"),
+                io.Boolean.Input("preview", optional=True, default=True, tooltip="The mask tinted over the image; video when the input is a frame batch"),
                 io.Float.Input("preview_fps", optional=True, default=30.0, min=1.0, max=120.0, step=1.0,
-                               tooltip="Frame rate of the preview when the input is a batch of frames (video)"),
-                io.Color.Input("mask_color", optional=True, default="#FF00FF80", tooltip="Mask tint color, #RRGGBB or #RRGGBBAA (the alpha is the opacity)"),
+                               tooltip="Only when the input is a frame batch"),
+                io.Color.Input("mask_color", optional=True, default="#FF00FF80", tooltip="#RRGGBB or #RRGGBBAA; the alpha is the opacity"),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output("context"),

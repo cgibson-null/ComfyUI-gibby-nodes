@@ -25,3 +25,6 @@ Thumbs.db
 # Runtime caches
 lora_info_cache.json
 model_info_cache.json
+
+# Local scratch tests for a feature in progress
+tests/

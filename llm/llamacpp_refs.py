@@ -1,28 +1,9 @@
-"""Reference-material collection helpers for the Gibby LLM Connect nodes.
+"""Reference-material collection for the LLM Connect nodes: turn image and video
+slots into one flat list of image data URLs.
 
-Why this module exists
-----------------------
-llama.cpp's OpenAI-compatible ``/v1/chat/completions`` endpoint has no video
-field either -- vision input is a list of ``image_url`` content parts on a
-message, each one a still image. So every "video" reference still has to be
-reduced to a handful of representative frames before it can reach the model,
-exactly like it did for Ollama.
-
-This module funnels arbitrary reference material into a flat list of image
-data URLs. What the caller does with that list (Ollama's ``images`` field vs.
-llama.cpp's ``image_url`` content parts) is none of this module's business --
-it is ported unchanged from ``ollama_refs.py`` in the Ollama-Enhanced pack,
-because none of this logic was ever Ollama-specific to begin with.
-
-* ``images_1``, ``images_2``, ... -- IMAGE batches, passed through verbatim.
-* ``video_1``, ``video_2``, ...   -- VIDEO objects or IMAGE batches treated as
-  footage, sub-sampled to N evenly-spaced frames.
-
-Ordering is deterministic: all image slots in ascending slot order, then all
-video slots in ascending slot order.
-
-Nothing here imports torch at runtime. Frame tensors are duck-typed; the only
-thing we need from them is ``.shape``, indexing and ``.cpu().numpy()``.
+The chat API has no video field, so a video reference is always reduced to
+evenly-spaced stills. Image slots come first in ascending order, then video
+slots. Frame tensors are duck-typed; nothing here imports torch.
 """
 
 from __future__ import annotations
@@ -39,30 +20,21 @@ from ..pipes.media_pipe import iter_numbered_slots
 
 logger = logging.getLogger(__name__)
 
-# Socket name prefixes. The JS extension (web/js/GibbyLLMNode.js) grows
-# sockets using these exact prefixes.
+# Socket name prefixes; the JS extension grows sockets using these exact names.
 IMAGE_SLOT_PREFIX = "images"
 VIDEO_SLOT_PREFIX = "video"
 
-# Upper bound on how many sockets the frontend is allowed to grow to. This is a
-# sanity rail, not a hard API limit; vision models generally fall apart well
-# before this many references.
+# Sanity rail on how many sockets the frontend may grow to; vision models fall
+# apart well before this many references.
 MAX_REF_SLOTS = 32
 
-# Soft warning threshold for total images sent in a single request.
+# Soft warning threshold for total images sent in one request.
 WARN_TOTAL_IMAGES = 16
 
-# --------------------------------------------------------------------------
-# Frame sampling
-# --------------------------------------------------------------------------
 
 def evenly_spaced_indices(total: int, count: int) -> list[int]:
-    """Pick ``count`` evenly-spaced indices out of ``range(total)``.
-
-    Always includes the first and last frame when ``count >= 2``. A request for
-    a single frame returns the middle one, which is far more representative of
-    a clip than frame 0 (which is often black or a fade-in).
-    """
+    """``count`` evenly-spaced indices out of ``range(total)``, always including
+    first and last. A single frame is the middle one - frame 0 is often black."""
     if total <= 0:
         return []
     count = max(1, min(int(count), total))
@@ -73,12 +45,9 @@ def evenly_spaced_indices(total: int, count: int) -> list[int]:
 
 
 def evenly_spaced_timestamps(start: float, duration: float, count: int) -> list[float]:
-    """Same idea as :func:`evenly_spaced_indices` but in the time domain.
-
-    Used when we sample a container with PyAV and only know the duration, not
-    the exact frame count. The last sample is nudged slightly inside the clip
-    so a seek to exactly ``end`` doesn't land past the final packet.
-    """
+    """The same in the time domain, for a container sampled by duration rather than
+    frame count. The last sample stays just inside the clip so a seek to ``end``
+    does not land past the final packet."""
     count = max(1, int(count))
     if duration <= 0:
         return [start]
@@ -88,10 +57,6 @@ def evenly_spaced_timestamps(start: float, duration: float, count: int) -> list[
     step = (end - start) / (count - 1)
     return [start + i * step for i in range(count)]
 
-
-# --------------------------------------------------------------------------
-# Encoding
-# --------------------------------------------------------------------------
 
 def _frame_tensor_to_pil(frame: Any) -> Image.Image:
     """Convert a single ComfyUI IMAGE frame (``[H, W, C]``, float 0-1) to PIL."""
@@ -116,11 +81,10 @@ def _downscale(image: Image.Image, max_size: int) -> Image.Image:
 def pil_to_data_url(image: Image.Image, max_size: int = 0) -> str:
     """Encode a PIL image as a JPEG data URL, optionally downscaled first.
 
-    JPEG rather than PNG because a vision model reads a picture at its own patch
-    grid: the lossless PNG of a 4K render is 23 MiB of base64 against the 3 MiB
-    of its JPEG and carries nothing the model can use for it, while the size is
-    what walks a run of references into the server's request-body limit (HTTP
-    413). Alpha is dropped -- the vision tower has no use for it.
+    JPEG, not PNG: a vision model reads a picture at its own patch grid, so the
+    lossless 23 MiB base64 of a 4K render carries nothing its 3 MiB JPEG does
+    not, while that size is what walks a run of references into the server's
+    request-body limit (HTTP 413). Alpha is dropped for the same reason.
     """
     image = _downscale(image, max_size)
     if image.mode not in ("RGB", "L"):
@@ -129,10 +93,6 @@ def pil_to_data_url(image: Image.Image, max_size: int = 0) -> str:
     image.save(buffered, format="JPEG", quality=90)
     return "data:image/jpeg;base64," + base64.b64encode(buffered.getvalue()).decode("ascii")
 
-
-# --------------------------------------------------------------------------
-# Source adapters
-# --------------------------------------------------------------------------
 
 def _is_frame_batch(value: Any) -> bool:
     """True for a ComfyUI IMAGE batch (a ``[N, H, W, C]`` tensor)."""
@@ -158,14 +118,9 @@ def encode_image_batch(value: Any, max_size: int = 0) -> list[str]:
 
 
 def _sample_video_with_pyav(video: Any, frames: int, max_size: int) -> list[str] | None:
-    """Sample a VIDEO by seeking, so we never materialise the whole clip.
-
-    ``VideoInput.get_components()`` decodes every frame into RAM -- a 30 second
-    1080p clip is roughly 22 GB as float32. Seeking to N timestamps keeps
-    memory flat regardless of clip length.
-
-    Returns ``None`` if this path isn't viable, so the caller can fall back.
-    """
+    """Sample a VIDEO by seeking, so memory stays flat: get_components() decodes
+    the whole clip (a 30s 1080p clip is ~22 GB as float32).
+    Returns None when this path is not viable, so the caller can fall back."""
     try:
         import av  # noqa: PLC0415 - optional, ships with ComfyUI's video support
     except ImportError:
@@ -242,13 +197,9 @@ def _decode_frame_at(container: Any, stream: Any, seconds: float) -> Image.Image
 
 def encode_video(value: Any, frames: int, max_size: int = 0) -> list[str]:
     """Reduce one video reference to ``frames`` evenly-spaced image data URLs.
-
-    Accepts either a ComfyUI ``VIDEO`` object or a raw IMAGE batch (what
-    VideoHelperSuite's Load Video hands back as frames).
-    """
+    Accepts a ComfyUI ``VIDEO`` object or a raw IMAGE frame batch."""
     frames = max(1, int(frames))
 
-    # Raw frame batch (VHS and friends) -- index-sample directly.
     if _is_frame_batch(value):
         indices = evenly_spaced_indices(int(value.shape[0]), frames)
         return [pil_to_data_url(_frame_tensor_to_pil(value[i]), max_size) for i in indices]
@@ -266,10 +217,6 @@ def encode_video(value: Any, frames: int, max_size: int = 0) -> list[str]:
     return encode_image_batch(value, max_size)
 
 
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
-
 def collect_reference_images(
     slot_values: dict[str, Any],
     frames_per_video: int = 4,
@@ -277,12 +224,8 @@ def collect_reference_images(
     debug: bool = False,
 ) -> tuple[list[str] | None, list[str]]:
     """Turn every populated image/video slot into one flat list of image data URLs.
-
-    Returns ``(image_urls, report)``. ``image_urls`` is ``None`` when nothing
-    was connected. The caller decides how to attach that list to a request --
-    see ``LLMConnect.py`` for the ``image_url`` content-part wrapping.
-    ``report`` is a per-slot human-readable summary for debug output.
-    """
+    Returns ``(image_urls, report)``; image_urls is None when nothing was
+    connected, report is the per-slot summary for debug output."""
     encoded: list[str] = []
     report: list[str] = []
 

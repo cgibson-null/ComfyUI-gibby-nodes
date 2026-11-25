@@ -23,9 +23,8 @@ class GibbyContextOverride(io.ComfyNode):
             display_name="Context Override",
             category="gibby/context",
             description=(
-                "Overrides parts of a CONTEXT object. Connected inputs replace their "
-                "values directly; the toggles gate widget overrides for sampling "
-                "parameters and prompts (which also regenerates the conditionings)."
+                "Overrides parts of a CONTEXT object. Connected inputs replace their values directly; the "
+                "toggles gate the widget overrides, and overriding the prompts regenerates the conditionings."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context"),
@@ -36,13 +35,13 @@ class GibbyContextOverride(io.ComfyNode):
                 io.Mask.Input("mask", optional=True),
                 io.Audio.Input("audio", optional=True),
                 io.Mask.Input("mask_audio", optional=True),
-                io.Boolean.Input("override_sampling", default=False, tooltip="Override the context's sampling values with the widgets below."),
+                io.Boolean.Input("override_sampling", default=False),
                 io.Int.Input("steps", default=20),
                 io.Int.Input("step_refiner", default=0),
                 io.Float.Input("cfg", default=1.0),
                 io.Combo.Input("sampler", options=comfy.samplers.KSampler.SAMPLERS, default="euler"),
                 io.Combo.Input("scheduler", options=comfy.samplers.KSampler.SCHEDULERS, default="normal"),
-                io.Boolean.Input("override_prompts", default=False, tooltip="Override the context's prompts with the widgets below and regenerate its conditionings from them."),
+                io.Boolean.Input("override_prompts", default=False, tooltip="Also regenerates the context's conditionings"),
                 io.String.Input("positive_prompt", multiline=True, default=""),
                 io.String.Input("negative_prompt", multiline=True, default=""),
             ],

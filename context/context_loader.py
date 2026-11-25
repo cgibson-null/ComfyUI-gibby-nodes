@@ -1,26 +1,14 @@
 """
-Context Loader node
--------------------
-A self-contained context source with a mode selector for the loading category:
+Context Loader: a self-contained context source with a mode selector - separate
+unet/clip/vae selectors, or a full checkpoint. With a context connected, its
+values carry through for anything the node does not load or receive connected.
 
-- diffusion model: separate unet/clip/vae selectors, each left on "None" to skip.
-- checkpoint: loads a full checkpoint like Load Checkpoint.
-
-With a context connected, its values carry through for anything the node
-does not load or receive connected; the loaded models, connected values and
-widget values override its matching fields.
-
-Carries the sampling parameters as widgets, and always fills in derived values on demand:
-
-- positive/negative conditioning encoded from the prompt widgets via clip
-- latent from image via VAE encode if present (with optional noise mask)
-- empty latent when width/height are given with nothing to sample from
-
-Use Context to merge or override individual values of this context downstream.
+It carries the sampling parameters as widgets and always fills in derived values
+on demand: conditioning from the prompt widgets, a latent from an image via VAE
+encode (with the noise mask when present), or an empty latent from width/height.
 """
 
 import logging
-import weakref
 
 import torch
 
@@ -37,41 +25,15 @@ except ImportError:
     logging.warning("[Gibby Context Loader] ModelAttentionBackend is missing - ck_attn is disabled (update ComfyUI)")
 
 from ..lora_loader import _apply_lora, iter_lora_stack
-from . import _CONTEXT_TYPE, _lora_stack, ctx_from, ctx_set_image, ctx_set_latent, GibbyContext
+from . import _CONTEXT_TYPE, _lora_stack, WeakCache, ctx_from, ctx_set_image, ctx_set_latent, GibbyContext
 
 # execute() runs once per list item when a list input is mapped over, so the
 # model loads are cached: each part is built once per key, not once per item.
-# A single entry per part keeps the cache from holding extra models in memory.
-class _WeakCache:
-    """One load, held weakly by key.
-
-    A list-mapped execute() has to build each part once for the whole list, but
-    the module must not be what keeps the result alive afterwards: a strong
-    reference held the last checkpoint, clip and VAE in host RAM for the rest of
-    the server session, past unload_all_models from the Clear VRAM options. A dead
-    reference is a miss, so the model goes when ComfyUI drops it."""
-
-    def __init__(self):
-        self.key = None
-        self.refs = None
-
-    def get_or_load(self, key, load):
-        """The objects load() returns (a tuple), for this key only."""
-        if self.key == key:
-            values = tuple(ref() for ref in self.refs)
-            if all(values):
-                return values
-        values = tuple(load())
-        self.key = key
-        self.refs = tuple(weakref.ref(value) for value in values)
-        return values
-
-
-_last_checkpoint = _WeakCache()  # ckpt_name -> (model, clip, vae)
-_last_unet = _WeakCache()  # (unet_name, weight_dtype) -> (model,)
-_last_clip = _WeakCache()  # (clip_path, type, device) -> (clip,)
-_last_vae = _WeakCache()  # vae_name -> (vae,)
-_last_vae_audio = _WeakCache()  # vae_audio_name -> (vae_audio,)
+_last_checkpoint = WeakCache()  # ckpt_name -> (model, clip, vae)
+_last_unet = WeakCache()  # (unet_name, weight_dtype) -> (model,)
+_last_clip = WeakCache()  # (clip_path, type, device) -> (clip,)
+_last_vae = WeakCache()  # vae_name -> (vae,)
+_last_vae_audio = WeakCache()  # vae_audio_name -> (vae_audio,)
 
 
 def _load_checkpoint(ckpt_name):
@@ -115,10 +77,10 @@ class GibbyContextLoader(io.ComfyNode):
             display_name="Context Loader",
             category="gibby/context",
             description=(
-                "Loads models via a mode selector (diffusion model parts or checkpoint), "
-                "carries sampling parameters, and fills in derived values. With a context "
-                "connected, its values carry through for anything the node does not load "
-                "or receive connected; the widget values override its matching fields."
+                "Loads models via a mode selector (diffusion model parts or checkpoint) "
+                "and carries the sampling parameters. A connected context supplies anything "
+                "this node does not load; its widgets override the context's matching "
+                "fields."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True, tooltip=(

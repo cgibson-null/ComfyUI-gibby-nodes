@@ -1,71 +1,35 @@
 """
-Resize Image / Empty Latent (Context)
--------------------------------------
-Creates an empty latent from a resolution spec instead of raw width/height.
+Resize Image / Empty Latent (Context): an empty latent from a resolution spec
+instead of raw width/height, plus the media fit, load, crop and preview around it.
 
-Four modes (switched by the horizontal mode toggle in resolution_latent.js):
-- keep_ar: resizes the linked media to the megapixels target at its own aspect
-  ratio (native Scale Image to Total Pixels math);
+Four modes, all widgets always visible - the mode only picks which math drives
+the target size:
+- keep_ar: the media's own aspect ratio at the megapixels target;
 - custom: explicit width x height;
 - aspect_ratio: portrait presets (1:1, 2:3, 3:4, 9:16, 9:21) + megapixels;
 - custom_aspect_ratio: manual x : y floats + megapixels.
 
-The presets are portrait-only; Swap dimensions is the landscape switch, and
-"closest to image" picks the preset nearest the media's ratio in the media's own
-orientation (a landscape media gets the preset's swapped form, never 1:1).
+The presets are portrait-only, so Swap dimensions is the landscape switch and
+"closest to image" takes the preset nearest the media's ratio in the media's own
+orientation. Megapixels 0 means no target pixel count: the media's own size,
+rescaled by scale_factor, or 1 MP with no media. Swap dimensions is ignored
+whenever the target comes from the media - a media-derived target has no
+orientation to swap, and swapping it would stretch the media back.
 
-Megapixels 0 in the ratio modes: no target pixel count - the media's own size
-is used (rescaled by scale_factor) instead, or 1 MP when no media is linked.
-Swap dimensions flips the chosen size spec's orientation (portrait preset to
-landscape) and is ignored whenever the target comes from the media - megapixels
-0, keep AR, or closest to image - because a media-derived target has no
-orientation to swap; swapping it would stretch the media back.
+With an image or mask connected, the target size becomes a box the media is
+fitted into per keep_proportion (Resize Image v2 semantics); pad_around keeps
+the original centered and pads the box around it. An upscale_model runs first,
+but the size spec still follows the original image, so scale_factor and not the
+model's factor sets the final size.
 
-All widgets are always visible; the mode only selects which math drives the
-target size.
-
-Shared across all modes: swap_dimensions, scale_factor (resolution multiplier),
-multiple (round down to this multiple, advanced) and batch_size. The latent type
-toggle picks between the standard 4ch /8x image latent and Flux2's 128ch /16x one
-(what the Flux2, klein, Flux3, Fibo 2.0 and MOSS image models use; the context's
-model overrides it - its latent format decides, whatever model that is).
-Outputs the context, empty_latent, encoded_latent and the computed width/height
-for downstream sizing.
-
-With an image or mask connected: the mode's target size becomes a box that the
-media is fitted into using keep_proportion (Resize Image v2 semantics - stretch,
-resize, pad with pad_color/crop_position, pad_around (keeps the original size
-centered and pads the box around it, like Pad Image for Outpainting), crop,
-total_pixels), and the resized media plus a matching latent are output.
-
-Optional upscale_model (Load Upscale Model): when connected and an image is
-linked, the image is first upscaled with it (Upscale Image (using Model))
-before the resize. The size spec follows the original image's size, so the
-upscaled result is fitted back into the target box (scale factor, not the
-model's factor, sets the final size).
-
-Load image (Load Image node functionality): loads a file from the input folder
-by path (the upload button, a file dropped on the node, a pasted image,
-preview + mask drawing on the preview, like the core Load Image - the drawn
-mask is the file's alpha). The loaded image replaces the connected one, and the
-file's alpha replaces the connected or context mask.
-
-With an image or a context's image connected, the node shows the output
-image's temp preview in the node on execution (like the core Preview
-Image). The enable preview toggle (off by default) controls it: off, no
-temp file is written at all; it is always written while Load image or
-Crop image is on (the toggle is hidden then), because downstream crop
-views read the context's image from it. A mask drawn on that preview is
-used the same way: the core mask editor rewrites the file combo to its
-clipspace-painted-masked-*.png upload, and the file's alpha becomes the
-mask - replacing the connected one, resized to the output size. Crop
-image's box mask still wins over it.
-Crop image is independent of it: it crops the image the resize uses (the
-loaded file with Load image on, else the connected or context image) to the
-drawn box (the crop preview's AR follows the size mode when set to selected),
-the box mask becomes the mask, and the crop info (the original image, the box
-mask and the box as the paste rect) is output and stored for pasting back
-with Image Paste By Mask (Batch) (Context).
+Load image replaces the connected image with a file from the input folder and its
+alpha with the mask. Enable preview writes the node's temp preview; it is always
+written while Load image or Crop image is on, because the downstream crop views
+read the context's image from it. A mask drawn on that preview becomes the mask
+through the file combo, the way the core mask editor works.
+Crop image is independent of both: it crops to the drawn box, the box mask
+becomes the mask, and the crop info is output and stored for pasting back with
+Image Paste By Mask (Batch) (Context).
 """
 
 import math
@@ -409,29 +373,8 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
             # output node: runs (and refreshes the preview) even with nothing connected
             is_output_node=True,
             description=(
-                "Creates an empty latent from a resolution spec instead of raw width/height. "
-                "Modes: keep AR (megapixels at the media's aspect ratio, like Scale Image to Total Pixels), "
-                "custom (width x height), aspect ratio (preset, or closest to the image, + megapixels) "
-                "or custom aspect ratio (manual w:h + megapixels). Megapixels 0 rescales the media's own size instead, or "
-                "defaults to 1 MP with no media linked. "
-                "Shared: swap dimensions, scale factor, multiple and batch size; latent type toggle for "
-                "standard 8x vs 16x (128ch) latents. With an image or mask connected (the context's when "
-                "nothing is) it is fitted into the target box per keep_proportion (stretch/resize/pad/pad_around/"
-                "crop/total_pixels; pad_around keeps the original size centered and pads the box around it like "
-                "Pad Image for Outpainting) and output resized. "
-                "Load image loads a file from the input folder (upload button, drop a file on the node, "
-                "paste, preview and mask drawing like the core Load Image) instead of the connected image; its alpha replaces the connected or context mask when non-empty. "
-                "Crop image is independent of it: it crops the image the resize uses (the loaded file with Load image on, "
-                "else the connected or context image) to the drawn box, the box mask becomes the mask, and the crop info "
-                "is output and stored for pasting back with Image Paste By Mask (Batch) (Context). "
-                "Enable preview (off by default, hidden while Load image or Crop image is on) writes and shows the "
-                "output image's temp preview in the node on execution (like the core Preview Image); off writes no "
-                "preview file at all, and while Load image or Crop image is on the preview is always written - "
-                "downstream crop views read the context's image from it. "
-                "An optional vae overrides the context's vae; encoded_latent outputs the resized image "
-                "encoded with it (the context's vae when unconnected), or empty_latent without an image or vae. "
-                "mask_padded marks the pad border (1 = padding, 0 elsewhere). The image output is black and the "
-                "mask outputs are empty (all 0) when there is no media or mask, so downstream previews never fail."
+                "Creates an empty latent from a resolution spec instead of raw width/height, and fits a "
+                "connected image or mask into the same target box."
             ),
             inputs=[
                 # Optional context: width/height overridden with finalized size; latent or image+latent updated.
@@ -460,32 +403,29 @@ class GibbyEmptyLatentResolution(io.ComfyNode):
                 io.Combo.Input("crop_position", options=CROP_POSITIONS, default="center", advanced=True),
                 # shared settings (plain booleans render as pill toggles).
                 io.Boolean.Input("swap_dimensions", display_name="Swap dimensions", default=False,
-                                  tooltip="Flip the size spec's orientation (a portrait preset or width x height becomes landscape); ignored while the target comes from the media - megapixels 0, keep AR or closest to image"),
+                                  tooltip="Flip the size spec's orientation (a portrait preset or width x height becomes landscape); ignored while the target comes from the media"),
                 io.Int.Input("multiple", default=8, min=1, max=256, advanced=True),
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
                 # latent format: on = Flux 2's 128ch /16x latent, off = standard 4ch /8x.
                 io.Boolean.Input("flux2_latent", display_name="Flux 2 latent (16x)", default=False,
-                                 tooltip="Flux2's 128ch /16x latent format (Flux2, klein, Flux3, Fibo 2.0 and MOSS image use it); off is the standard 4ch /8x image latent. Ignored when the context has a model - its latent format decides the format"),
-                # The executed temp preview in the node (like the core Preview Image):
-                # off by default - off writes no temp file at all. Hidden by the
-                # frontend while load or crop is on, where the preview is always
+                                 tooltip="Flux2's 128ch /16x latent format (Flux2, klein, Flux3, Fibo 2.0, MOSS image); off is the standard 4ch /8x one. Ignored when the context has a model - its latent format decides"),
+                # The executed temp preview in the node (like the core Preview Image).
+                # Hidden by the frontend while load or crop is on, where it is always
                 # written (downstream crop views read the context's image from it).
                 io.Boolean.Input("enable_preview", display_name="Enable preview", default=False, optional=True,
-                                  tooltip="Write and show the output image's temp preview in the node on execution (like the core Preview Image); off writes no preview file at all. Hidden while Load image or Crop image is on, where the preview is always written - downstream crop views read the context's image from it"),
+                                  tooltip="Write and show the output image's temp preview in the node on execution, like the core Preview Image; off writes no preview file. Always on while Load image or Crop image is on"),
                 # Load image: the core Load Image's path combo (upload, preview, mask
-                # drawing) replaces the connected image with the file's. All five are
-                # optional: a prompt without them (pre-feature workflows, API users)
-                # runs exactly like before the feature.
+                # drawing) replaces the connected image with the file's.
                 io.Boolean.Input("load_image", display_name="Load image", default=False, optional=True,
-                                 tooltip="Load an image from the input folder instead of the connected one; its alpha (the mask drawn on the preview) replaces the connected or context mask when non-empty"),
+                                 tooltip="Its alpha (the mask drawn on the preview) replaces the connected or context mask when non-empty"),
                 io.Combo.Input("image", options=files, default=files[0] if files else "", upload=io.UploadType.image, optional=True,
-                               tooltip="The file in the input folder to load (the upload button, a file dropped on the node or a pasted image adds it here, or draw a mask on the preview - it is saved as the file's alpha). With Load image off it is where a mask drawn on the node's executed preview lands (the core mask editor), and its alpha is used as the mask"),
+                               tooltip="The file in the input folder to load; upload, drop or paste adds it here. A mask drawn on this node's preview is saved as the file's alpha, and lands here even with Load image off"),
                 io.Boolean.Input("crop_image", display_name="Crop image", default=False, optional=True,
-                                 tooltip="Crop the image the resize uses (the loaded file with Load image on, else the connected or context image) to the drawn box before the resize; the box mask becomes the mask and the crop info is output and stored in the context"),
+                                 tooltip="Crop the image the resize uses to the drawn box before the resize; the box mask becomes the mask and the crop info is output and stored in the context"),
                 io.Combo.Input("crop_ar", options=["custom", "selected"], default="custom", optional=True,
-                               tooltip="The crop box's aspect ratio: custom is a free box, selected follows the size mode (the image's AR for keep AR, width x height for custom, the preset or manual ratio for the AR modes)"),
+                               tooltip="The crop box's aspect ratio: custom is a free box, selected follows the size mode"),
                 io.BoundingBox.Input("crop_region", default={"x": 0, "y": 0, "width": 512, "height": 512}, optional=True,
-                                     tooltip="The crop box in the image's pixels (drawn on the preview)"),
+                                     tooltip="In the image's own pixels"),
                 # Optional Load Upscale Model: when linked and an image is present, upscale it
                 # (Upscale Image (using Model)) before the resize.
                 io.UpscaleModel.Input("upscale_model", optional=True),

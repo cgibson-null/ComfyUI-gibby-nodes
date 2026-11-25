@@ -24,9 +24,8 @@ class GibbySamplingParametersContext(io.ComfyNode):
             display_name="Sampling Parameters (Context)",
             category="gibby/context",
             description=(
-                "Holds sampling parameters as widgets and passes them through "
-                "individually. With a context connected, the widget values "
-                "override its steps, step_refiner, cfg, sampler and scheduler."
+                "Holds sampling parameters as widgets and passes them through individually. With a context "
+                "connected, the widgets override its values."
             ),
             # All inputs optional (like rgthree's Context Big) so the context input,
             # declared first, renders at the top instead of after required widgets.

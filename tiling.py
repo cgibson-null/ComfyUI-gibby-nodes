@@ -1,21 +1,12 @@
 """
-Split Tiles (Context) / Combine Tiles (Context)
------------------------------------------------
-Tiling for tiled sampling/upscale. Split Tiles cuts the context image into a
-batch of uniform, overlapping tiles (rows x cols, overlap as a fraction of
-the tile size) and outputs the tiles, a matching batch of masks for the
-crop-inpaint options, and the tiling info. The tiling info also travels in
-the output context, so the tiles can be recombined with Combine Tiles after
-they've been processed (e.g. upscaled and sampled per tile).
+Split Tiles (Context) / Combine Tiles (Context): tiling for tiled sampling or
+upscale. Split cuts the context image into a batch of uniform, overlapping
+tiles plus the masks and the tiling info; Combine puts a tile batch back at
+whatever size it came back at, crossfading the overlap bands.
 
-Combine Tiles recombines a tile batch (at whatever size it came back at)
-into the image: the layout is scaled to the tiles' size (the upscaled case)
-and the tiles are crossfaded across the overlap bands.
-
-The tile mask (feathered) is 1 on the tile core and fades to 0 across each
-overlap band: with masked_only the overlap keeps its content, and the
-recombine crossfades the tiles across the overlap (the weights sum to 1
-there), so the seams are blended without a separate pass.
+The feathered mask is 1 on the tile core and fades to 0 across each overlap
+band, so adjacent weights sum to 1 there and the seams blend without a
+separate pass.
 """
 
 import math
@@ -26,17 +17,15 @@ from comfy_api.latest import io
 from .context import _CONTEXT_TYPE, ctx_from, ctx_set_image
 from .resolution_latent import _resize_image
 
-# Carries how the image was tiled: the per-tile rects and the grid, so the
-# tiles can be recombined by Combine Tiles (Context)
+# Carries how the image was tiled: the per-tile rects and the grid.
 _TILING_INFO_TYPE = io.Custom("GIBBY_TILING_INFO")
 
 
 def _tile_axis(n, count, overlap):
     """(starts, tile_size, overlap_px) for tiling an axis of length n into count
-    uniform, overlapping tiles: the tile size comes from the overlap fraction
-    (span = count*tile - (count-1)*overlap*tile >= n), the first tile starts at
-    0 and the last is pinned to the axis end - the axis is fully covered and
-    every neighbor pair overlaps by ~overlap*tile (up to a rounding pixel)."""
+    uniform, overlapping tiles. The first tile starts at 0 and the last is pinned
+    to the axis end, so the axis is fully covered and every neighbor pair overlaps
+    by ~overlap*tile (up to a rounding pixel)."""
     count = min(count, n)
     if count <= 1:
         return [0], n, 0
@@ -61,9 +50,9 @@ def _tile_grid(w, h, rows, cols, overlap):
 
 
 def _tile_bands(info, i, j):
-    """(band_l, band_r, band_t, band_b) of tile (i, j) in original pixels: how
-    far each of its overlap bands extends from the tile's edges (0 on the image
-    border, where there is no neighbor)."""
+    """(band_l, band_r, band_t, band_b) of tile (i, j) in original pixels: how far
+    each overlap band reaches from the tile's edges (0 on the image border, where
+    there is no neighbor)."""
     rects = info["rects"]
     rows, cols = info["rows"], info["cols"]
     tw, th = info["tile_w"], info["tile_h"]
@@ -77,9 +66,9 @@ def _tile_bands(info, i, j):
 
 
 def _tile_weight(h, w, band_l, band_r, band_t, band_b, device=None):
-    """(h, w) float32 weight: 1 on the tile core, a linear ramp to 0 across each
-    overlap band (no band on the image border) - adjacent tiles' weights sum to
-    1 across the overlap, so a weighted recombine is a plain crossfade."""
+    """(h, w) float32 weight: 1 on the tile core, linear to 0 across each overlap
+    band. Adjacent tiles' weights sum to 1 across the overlap, so a weighted
+    recombine is a plain crossfade."""
     wx = torch.ones(w, dtype=torch.float32, device=device)
     if band_l > 0:
         wx[:band_l] = torch.linspace(0.0, 1.0, band_l, device=device)
@@ -95,9 +84,8 @@ def _tile_weight(h, w, band_l, band_r, band_t, band_b, device=None):
 
 def _tile_masks(info, w, h, device=None):
     """(rows*cols, h, w) batch of per-tile masks: 'feathered' is the recombine
-    weight (1 on the core, linear to 0 across each overlap band), 'full' is all
-    1s. The bands are scaled to (w, h), which may differ from the tile size
-    (the tiles are upscaled before sampling)."""
+    weight, 'full' is all 1s. The bands are scaled to (w, h), which may differ
+    from the tile size when the tiles were upscaled before sampling."""
     rows, cols = info["rows"], info["cols"]
     if info.get("mask_style", "feathered") != "feathered":
         return torch.ones(rows * cols, h, w, dtype=torch.float32, device=device)
@@ -115,9 +103,8 @@ def _tile_masks(info, w, h, device=None):
 
 def _combine_tiles(tiles, info, new_tw, new_th):
     """Recombine a (B*rows*cols, new_th, new_tw, C) batch of tiles (b-major) into
-    the image at the new size: the tile layout is scaled to the new tile size
-    (each tile keeps its own span, so the overlaps carry over) and the tiles
-    are crossfaded across the overlap bands. Returns (B, out_h, out_w, C)."""
+    the image at the new size: the layout is scaled to the new tile size and the
+    tiles are crossfaded across the overlap bands. Returns (B, out_h, out_w, C)."""
     rects = info["rects"]
     rows, cols = info["rows"], info["cols"]
     n = len(rects)
@@ -155,22 +142,20 @@ class GibbySplitTiles(io.ComfyNode):
             category="gibby/image",
             search_aliases=["tile", "split", "tiles", "tiled", "upscale", "mask"],
             description=(
-                "Splits the image into a batch of uniform, overlapping tiles (rows x cols, "
-                "overlap as a fraction of the tile size) and outputs the tiles, a matching batch "
-                "of masks for the crop-inpaint options and the tiling info for Combine Tiles "
-                "(Context). The output context carries the tiling info as well. Stills only."
+                "Splits the image into a batch of uniform, overlapping tiles, and outputs the tiles, matching "
+                "masks for the crop-inpaint options, and the tiling info for Combine Tiles. Stills only."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True,
                                      tooltip="Base context; its image is tiled when no image is connected"),
                 io.Image.Input("image", optional=True,
                                tooltip="Overrides the context image (the latent and cached sample built from the old image are dropped)"),
-                io.Int.Input("rows", default=2, min=1, max=256, step=1, tooltip="Tile rows"),
-                io.Int.Input("cols", default=2, min=1, max=256, step=1, tooltip="Tile columns"),
+                io.Int.Input("rows", default=2, min=1, max=256, step=1),
+                io.Int.Input("cols", default=2, min=1, max=256, step=1),
                 io.Float.Input("overlap", default=0.25, min=0.0, max=0.5, step=0.01,
-                               tooltip="Tile overlap as a fraction of the tile size"),
+                               tooltip="Fraction of the tile size"),
                 io.Combo.Input("mask", default="feathered", options=["feathered", "full"],
-                               tooltip="feathered: 1 on the tile core, fading to 0 across each overlap band (masked_only keeps the overlap content, the recombine crossfades it). full: 1 across the whole tile (whole-tile denoise)"),
+                               tooltip="feathered: 1 on the tile core, fading to 0 across each overlap band, which masked_only keeps and the recombine crossfades. full: 1 across the whole tile (whole-tile denoise)"),
             ],
             outputs=[
                 _CONTEXT_TYPE.Output("context"),
@@ -211,9 +196,9 @@ class GibbyCombineTiles(io.ComfyNode):
             category="gibby/image",
             search_aliases=["tile", "combine", "untile", "collect", "recombine", "tiled"],
             description=(
-                "Recombines a batch of tiles from a tiling info into the image: the layout is "
-                "scaled to the tiles' size (which may be larger than the split - the upscaled "
-                "case) and the tiles are crossfaded across the overlap bands."
+                "Recombines a batch of tiles from a tiling info into the image, crossfading across the overlap "
+                "bands. The layout scales to the tiles' size, so a batch that came back bigger still lands "
+                "right."
             ),
             inputs=[
                 _CONTEXT_TYPE.Input("context", optional=True,

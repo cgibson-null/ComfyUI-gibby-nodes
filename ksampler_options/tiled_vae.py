@@ -10,13 +10,13 @@ class GibbyTiledVaeOptions(io.ComfyNode):
             display_name="Tiled VAE options",
             category="gibby/flow",
             search_aliases=["tiled", "vae", "tile", "options", "config"],
-            description="Outputs tiled VAE options. Feed into KSampler (Context)'s options input or Reference Latent (Context)'s tiled_vae_options - encode/decode use the tiled VAE for sizes at or above above_megapixels.",
+            description="Tiled VAE options for KSampler (Context) or Reference Latent (Context): encode and decode use the tiled VAE at or above the megapixel threshold.",
             inputs=[
                 io.Float.Input("above_megapixels", default=1.0, min=0.0, max=100.0, step=0.1, tooltip="Tiled VAE is used for sizes at or above this many megapixels (0 = always), below - normal encode/decode"),
                 io.Int.Input("tile_size", default=512, min=64, max=4096, step=32),
                 io.Int.Input("overlap", default=64, min=0, max=4096, step=32),
-                io.Int.Input("temporal_size", default=64, min=8, max=4096, step=4, tooltip="Only used for video VAEs: Amount of frames to decode at a time."),
-                io.Int.Input("temporal_overlap", default=8, min=4, max=4096, step=4, tooltip="Only used for video VAEs: Amount of frames to overlap."),
+                io.Int.Input("temporal_size", default=64, min=8, max=4096, step=4, tooltip="Video VAEs only: frames to decode at a time."),
+                io.Int.Input("temporal_overlap", default=8, min=4, max=4096, step=4, tooltip="Video VAEs only: frames to overlap."),
             ],
             outputs=[
                 _KSAMPLER_OPTIONS_TYPE.Output("options"),

@@ -10,7 +10,7 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
             display_name="Iterative Options",
             category="gibby/flow",
             search_aliases=["upscale", "iterative", "hires", "options", "config"],
-            description="Outputs iterative upscale options. Feed into KSampler (Context) options input; the upscale model travels inside the options.",
+            description="Iterative upscale options for KSampler (Context); the upscale model travels inside the options.",
             inputs=[
                 io.Float.Input("upscale_factor", default=2.0, min=1.0, max=100.0, step=0.1, tooltip="Total resolution multiplier across all steps; overridden when target_size_image is connected"),
                 io.Int.Input("steps", default=2, min=1, max=100, step=1, tooltip="Number of iterative upscale steps; with no image in the context the 1st step is the basic generation (denoise 1.0)"),
@@ -18,13 +18,13 @@ class GibbyIterativeUpscaleOptions(io.ComfyNode):
                 io.Float.Input("target_denoise", default=0.3, min=0.0, max=1.0, step=0.01, tooltip="Denoise of the last step; kept for steps beyond 'steps'"),
                 io.Combo.Input("upscale_method", default="lanczos", options=["bilinear", "area", "nearest", "lanczos"], tooltip="Resize method used on each step when no upscale model is connected"),
                 io.Boolean.Input("mode", default=True, label_on="total", label_off="single", tooltip="total: run all remaining steps at once. single: run one step per KSampler (Context) run."),
-                io.Boolean.Input("verbose", default=False, tooltip="Print each step's index, scale, image size and denoise to the console"),
-                io.UpscaleModel.Input("upscale_model", optional=True, tooltip="Optional upscale model (Load Upscale Model) used on each step"),
+                io.Boolean.Input("verbose", default=False),
+                io.UpscaleModel.Input("upscale_model", optional=True, tooltip="Load Upscale Model output"),
                 io.Image.Input("target_size_image", optional=True, tooltip="Optional image defining the final size: the per-step scale path runs to this image's size instead of upscale_factor"),
                 # Declared last: an input inserted before upscale_model or
                 # target_size_image would move their slots and silently re-route the
                 # links saved to them.
-                io.Boolean.Input("latent_upscale", default=False, optional=True, tooltip="Grow the latent between steps instead of decoding it, scaling the image and encoding it back: the VAE then runs at the ends of the run instead of once per step. The upscale model is an image model, so it is not used; the resize uses the upscale_method above (lanczos is an image resizer, so the latent takes bicubic)."),
+                io.Boolean.Input("latent_upscale", default=False, optional=True, tooltip="Grow the latent between steps instead of decoding and re-encoding it, so the VAE runs only at the ends of the run. The upscale model is an image model and is not used then; the latent resizes bicubic."),
             ],
             outputs=[
                 _KSAMPLER_OPTIONS_TYPE.Output("options"),
