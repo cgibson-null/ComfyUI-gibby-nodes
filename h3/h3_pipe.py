@@ -138,43 +138,57 @@ def _resolve_keyframe_index(pos, frame_count):
     return idx
 
 
-def _audio_guide_keyframes(audio_vae, frame_count, audio_t, tracks, positions):
+def _audio_guide_keyframes(audio_vae, frame_count, audio_t, audio, positions):
     """Audio tracks -> keyframe entries that pin sound onto the clip's timeline.
 
-    A keyframe's audio window starts at FRAME_RESCALE * frame and runs forward one
-    40 Hz step per row, so each track is bounded by the next track and by the end
-    of the clip's audio, and the tail is what gets cut: the anchor coordinate IS
-    the track's start, so trimming the head would move content the user pinned to
-    an instant. Tracks cannot be blended, because blending two pinned windows
-    means two different contents at the same audio coordinates, so a track that
-    lands on an instant another track already owns is dropped rather than merged.
+    A list is one AUDIO per track, each with its own length; a single AUDIO is a
+    batch, so its batch dimension is the tracks. Only a list can hold tracks of
+    different length - padding a batch to one length would make the model perform
+    the silence. Each track is anchored by the position at the same index of the
+    pipe's positions. A keyframe's audio window starts at FRAME_RESCALE * frame
+    and runs forward one 40 Hz step per row, so each track is bounded by the next
+    track and by the end of the clip's audio, and the tail is what gets cut: the
+    anchor coordinate IS the track's start, so trimming the head would move
+    content the user pinned to an instant. Tracks cannot be blended, because
+    blending two pinned windows means two different contents at the same audio
+    coordinates, so a track that lands on an instant another track already owns
+    is dropped rather than merged.
     """
+    if audio is None:
+        return []
+
+    if isinstance(audio, list):
+        tracks = audio
+    else:
+        waveform = audio["waveform"]
+        tracks = [{"waveform": waveform[t:t + 1], "sample_rate": audio["sample_rate"]}
+                  for t in range(waveform.shape[0])]
     if len(positions) < len(tracks):
         logging.warning("WARNING: H3 Pipe Apply: {} audio tracks with {} positions - the tracks left over anchor frame 0".format(len(tracks), len(positions)))
 
     guides = []
-    for slot, audio in enumerate(tracks):
-        pos = positions[slot] if slot < len(positions) else 0
-        guides.append([_resolve_keyframe_index(pos, frame_count), slot + 1, audio])
+    for track in range(len(tracks)):
+        pos = positions[track] if track < len(positions) else 0
+        guides.append([_resolve_keyframe_index(pos, frame_count), track])
     guides.sort(key=lambda guide: (guide[0], guide[1]))
 
     audio_end = math.ceil(audio_t / FRAME_RESCALE)
     out = []
-    for n, (idx, slot, audio) in enumerate(guides):
+    for n, (idx, track) in enumerate(guides):
         # how far the window may reach: to the next track, or to the clip's audio end
         room = math.floor(audio_t - FRAME_RESCALE * idx)
         limit = "the clip's audio ends at frame {}".format(audio_end)
         if n + 1 < len(guides):
             gap = math.floor(FRAME_RESCALE * (guides[n + 1][0] - idx))
             if gap < room:
-                room, limit = gap, "keyaudio_{} anchors frame {}".format(guides[n + 1][1], guides[n + 1][0])
+                room, limit = gap, "audio track {} anchors frame {}".format(guides[n + 1][1] + 1, guides[n + 1][0])
         if room < 1:
-            logging.warning("WARNING: H3 Pipe Apply: keyaudio_{} anchors frame {} on top of the track anchored there before it - two pinned windows cannot share an instant, so this track is dropped".format(slot, idx))
+            logging.warning("WARNING: H3 Pipe Apply: audio track {} anchors frame {} where another track is already anchored - two pinned windows cannot share an instant, so this track is dropped".format(track + 1, idx))
             continue
-        z, rt = _encode_ref_audio(audio_vae, audio)
+        z, rt = _encode_ref_audio(audio_vae, tracks[track])
         if room < rt:
             z = z[..., :room].clone()
-            logging.warning("WARNING: H3 Pipe Apply: keyaudio_{} is cut from {:.2f}s to {:.2f}s because {}".format(slot, rt / AUDIO_LATENT_FPS, room / AUDIO_LATENT_FPS, limit))
+            logging.warning("WARNING: H3 Pipe Apply: audio track {} is cut from {:.2f}s to {:.2f}s because {}".format(track + 1, rt / AUDIO_LATENT_FPS, room / AUDIO_LATENT_FPS, limit))
         out.append({"resolved_frame_index": idx, "audio_latent": z})
     return out
 
@@ -302,7 +316,7 @@ def _apply_pipe_to_conditioning(clip, vae, audio_vae, pipe, target_width=None, t
     # audio half of a keyframe; the bound is the audio length of the latent this
     # call hands back, not the frame count, since the two round differently.
     guides = _audio_guide_keyframes(audio_vae, frame_count, temporal_shape(length)[2],
-                                    pipe.get("keyaudio") or [],
+                                    pipe.get("keyaudio"),
                                     pipe.get("keyaudio_positions") or [])
 
     # Tokenize prompt with refs, or with the start/end keyframes as reference images.
@@ -380,12 +394,10 @@ class H3PipeCreate(io.ComfyNode):
                                  tooltip="Includes first/last frame."),
                 io.Boolean.Input("loop", default=False, optional=True, advanced=True,
                                  tooltip="Duplicates the first keyframe at the last frame."),
-                io.Autogrow.Input("keyaudio", optional=True,
-                    template=io.Autogrow.TemplatePrefix(
-                        input=io.Audio.Input("keyaudio"), prefix="keyaudio_", min=0, max=3),
-                    tooltip="Sound pinned onto the clip's own timeline at a frame from 'indices_audio' - the model performs it there, at a lip sync point or on a beat. Reference audio is only imitated."),
+                io.Audio.Input("keyaudio", optional=True,
+                    tooltip="Sound pinned onto the clip's own timeline at a frame from 'indices_audio' - the model performs it there, at a lip sync point or on a beat. Reference audio is only imitated. Several tracks: a batched AUDIO, or a list of them (Any Batch/List) - only a list keeps each track's own length."),
                 io.String.Input("indices_audio", default="", optional=True, advanced=True,
-                                tooltip="Positions for the audio tracks, in slot order: an integer is a frame index (negative counts from the end), a decimal a percentage of the video; an empty position anchors frame 0. A track is cut where the next one starts or the audio ends."),
+                                tooltip="Positions for the audio tracks, in batch order: an integer is a frame index (negative counts from the end), a decimal a percentage of the video; an empty position anchors frame 0. A track is cut where the next one starts or the audio ends."),
                 io.Autogrow.Input("ref_images", optional=True,
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Image.Input("ref_image"), prefix="ref_image_", min=0, max=9)),
@@ -448,11 +460,9 @@ class H3PipeCreate(io.ComfyNode):
                 pipe.pop("keyframe_positions", None)
 
         # Rebuild the audio guide section when any audio guide input is provided
-        if ((keyaudio is not None and any(v is not None for v in keyaudio.values()))
-                or (indices_audio is not None and str(indices_audio).strip())):
-            tracks = [value for _index, _name, value in iter_numbered_slots(keyaudio or {}, "keyaudio")]
-            if tracks:
-                pipe["keyaudio"] = tracks
+        if keyaudio is not None or (indices_audio is not None and str(indices_audio).strip()):
+            if keyaudio is not None:
+                pipe["keyaudio"] = keyaudio
                 pipe["keyaudio_positions"] = _parse_positions(indices_audio or "")
             else:
                 pipe.pop("keyaudio", None)

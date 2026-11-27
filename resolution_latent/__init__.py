@@ -26,7 +26,10 @@ Load image replaces the connected image with a file from the input folder and it
 alpha with the mask. Enable preview writes the node's temp preview; it is always
 written while Load image or Crop image is on, because the downstream crop views
 read the context's image from it. A mask drawn on that preview becomes the mask
-through the file combo, the way the core mask editor works.
+through the file combo, the way the core mask editor works. The frontend keeps
+that file out of the input root (in input/clipspace) and deletes a node's
+previous mask save when the combo moves on - it names the group, because only it
+knows which node the mask belongs to.
 Crop image is independent of both: it crops to the drawn box, the box mask
 becomes the mask, and the crop info is output and stored for pasting back with
 Image Paste By Mask (Batch) (Context).
@@ -34,6 +37,7 @@ Image Paste By Mask (Batch) (Context).
 
 import math
 import os
+import re
 
 import numpy as np
 import torch
@@ -324,6 +328,42 @@ def _is_mask_editor_file(image):
         return False
     name, _ = folder_paths.annotated_filepath(image)
     return os.path.basename(name).startswith("clipspace-painted-masked-")
+
+
+# The core mask editor's files: every save writes a fresh timestamped group of
+# four (mask, paint, painted, painted-masked) and nothing ever removes them, so
+# tweaking a mask floods the input folder. The frontend keeps the one file that
+# matters out of the input root (CLIPSPACE_SUBFOLDER) and drops the rest.
+MASK_EDITOR_FILE = re.compile(r"^clipspace-(?:mask|paint|painted|painted-masked)-(\d+)\.png$")
+CLIPSPACE_SUBFOLDER = "clipspace"
+
+
+def delete_mask_editor_group(image):
+    """Delete one mask editor group: the clipspace files sharing the given
+    file's timestamp, in the input root (where the core wrote them) and in its
+    clipspace subfolder (where this pack writes them). The caller names the
+    group it owns (the frontend knows which node saved the mask), so no other
+    node's mask file is ever touched. Returns how many files went."""
+    name = MASK_EDITOR_FILE.match(os.path.basename(image or ""))
+    if not name:
+        return 0
+    ts = int(name.group(1))
+    input_dir = folder_paths.get_input_directory()
+    deleted = 0
+    for folder in (input_dir, os.path.join(input_dir, CLIPSPACE_SUBFOLDER)):
+        if not os.path.isdir(folder):
+            continue
+        for f in os.listdir(folder):
+            group = MASK_EDITOR_FILE.match(f)
+            if not group or int(group.group(1)) != ts:
+                continue
+            try:
+                os.remove(os.path.join(folder, f))
+                deleted += 1
+            except OSError:
+                # A locked or already-removed scratch file is no reason to fail
+                pass
+    return deleted
 
 
 def _drawn_mask(image):

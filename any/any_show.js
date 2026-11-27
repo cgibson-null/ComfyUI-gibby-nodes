@@ -12,7 +12,7 @@
 
 import { app } from "../../../scripts/app.js";
 import { ComfyWidgets } from "../../../scripts/widgets.js";
-import { markGraphDirty, refitNode } from "../gibby_widgets.js";
+import { markGraphDirty } from "../gibby_widgets.js";
 
 const NODE_TYPE = "Gibby_ShowAny";
 const ROW = "preview_text";
@@ -33,7 +33,15 @@ function populate(node, texts) {
         }
         widget.value = `${text ?? ""}`;
     }
-    refitNode(node);
+    // Grow only to make room for rows the node is too short for. Refitting down
+    // through the core's computeSize would snap the node back to the minimum of
+    // its rows on every execution and throw away a size set by hand.
+    if (node.size) {
+        try {
+            const fit = node.computeSize([...node.size])[1];
+            if (fit > node.size[1]) node.size = [node.size[0], fit];
+        } catch (e) { /* ignore */ }
+    }
     markGraphDirty(node);
 }
 

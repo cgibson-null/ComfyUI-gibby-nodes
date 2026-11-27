@@ -523,6 +523,101 @@ function trackOriginalFile(node, value) {
     if (v && !isMaskEditorFile(v)) node._gibbyOriginalFile = v;
 }
 
+// The core mask editor writes four full-size PNGs on every save (base with the
+// mask as alpha, the paint layer, base with the paint, paint with the mask as
+// alpha) and only the last is ever read back: the node's combo, this node's
+// backend and the editor's own reload all take the mask from that file's alpha
+// (/view?channel=a). Answer the other three locally - four SSD writes per mask
+// tweak for layers nothing reads is four too many. What is lost with them is
+// the paint layer, so brush strokes are not restored when the editor reopens;
+// the drawn mask is, from the surviving file.
+const UNUSED_MASK_LAYER = /^clipspace-(?:mask|paint|painted)-\d+\.png$/;
+const MASK_EDITOR_FILE = /^clipspace-painted-masked-\d+\.png$/;
+
+// The mask editor's own files are working data, not user input: the one layer
+// that is kept is uploaded straight into input/clipspace, out of the input
+// root. Its names wait here until the node's combo is pointed at where the
+// file actually landed (the editor writes the bare filename it was handed).
+const movedToClipSpace = new Set();
+
+function stubUnusedMaskLayers() {
+    if (api._gibbyMaskLayerStub) return;
+    api._gibbyMaskLayerStub = true;
+    const origFetchApi = api.fetchApi.bind(api);
+    api.fetchApi = async (path, init) => {
+        const body = init?.body;
+        if (init?.method === "POST" && String(path).includes("/upload/image") &&
+            body instanceof FormData) {
+            const file = body.get("image");
+            if (file?.name && UNUSED_MASK_LAYER.test(file.name)) {
+                return new Response(JSON.stringify({ name: file.name, subfolder: "", type: "input" }),
+                    { status: 200, headers: { "Content-Type": "application/json" } });
+            }
+            if (file?.name && MASK_EDITOR_FILE.test(file.name)) {
+                body.append("subfolder", "clipspace");
+                movedToClipSpace.add(file.name);
+            }
+        }
+        return origFetchApi(path, init);
+    };
+}
+
+// A clipspace file is not necessarily one node's own: a duplicated node
+// carries its source's combo value, so two nodes can name the same file, and
+// any other node's file widget can name it too. Only a file no node in the
+// graph still names is a leftover to delete.
+function maskFileStillUsed(name, self) {
+    const graphs = new Set();
+    for (const g of [self.graph, app.canvas?.getCurrentGraph?.() || app.graph]) {
+        const root = g && (g.rootGraph || g);
+        if (root) graphs.add(root);
+    }
+    for (const g of graphs) {
+        for (const n of g.nodes || []) {
+            if (n === self) continue;
+            for (const w of n.widgets || []) {
+                if (typeof w.value === "string" &&
+                    w.value.replace(/\s*\[\w+\]$/, "") === name) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The mask editor writes a fresh timestamped file on every save and never
+// removes the previous one. When the combo moves off this node's file, that one
+// is this node's leftover - but the node only owns it while no other node names
+// it, so the delete goes through maskFileStillUsed first. A rule read off the
+// timestamps alone could not tell two nodes' masks apart at all.
+function dropReplacedMaskGroup(node) {
+    const v = getWidgetValue(node, "image");
+    if (!isMaskEditorFile(v)) return;
+    const name = String(v).replace(/\s*\[\w+\]$/, "");
+    if (!name.includes("/") && movedToClipSpace.delete(name)) {
+        const value = `clipspace/${name}${v.slice(name.length)}`;
+        setWidgetValue(node, "image", value);
+        // The mask editor reads the widget value store over the widget, so the
+        // next mask session must see the moved file there too.
+        const store = frontendStore("widgetValue");
+        const graphId = node.graph?.rootGraph?.id;
+        if (store?.setValue && graphId) {
+            store.setValue(`${graphId}:${encodeURIComponent(String(node.id))}:image`, value);
+        }
+        markGraphDirty(node);
+        node._gibbyPrevMaskFile = value;
+        return;
+    }
+    const prev = node._gibbyPrevMaskFile;
+    node._gibbyPrevMaskFile = name;
+    if (!prev || prev === name || maskFileStillUsed(prev, node)) return;
+    fetch("/gibby_nodes/delete_mask_editor_group", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: prev }),
+    }).then(() => frontendStore("assets")?.inputAssets?.invalidate?.())
+        .catch(() => { /* a leftover scratch file is nothing to fail over */ });
+}
+
 // Whether the clipspace file the combo points at holds a drawn mask: any
 // non-opaque alpha pixel (the backend's _drawn_mask does the same). The
 // combo can't tell it - the core editor rewrites it to a fresh file on
@@ -541,9 +636,14 @@ async function checkDrawnMask(node) {
     node._gibbyMaskFile = name;
     node._gibbyMaskEmpty = null;
     try {
-        // The editor's upload sends no subfolder, so the file lands in the
-        // input root (the "clipspace" in the ref is nominal)
-        const params = new URLSearchParams({ filename: name, type: "input" });
+        // The combo names the file where it is: "subfolder/file" once the
+        // upload has been moved into input/clipspace, bare in the input root.
+        const slash = name.lastIndexOf("/");
+        const params = new URLSearchParams({
+            filename: slash < 0 ? name : name.slice(slash + 1),
+            type: "input",
+        });
+        if (slash >= 0) params.set("subfolder", name.slice(0, slash));
         const resp = await fetch("/view?" + params.toString());
         if (!resp.ok) {
             // The backend treats a missing file as no mask
@@ -603,7 +703,7 @@ function resetErasedMask(node) {
         try {
             img = store.getNodeOutputs(node)?.images?.[0];
         } catch (e) { /* ignore */ }
-        if (img && img.filename === name && img.type === "input") {
+        if (img && img.filename === name.slice(name.lastIndexOf("/") + 1) && img.type === "input") {
             node.imgs = undefined;
             try {
                 store.removeNodeOutputsForNode(node);
@@ -1194,6 +1294,9 @@ app.registerExtension({
             }
             const n = liveNode(this.id) || this;
             if (!n || n._removed) return;
+            // The store subscription is the primary hook for the editor's
+            // combo rewrite; a run is the fallback that does not depend on it.
+            dropReplacedMaskGroup(n);
             if (getWidgetValue(n, "crop_image") || !filePreviewActive(n)) return;
             setTimeout(() => restoreFilePreview(liveNode(n.id) || n), 0);
         };
@@ -1244,6 +1347,7 @@ app.registerExtension({
     // image) - refresh every resize node's crop preview whenever the store
     // changes.
     setup() {
+        stubUnusedMaskLayers();
         // Ctrl+V with a resize node selected: claim the clipboard image before
         // the core's bubble-phase handler turns the paste into a new Load
         // Image node. A capture listener on document runs first, and stopping
@@ -1275,7 +1379,11 @@ app.registerExtension({
                 app.graph;
             if (!graph) return;
             for (const n of graph.nodes || []) {
-                if (n?.type === NODE_TYPE) n._gibbyRefreshCropPreview?.();
+                if (n?.type !== NODE_TYPE) continue;
+                n._gibbyRefreshCropPreview?.();
+                // The editor's save lands here too (it writes the node's
+                // output), which is where its combo rewrite is noticed.
+                dropReplacedMaskGroup(n);
             }
         };
         const subscribe = () => {

@@ -943,6 +943,10 @@ class GibbyH3Chunk(io.ComfyNode):
                     "Batch Extend With Overlap's overlap or Close Tensor Loop's "
                     "overlap_frames. The value actually used, so not necessarily what you "
                     "typed. 0 on the first window.")),
+                io.Dict.Output(display_name="h3_pipe", tooltip=(
+                    "This window's width, height and length, for H3 Pipe Create's h3_pipe "
+                    "input. Create keeps them while its three widgets hold their own "
+                    "defaults; override_config writes the widgets over them.")),
             ],
         )
 
@@ -1092,4 +1096,8 @@ class GibbyH3Chunk(io.ComfyNode):
                      f0, f1, clip_frames, start, f1, overlap_frames, overlap_frames,
                      int(video.shape[2]), int((v_mask[0, 0].amax(dim=(1, 2)) > 0).sum()),
                      "sliced from its latent" if latent is not None else "encoded from frames")
-        return io.NodeOutput(ctx, out, out_image, out_audio, out_mask, overlap_frames)
+        # Only the window's geometry: downstream, H3 Pipe Create keeps these three and
+        # supplies the prompt and media itself.
+        pipe = {"width": int(video.shape[-1]) * 16, "height": int(video.shape[-2]) * 16,
+                "length": covered}
+        return io.NodeOutput(ctx, out, out_image, out_audio, out_mask, overlap_frames, pipe)

@@ -40,7 +40,7 @@ from .any.any_switch import GibbyAnySwitch
 from .any.any_batch_list import GibbyAnyBatchList
 from .any.any_count import GibbyAnyCount
 from .any.any_show import GibbyShowAny
-from .resolution_latent import GibbyEmptyLatentResolution
+from .resolution_latent import GibbyEmptyLatentResolution, delete_mask_editor_group
 from .upscale.seedvr2_upscale import GibbySeedvr2Upscale
 from .upscale.relayvsr_upscale import GibbyRelayvsrUpscale
 from .h3.h3_latent_upscale import GibbyH3LatentUpscale
@@ -113,6 +113,14 @@ try:
             logging.warning(f"[Gibby Nodes] Could not list models from {url!r}: {exc}")
             return web.json_response([])
         return web.json_response(models)
+
+    # The mask editor's cleanup: only the frontend knows which node a saved
+    # mask belongs to, so it names the group to remove and the backend deletes
+    # that group's clipspace files out of the input folder.
+    @PromptServer.instance.routes.post("/gibby_nodes/delete_mask_editor_group")
+    async def _delete_mask_editor_group(request):
+        data = await request.json()
+        return web.json_response({"deleted": delete_mask_editor_group(data.get("filename", ""))})
 
     logging.info("[Gibby Nodes] Registered dedicated routes for JS files")
 except Exception as e:
